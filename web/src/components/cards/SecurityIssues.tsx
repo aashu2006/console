@@ -1,5 +1,4 @@
 import { Shield, AlertTriangle, User, Network, Server, ChevronRight } from 'lucide-react'
-import { useMemo } from 'react'
 import type { SecurityIssue } from '../../hooks/useMCP'
 import { useCachedSecurityIssues } from '../../hooks/useCachedData'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
@@ -24,48 +23,42 @@ function getDemoSecurityIssues(): SecurityIssue[] {
       cluster: 'eks-prod-us-east-1',
       issue: 'Privileged container',
       severity: 'high',
-      details: 'Container running in privileged mode',
-    },
+      details: 'Container running in privileged mode' },
     {
       name: 'worker-deployment',
       namespace: 'batch',
       cluster: 'vllm-gpu-cluster',
       issue: 'Running as root',
       severity: 'high',
-      details: 'Container running as root user',
-    },
+      details: 'Container running as root user' },
     {
       name: 'nginx-ingress',
       namespace: 'ingress',
       cluster: 'eks-prod-us-east-1',
       issue: 'Host network enabled',
       severity: 'medium',
-      details: 'Pod using host network namespace',
-    },
+      details: 'Pod using host network namespace' },
     {
       name: 'monitoring-agent',
       namespace: 'monitoring',
       cluster: 'gke-staging',
       issue: 'Missing security context',
       severity: 'low',
-      details: 'No security context defined',
-    },
+      details: 'No security context defined' },
     {
       name: 'redis-cache',
       namespace: 'data',
       cluster: 'openshift-prod',
       issue: 'Capabilities not dropped',
       severity: 'medium',
-      details: 'Container not dropping all capabilities',
-    },
+      details: 'Container not dropping all capabilities' },
     {
       name: 'legacy-app',
       namespace: 'legacy',
       cluster: 'vllm-gpu-cluster',
       issue: 'Running as root',
       severity: 'high',
-      details: 'Container running as root user',
-    },
+      details: 'Container running as root user' },
   ]
 }
 
@@ -107,7 +100,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
   const { issues: cachedIssues, isLoading: cachedLoading, isRefreshing: cachedRefreshing, isDemoFallback, error: cachedError, isFailed: cachedFailed, consecutiveFailures: cachedFailures, lastRefresh } = useCachedSecurityIssues(clusterConfig, namespaceConfig)
 
   // Use demo data when in demo mode, otherwise use cached/agent data
-  const rawIssues = useMemo(() => isDemoMode ? getDemoSecurityIssues() : cachedIssues, [isDemoMode, cachedIssues])
+  const rawIssues = isDemoMode ? getDemoSecurityIssues() : cachedIssues
   const isLoading = isDemoMode ? false : cachedLoading
   const error = isDemoMode ? null : cachedError
   const isFailed = isDemoMode ? false : cachedFailed
@@ -125,8 +118,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
     hasAnyData: hasData,
     isFailed,
     consecutiveFailures,
-    lastRefresh: isDemoMode ? null : lastRefresh,
-  })
+    lastRefresh: isDemoMode ? null : lastRefresh })
 
   const severityOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
 
@@ -149,33 +141,26 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
       availableClusters: availableClustersForFilter,
       showClusterFilter,
       setShowClusterFilter,
-      clusterFilterRef,
-    },
+      clusterFilterRef },
     sorting: {
       sortBy,
       setSortBy,
       sortDirection,
-      setSortDirection,
-    },
+      setSortDirection },
     containerRef,
-    containerStyle,
-  } = useCardData<SecurityIssue, SortByOption>(rawIssues, {
+    containerStyle } = useCardData<SecurityIssue, SortByOption>(rawIssues, {
     filter: {
       searchFields: ['name', 'namespace', 'cluster', 'issue', 'severity', 'details'],
       clusterField: 'cluster',
-      storageKey: 'security-issues',
-    },
+      storageKey: 'security-issues' },
     sort: {
       defaultField: 'severity',
       defaultDirection: 'desc',
       comparators: {
         severity: (a, b) => (severityOrder[a.severity] || 5) - (severityOrder[b.severity] || 5),
         name: (a, b) => a.name.localeCompare(b.name),
-        cluster: (a, b) => (a.cluster || '').localeCompare(b.cluster || ''),
-      },
-    },
-    defaultLimit: 5,
-  })
+        cluster: (a, b) => (a.cluster || '').localeCompare(b.cluster || '') } },
+    defaultLimit: 5 })
 
   const handleIssueClick = (issue: SecurityIssue) => {
     if (!issue.cluster) {
@@ -184,8 +169,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
     }
     drillToPod(issue.cluster, issue.namespace, issue.name, {
       securityIssue: issue.issue,
-      severity: issue.severity,
-    })
+      severity: issue.severity })
   }
 
   const highCount = rawIssues.filter(i => i.severity === 'high').length
@@ -310,8 +294,10 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
         className="mb-3"
       />
 
-      {/* Issues list */}
-      <div ref={containerRef} className="flex-1 space-y-3 overflow-y-auto min-h-card-content" style={containerStyle}>
+      {/* Issues list — compact spacing (#6460): space-y-2 between rows,
+          p-2 per row, and suppressed mt-2 on the meta row. This keeps the
+          card within standard card height when rendered at lg grid size. */}
+      <div ref={containerRef} className="flex-1 space-y-2 overflow-y-auto min-h-card-content" style={containerStyle}>
         {issues.map((issue: SecurityIssue, idx: number) => {
           const { icon: Icon, tooltip: iconTooltip } = getIssueIcon(issue.issue, t as unknown as (key: string) => string)
           const colors = getSeverityColor(issue.severity)
@@ -319,21 +305,21 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
           return (
             <div
               key={`${issue.name}-${issue.issue}-${idx}`}
-              className={`p-3 rounded-lg ${colors.bg} border ${colors.border} cursor-pointer hover:opacity-80 transition-opacity`}
+              className={`p-2 rounded-lg ${colors.bg} border ${colors.border} cursor-pointer hover:opacity-80 transition-opacity`}
               onClick={() => handleIssueClick(issue)}
               title={t('securityIssues.clickViewPod', { name: issue.name, issue: issue.issue })}
             >
-              <div className="flex items-start gap-3 group">
-                <div className={`p-2 rounded-lg ${colors.badge} flex-shrink-0`} title={iconTooltip}>
+              <div className="flex items-start gap-2 group">
+                <div className={`p-1.5 rounded-lg ${colors.badge} flex-shrink-0`} title={iconTooltip}>
                   <Icon className={`w-4 h-4 ${colors.text}`} />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-0.5">
                     <ClusterBadge cluster={issue.cluster || 'unknown'} />
                     <span className="text-xs text-muted-foreground" title={`Namespace: ${issue.namespace}`}>{issue.namespace}</span>
                   </div>
                   <p className="text-sm font-medium text-foreground truncate" title={issue.name}>{issue.name}</p>
-                  <div className="flex items-center gap-2 mt-2 flex-wrap">
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
                     <span className={`text-xs px-2 py-0.5 rounded ${colors.badge} ${colors.text}`} title={`Issue type: ${issue.issue}`}>
                       {issue.issue}
                     </span>
@@ -354,8 +340,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
                     name: issue.name,
                     namespace: issue.namespace,
                     cluster: issue.cluster || 'default',
-                    status: issue.severity,
-                  }}
+                    status: issue.severity }}
                   issues={[{ name: issue.issue, message: issue.details || issue.issue }]}
                   additionalContext={{ severity: issue.severity, securityIssue: issue.issue }}
                 />

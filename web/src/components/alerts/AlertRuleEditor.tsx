@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Trash2, Server, Bell, BellOff, Bot, Slack, Webhook, Siren, ShieldAlert } from 'lucide-react'
+import { Trash2, Server, Bell, BellOff, Bot, Webhook, Siren, ShieldAlert } from 'lucide-react'
+import { Slack } from '@/lib/icons'
 import { useClusters } from '../../hooks/useMCP'
 import { BaseModal, ConfirmDialog } from '../../lib/modals'
 import type {
@@ -88,7 +89,17 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
   }
 
   const handleClose = () => {
-    const hasChanges = name.trim() !== '' || description.trim() !== ''
+    // Check ALL fields for changes, not just name/description (#5716)
+    const hasChanges = rule
+      ? (name !== rule.name || description !== (rule.description || '') ||
+         severity !== rule.severity || enabled !== rule.enabled ||
+         aiDiagnose !== (rule.aiDiagnose ?? true) ||
+         conditionType !== rule.condition.type ||
+         threshold !== (rule.condition.threshold || 90) ||
+         duration !== (rule.condition.duration || 60) ||
+         JSON.stringify(selectedClusters) !== JSON.stringify(rule.condition.clusters || []) ||
+         JSON.stringify(channels) !== JSON.stringify(rule.channels || []))
+      : (name.trim() !== '' || description.trim() !== '')
     if (hasChanges) {
       setShowDiscardConfirm(true)
       return

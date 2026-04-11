@@ -1,4 +1,3 @@
-import { useMemo } from 'react'
 import { AlertCircle, Play, Clock } from 'lucide-react'
 import { useMissions } from '../../../hooks/useMissions'
 import { useClusters } from '../../../hooks/useMCP'
@@ -29,11 +28,10 @@ export function ConsoleHealthCheckCard(_props: ConsoleMissionCardProps) {
     hasAnyData: allClusters.length > 0,
     isDemoData: podsDemoFallback || deploysDemoFallback,
     isFailed: podsFailed || deploysFailed,
-    consecutiveFailures: Math.max(podsFailures, deploysFailures),
-  })
+    consecutiveFailures: Math.max(podsFailures, deploysFailures) })
 
   // Filter clusters by global filter
-  const clusters = useMemo(() => {
+  const clusters = (() => {
     let result = allClusters
 
     // Apply global cluster filter
@@ -48,10 +46,10 @@ export function ConsoleHealthCheckCard(_props: ConsoleMissionCardProps) {
     }
 
     return result
-  }, [allClusters, selectedClusters, isAllClustersSelected, customFilter])
+  })()
 
   // Filter issues by global filter
-  const podIssues = useMemo(() => {
+  const podIssues = (() => {
     let result = allPodIssues
 
     if (!isAllClustersSelected) {
@@ -59,9 +57,9 @@ export function ConsoleHealthCheckCard(_props: ConsoleMissionCardProps) {
     }
 
     return result
-  }, [allPodIssues, selectedClusters, isAllClustersSelected])
+  })()
 
-  const deploymentIssues = useMemo(() => {
+  const deploymentIssues = (() => {
     let result = allDeploymentIssues
 
     if (!isAllClustersSelected) {
@@ -69,7 +67,7 @@ export function ConsoleHealthCheckCard(_props: ConsoleMissionCardProps) {
     }
 
     return result
-  }, [allDeploymentIssues, selectedClusters, isAllClustersSelected])
+  })()
 
   const healthyClusters = clusters.filter(c => c.healthy && c.reachable !== false).length
   const unhealthyClusters = clusters.filter(c => !c.healthy && c.reachable !== false).length
@@ -117,11 +115,8 @@ Please provide:
           nodeCount: c.nodeCount,
           podCount: c.podCount,
           cpuCores: c.cpuCores,
-          memoryGB: c.memoryGB,
-        })),
-        totalIssues,
-      },
-    })
+          memoryGB: c.memoryGB })),
+        totalIssues } })
   }
 
   const handleStartHealthCheck = () => checkKeyAndRun(doStartHealthCheck)
@@ -130,6 +125,11 @@ Please provide:
   const healthScore = clusters.length > 0
     ? Math.round((healthyClusters / clusters.length) * 100)
     : 0
+
+  // Gauge size tuned so the card + stats + issues + button all fit the
+  // standard card height (see #6461). Previously size=120 plus mb-4 spacing
+  // on every row pushed the action button off the bottom of the card.
+  const HEALTH_GAUGE_SIZE_PX = 100
 
   return (
     <div className="h-full flex flex-col relative">
@@ -140,21 +140,21 @@ Please provide:
         onGoToSettings={goToSettings}
       />
 
-      <div className="flex items-center justify-end mb-4">
-      </div>
-
-      {/* Health Score — horseshoe gauge */}
-      <div className="flex items-center justify-center mb-4">
+      {/* Health Score — horseshoe gauge.
+          semantic="health" inverts the threshold colors so 100% is green,
+          not red (#6461). Utilization gauges still use the default. */}
+      <div className="flex items-center justify-center mb-2">
         <HorseshoeGauge
           value={healthScore}
           maxValue={100}
           label={t('healthCheck.health')}
-          size={120}
+          size={HEALTH_GAUGE_SIZE_PX}
+          semantic="health"
         />
       </div>
 
       {/* Quick Stats */}
-      <div className="grid grid-cols-3 gap-2 mb-4 text-center">
+      <div className="grid grid-cols-3 gap-2 mb-2 text-center">
         <div
           className={cn(
             "p-2 rounded bg-green-500/10",
@@ -202,7 +202,7 @@ Please provide:
       {/* Issues Summary */}
       {totalIssues > 0 && (
         <div
-          className="mb-4 p-2 rounded bg-red-500/10 border border-red-500/20 cursor-pointer hover:bg-red-500/20 transition-colors"
+          className="mb-2 p-2 rounded bg-red-500/10 border border-red-500/20 cursor-pointer hover:bg-red-500/20 transition-colors"
           onClick={() => {
             if (podIssues.length > 0 && podIssues[0]?.cluster) {
               drillToPod(podIssues[0].cluster, podIssues[0].namespace, podIssues[0].name)
@@ -222,7 +222,7 @@ Please provide:
         onClick={handleStartHealthCheck}
         disabled={!!runningHealthMission}
         className={cn(
-          'w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all mt-auto',
+          'w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-all mt-auto',
           runningHealthMission
             ? 'bg-green-500/20 text-green-400 cursor-wait'
             : 'bg-green-500/20 hover:bg-green-500/30 text-green-400'

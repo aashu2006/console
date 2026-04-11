@@ -3,13 +3,45 @@ package handlers
 import (
 	"context"
 	"log/slog"
-	"sort"
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/kubestellar/console/pkg/k8s"
 )
+
+// listClustersHealthWarmup coordinates background health-refresh goroutines
+// triggered from ListClusters. Previously each /api/mcp/clusters request
+// spawned a new GetAllClusterHealth goroutine, so a polling UI (or a pile of
+// concurrent tabs) would stack up overlapping expensive health sweeps that
+// all raced to write the same cache (#6484). A simple in-flight flag is
+// enough to collapse concurrent callers onto a single warmup: if one is
+// already running, additional callers skip spawning and rely on the existing
+// goroutine to refresh the cache.
+var (
+	listClustersWarmupMu       sync.Mutex
+	listClustersWarmupInFlight bool
+)
+
+// tryStartClusterHealthWarmup returns true if the caller became the warmup
+// owner. Only the owner should spawn a goroutine; everyone else must drop
+// the refresh. The owner MUST call finishClusterHealthWarmup when done so
+// the flag clears and the next cycle can start.
+func tryStartClusterHealthWarmup() bool {
+	listClustersWarmupMu.Lock()
+	defer listClustersWarmupMu.Unlock()
+	if listClustersWarmupInFlight {
+		return false
+	}
+	listClustersWarmupInFlight = true
+	return true
+}
+
+func finishClusterHealthWarmup() {
+	listClustersWarmupMu.Lock()
+	listClustersWarmupInFlight = false
+	listClustersWarmupMu.Unlock()
+}
 
 // ListClusters returns all discovered clusters with health data
 func (h *MCPHandlers) ListClusters(c *fiber.Ctx) error {
@@ -46,6 +78,13 @@ func (h *MCPHandlers) ListClusters(c *fiber.Ctx) error {
 				clusters[i].Healthy = health.Healthy
 				clusters[i].NodeCount = health.NodeCount
 				clusters[i].PodCount = health.PodCount
+				// Surface the stale-kubeconfig signal: a cluster that has
+				// a health cache entry but has never been successfully
+				// reached (empty LastSeen) drives the "never connected"
+				// warning banner in the Clusters page (#5921).
+				if !health.Reachable && health.LastSeen == "" {
+					clusters[i].NeverConnected = true
+				}
 			} else {
 				// No health data collected yet (e.g. immediately after boot).
 				// Signal "initializing" rather than falsely reporting Unhealthy.
@@ -53,12 +92,19 @@ func (h *MCPHandlers) ListClusters(c *fiber.Ctx) error {
 			}
 		}
 
-		// Kick off a background health refresh so subsequent calls get fresh data
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mcpHealthTimeout)
-			defer cancel()
-			h.k8sClient.GetAllClusterHealth(ctx)
-		}()
+		// Kick off a background health refresh so subsequent calls get fresh
+		// data — but only if another refresh is not already in flight. Under
+		// polling load the previous unconditional `go` stacked up overlapping
+		// health sweeps, each expensive and all racing on the same cache
+		// (#6484).
+		if tryStartClusterHealthWarmup() {
+			go func() {
+				defer finishClusterHealthWarmup()
+				ctx, cancel := context.WithTimeout(context.Background(), mcpHealthTimeout)
+				defer cancel()
+				h.k8sClient.GetAllClusterHealth(ctx)
+			}()
+		}
 
 		if clusters == nil {
 			clusters = make([]k8s.ClusterInfo, 0)
@@ -274,10 +320,10 @@ func (h *MCPHandlers) GetEvents(c *fiber.Ctx) error {
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
 
-			// Sort by timestamp (most recent first) and limit total
-			sort.Slice(allEvents, func(i, j int) bool {
-				return allEvents[i].LastSeen > allEvents[j].LastSeen
-			})
+			// Sort by LastSeen parsed as time (most recent first).
+			// Lexicographic string compare is unreliable across timezones
+			// and empty values (see issue #6043).
+			k8s.SortEventsByLastSeenDesc(allEvents)
 			if len(allEvents) > limit {
 				allEvents = allEvents[:limit]
 			}
@@ -377,10 +423,10 @@ func (h *MCPHandlers) GetWarningEvents(c *fiber.Ctx) error {
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
 
-			// Sort by timestamp (most recent first) and limit total
-			sort.Slice(allEvents, func(i, j int) bool {
-				return allEvents[i].LastSeen > allEvents[j].LastSeen
-			})
+			// Sort by LastSeen parsed as time (most recent first).
+			// Lexicographic string compare is unreliable across timezones
+			// and empty values (see issue #6043).
+			k8s.SortEventsByLastSeenDesc(allEvents)
 			if len(allEvents) > limit {
 				allEvents = allEvents[:limit]
 			}

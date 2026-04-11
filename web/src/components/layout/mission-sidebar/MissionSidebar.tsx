@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
+import { useState, useEffect, useRef, lazy, Suspense } from 'react'
 import {
   X,
   ChevronRight,
@@ -23,14 +23,14 @@ import {
   BookOpen,
   Rocket,
   Search,
-} from 'lucide-react'
+  Satellite } from 'lucide-react'
 import { useSearchParams, useLocation } from 'react-router-dom'
-import { useMissions } from '../../../hooks/useMissions'
+import { useMissions, isActiveMission } from '../../../hooks/useMissions'
 import { useMobile } from '../../../hooks/useMobile'
 import { StatusBadge } from '../../ui/StatusBadge'
 import { cn } from '../../../lib/cn'
 import { AgentSelector } from '../../agent/AgentSelector'
-import { AgentIcon } from '../../agent/AgentIcon'
+import { LogoWithStar } from '../../ui/LogoWithStar'
 const MissionBrowser = lazy(() =>
   import('../../missions/MissionBrowser').then(m => ({ default: m.MissionBrowser }))
 )
@@ -40,6 +40,9 @@ import type { MissionExport } from '../../../lib/missions/types'
 import type { Mission } from '../../../hooks/useMissions'
 import type { FontSize } from './types'
 import { MissionListItem } from './MissionListItem'
+import { OrbitReminderBanner } from '../../missions/OrbitReminderBanner'
+import { MissionTypeExplainer } from '../../missions/MissionTypeExplainer'
+import { StandaloneOrbitDialog } from '../../missions/StandaloneOrbitDialog'
 import { MissionChat } from './MissionChat'
 import { ClusterSelectionDialog } from '../../missions/ClusterSelectionDialog'
 import { ResolutionKnowledgePanel } from '../../missions/ResolutionKnowledgePanel'
@@ -55,6 +58,12 @@ const SIDEBAR_MIN_WIDTH = 380
 const SIDEBAR_MAX_WIDTH = 800
 const SIDEBAR_DEFAULT_WIDTH = 480
 const SIDEBAR_WIDTH_KEY = 'ksc-mission-sidebar-width'
+
+// Tablet breakpoint matches Tailwind's `lg` (1024px). Below this width the
+// mission sidebar is rendered as an overlay (position: fixed without pushing
+// main content) so tablet layouts don't get squeezed below the min sidebar
+// width. See issues 6388 / 6394.
+const TABLET_BREAKPOINT_PX = 1024
 
 function loadSavedWidth(): number {
   const maxW = typeof window !== 'undefined'
@@ -86,19 +95,37 @@ export function MissionSidebar() {
   const [isResizing, setIsResizing] = useState(false)
   const latestWidthRef = useRef(sidebarWidth)
 
+  // Track tablet range (>= mobile but < lg). In this range the sidebar is
+  // rendered as an overlay that does NOT push main content — pushing at
+  // tablet widths squeezes main below the sidebar min width and can cause
+  // ~10px content overlap (issue 6388).
+  const [isTablet, setIsTablet] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.innerWidth < TABLET_BREAKPOINT_PX
+  })
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${TABLET_BREAKPOINT_PX - 1}px)`)
+    const onChange = (e: MediaQueryListEvent) => setIsTablet(e.matches)
+    setIsTablet(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
   // Publish sidebar width as a CSS custom property so Layout.tsx can
   // adjust main-content margins without needing context plumbing.
+  // On tablet (< 1024px) we publish 0 so the sidebar floats as an overlay.
   useEffect(() => {
     const root = document.documentElement
-    if (!isMobile && isSidebarOpen && !isSidebarMinimized && !isFullScreen) {
+    const isOverlayMode = isMobile || isTablet
+    if (!isOverlayMode && isSidebarOpen && !isSidebarMinimized && !isFullScreen) {
       root.style.setProperty('--mission-sidebar-width', `${sidebarWidth}px`)
-    } else if (!isMobile && isSidebarOpen && isSidebarMinimized && !isFullScreen) {
+    } else if (!isOverlayMode && isSidebarOpen && isSidebarMinimized && !isFullScreen) {
       root.style.setProperty('--mission-sidebar-width', '48px')
     } else {
       root.style.setProperty('--mission-sidebar-width', '0px')
     }
     return () => { root.style.removeProperty('--mission-sidebar-width') }
-  }, [isMobile, isSidebarOpen, isSidebarMinimized, isFullScreen, sidebarWidth])
+  }, [isMobile, isTablet, isSidebarOpen, isSidebarMinimized, isFullScreen, sidebarWidth])
 
   // Re-clamp sidebar width when viewport is resized
   useEffect(() => {
@@ -114,7 +141,7 @@ export function MissionSidebar() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+  const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault()
     setIsResizing(true)
     document.documentElement.dataset.missionResizing = '1'
@@ -145,10 +172,11 @@ export function MissionSidebar() {
     document.body.style.userSelect = 'none'
     document.addEventListener('mousemove', onMouseMove)
     document.addEventListener('mouseup', onMouseUp)
-  }, [sidebarWidth])
+  }
   const [showNewMission, setShowNewMission] = useState(false)
   const [showBrowser, setShowBrowser] = useState(false)
   const [showMissionControl, setShowMissionControl] = useState(false)
+  const [showOrbitDialog, setShowOrbitDialog] = useState(false)
   const [newMissionPrompt, setNewMissionPrompt] = useState('')
   const [showSavedToast, setShowSavedToast] = useState<string | null>(null)
   /** Countdown seconds remaining for the saved-mission toast */
@@ -156,6 +184,8 @@ export function MissionSidebar() {
   const [viewingMission, setViewingMission] = useState<MissionExport | null>(null)
   const [viewingMissionRaw, setViewingMissionRaw] = useState(false)
   const newMissionInputRef = useRef<HTMLTextAreaElement>(null)
+  /** Ref to track the first-import toast countdown interval so it can be cleared on unmount or re-import */
+  const toastIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   // Cluster selection for install missions
   const [pendingRunMissionId, setPendingRunMissionId] = useState<string | null>(null)
   const [isDirectImporting, setIsDirectImporting] = useState(false)
@@ -163,10 +193,19 @@ export function MissionSidebar() {
   const [showSaveResolutionDialog, setShowSaveResolutionDialog] = useState(false)
   // Reset dialog when active mission changes to prevent stale dialog for a different mission
   useEffect(() => { setShowSaveResolutionDialog(false) }, [activeMission?.id])
+  // Clean up first-import toast interval on unmount to prevent timer leak (#5211)
+  useEffect(() => {
+    return () => {
+      if (toastIntervalRef.current) {
+        clearInterval(toastIntervalRef.current)
+        toastIntervalRef.current = null
+      }
+    }
+  }, [])
   // Resolution panel state (fullscreen left sidebar)
   const [resolutionPanelView, setResolutionPanelView] = useState<'related' | 'history'>('related')
   const { findSimilarResolutions, allResolutions } = useResolutions()
-  const relatedResolutions = useMemo(() => {
+  const relatedResolutions = (() => {
     if (!activeMission) return []
     const content = [
       activeMission.title,
@@ -176,21 +215,34 @@ export function MissionSidebar() {
     const signature = detectIssueSignature(content)
     if (!signature.type || signature.type === 'Unknown') return []
     return findSimilarResolutions(signature as { type: string }, { minSimilarity: 0.4, limit: 5 })
-  }, [activeMission?.title, activeMission?.description, activeMission?.messages, findSimilarResolutions])
+  })()
 
-  const handleApplyResolution = useCallback((resolution: { title: string; resolution: { summary: string; steps: string[]; yaml?: string } }) => {
+  const handleApplyResolution = (resolution: { title: string; resolution: { summary: string; steps: string[]; yaml?: string } }) => {
     if (!activeMission) return
+    // Enforce lifecycle validation (#5934): resolution should never be
+    // applied to a mission that is in a non-interactive state. Blocked
+    // missions are awaiting preflight fixes, pending missions have never
+    // left the queue, and cancelling/cancelled missions should not be
+    // restarted through the resolution flow. Running missions already
+    // have input disabled so sendMessage would no-op, but we surface a
+    // clearer guard here anyway.
+    const NON_APPLIABLE_STATUSES = new Set(['blocked', 'pending', 'cancelling', 'running'])
+    if (NON_APPLIABLE_STATUSES.has(activeMission.status)) {
+      return
+    }
     const applyMessage = `Please apply this saved resolution:\n\n**${resolution.title}**\n\n${resolution.resolution.summary}\n\nSteps:\n${resolution.resolution.steps.map((s: string, i: number) => `${i + 1}. ${s}`).join('\n')}${resolution.resolution.yaml ? `\n\nYAML:\n\`\`\`yaml\n${resolution.resolution.yaml}\n\`\`\`` : ''}`
     sendMessage(activeMission.id, applyMessage)
-  }, [activeMission, sendMessage])
+  }
 
   // Deep-link: open MissionBrowser via ?mission= (specific) or ?browse=missions (explorer)
+  // Deep-link: open MissionControlDialog via ?mission-control=open (#6474)
   // Direct import: ?import= fetches and imports mission directly (no browser popup)
   const [searchParams, setSearchParams] = useSearchParams()
   const location = useLocation()
   const deepLinkMission = searchParams.get('mission')
   const directImportSlug = searchParams.get('import')
   const browseParam = searchParams.get('browse')
+  const missionControlParam = searchParams.get('mission-control')
   /** Mission pre-fetched by MissionLandingPage and passed via navigation state */
   const prefetchedMission = (location.state as { prefetchedMission?: MissionExport } | null)?.prefetchedMission
 
@@ -203,6 +255,18 @@ export function MissionSidebar() {
       setSearchParams(newParams, { replace: true })
     }
   }, [deepLinkMission, browseParam, searchParams, setSearchParams])
+
+  // #6474 — ?mission-control=open opens the MissionControlDialog.
+  // Parallel to the ?browse=missions deep-link above. Gives users a
+  // shareable URL and makes Missions.spec.ts e2e tests actually work.
+  useEffect(() => {
+    if (missionControlParam === 'open') {
+      setShowMissionControl(true)
+      const newParams = new URLSearchParams(searchParams)
+      newParams.delete('mission-control')
+      setSearchParams(newParams, { replace: true })
+    }
+  }, [missionControlParam, searchParams, setSearchParams])
 
   // Direct import from landing page — fetch mission content and import it
   // without opening the MissionBrowser dialog
@@ -243,8 +307,7 @@ export function MissionSidebar() {
       try {
         found = await Promise.any(paths.map(async (path) => {
           const res = await fetch(`/api/missions/file?path=${encodeURIComponent(path)}`, {
-            signal: controller.signal,
-          })
+            signal: controller.signal })
           if (!res.ok) throw new Error('not found')
           const raw = await res.text()
           const parsed = JSON.parse(raw)
@@ -265,8 +328,7 @@ export function MissionSidebar() {
       // Fallback: search index.json for nested paths
       try {
         const res = await fetch('/api/missions/file?path=fixes/index.json', {
-          signal: AbortSignal.timeout(MISSION_FILE_FETCH_TIMEOUT_MS),
-        })
+          signal: AbortSignal.timeout(MISSION_FILE_FETCH_TIMEOUT_MS) })
         if (res.ok) {
           const index = await res.json() as { missions?: Array<{ path: string }> }
           const match = (index.missions || []).find(m => {
@@ -275,8 +337,7 @@ export function MissionSidebar() {
           })
           if (match) {
             const fileRes = await fetch(`/api/missions/file?path=${encodeURIComponent(match.path)}`, {
-              signal: AbortSignal.timeout(MISSION_FILE_FETCH_TIMEOUT_MS),
-            })
+              signal: AbortSignal.timeout(MISSION_FILE_FETCH_TIMEOUT_MS) })
             if (fileRes.ok) {
               const raw = await fileRes.text()
               const parsed = JSON.parse(raw)
@@ -309,21 +370,35 @@ export function MissionSidebar() {
   }, [missionSearchQuery])
 
   // Split missions into saved (library) and active, applying search filter
-  const matchesSearch = useCallback((m: Mission) => {
+  const matchesSearch = (m: Mission) => {
     if (!missionSearchQuery.trim()) return true
     const q = missionSearchQuery.toLowerCase()
     return m.title.toLowerCase().includes(q) || m.description.toLowerCase().includes(q)
-  }, [missionSearchQuery])
+  }
   const savedMissions = missions.filter(m => m.status === 'saved' && matchesSearch(m))
+  // #5946 — "Active" missions must exclude completed, failed, and cancelled
+  // missions. Previously this filter only excluded 'saved', which caused
+  // terminal missions to still appear under the active list and inflate the
+  // count.
   const activeMissions = missions
-    .filter(m => m.status !== 'saved' && matchesSearch(m))
+    .filter(m => isActiveMission(m) && matchesSearch(m))
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
 
   /** Paginated slice of active missions for rendering (#4778) */
   const visibleActiveMissions = activeMissions.slice(0, visibleMissionCount)
   const hasMoreMissions = activeMissions.length > visibleMissionCount
 
-  const handleImportMission = useCallback((mission: MissionExport) => {
+  /**
+   * Total missions actually rendered in the list view (saved + active).
+   * Used so the list header count and the chat view's "Back to missions"
+   * label agree on the same source of truth (#6134, #6135, #6136, #6137).
+   * Previously the chat button used `missions.length` (which included
+   * terminal completed/failed/cancelled missions that the list filters
+   * out via isActiveMission), producing a mismatch like "21 vs 24".
+   */
+  const listTotalMissions = savedMissions.length + activeMissions.length
+
+  const handleImportMission = (mission: MissionExport) => {
     const missionType = mission.missionClass === 'install' ? 'deploy' as const
       : mission.type === 'troubleshoot' ? 'troubleshoot' as const
       : mission.type === 'deploy' ? 'deploy' as const
@@ -337,8 +412,7 @@ export function MissionSidebar() {
       cncfProject: mission.cncfProject,
       steps: mission.steps?.map(s => ({ title: s.title, description: s.description })),
       tags: mission.tags,
-      initialPrompt: mission.resolution?.summary || mission.description,
-    })
+      initialPrompt: mission.resolution?.summary || mission.description })
     setShowBrowser(false)
     // Auto-open the sidebar and highlight the imported mission so the user
     // immediately sees where it went and can act on it
@@ -353,10 +427,17 @@ export function MissionSidebar() {
       /** Countdown duration in seconds for first-import toast */
       const FIRST_IMPORT_COUNTDOWN_S = 60
       setToastCountdown(FIRST_IMPORT_COUNTDOWN_S)
-      const interval = setInterval(() => {
+      // Clear any previous interval to prevent leaks on rapid re-imports (#5211)
+      if (toastIntervalRef.current) {
+        clearInterval(toastIntervalRef.current)
+      }
+      toastIntervalRef.current = setInterval(() => {
         setToastCountdown((prev) => {
           if (prev <= 1) {
-            clearInterval(interval)
+            if (toastIntervalRef.current) {
+              clearInterval(toastIntervalRef.current)
+              toastIntervalRef.current = null
+            }
             setShowSavedToast(null)
             return 0
           }
@@ -367,10 +448,10 @@ export function MissionSidebar() {
       setShowSavedToast(mission.title)
       setTimeout(() => setShowSavedToast(null), SAVED_TOAST_MS)
     }
-  }, [saveMission, openSidebar, setActiveMission])
+  }
 
   /** Convert a saved Mission to MissionExport for the detail view */
-  const savedMissionToExport = useCallback((m: Mission): MissionExport => ({
+  const savedMissionToExport = (m: Mission): MissionExport => ({
     version: '1.0',
     title: m.importedFrom?.title || m.title,
     description: m.importedFrom?.description || m.description,
@@ -380,18 +461,16 @@ export function MissionSidebar() {
     cncfProject: m.importedFrom?.cncfProject,
     steps: (m.importedFrom?.steps || []).map(s => ({
       title: s.title,
-      description: s.description,
-    })),
-  }), [])
+      description: s.description })) })
 
-  const handleViewSavedMission = useCallback((m: Mission) => {
+  const handleViewSavedMission = (m: Mission) => {
     setViewingMission(savedMissionToExport(m))
     setViewingMissionRaw(false)
-  }, [savedMissionToExport])
+  }
 
   // Run mission — in demo mode (Netlify), block and open the install dialog instead.
   // For install/deploy types in live mode, show cluster picker first.
-  const handleRunMission = useCallback((missionId: string) => {
+  const handleRunMission = (missionId: string) => {
     if (isDemoMode()) {
       window.dispatchEvent(new CustomEvent('open-install'))
       return
@@ -403,7 +482,7 @@ export function MissionSidebar() {
     } else {
       runSavedMission(missionId)
     }
-  }, [missions, runSavedMission])
+  }
 
   const pendingMission = pendingRunMissionId ? missions.find(m => m.id === pendingRunMissionId) : null
 
@@ -413,7 +492,7 @@ export function MissionSidebar() {
       if (e.key === 'Escape') {
         if (isFullScreen) {
           setFullScreen(false)
-          closeSidebar()
+          // Only exit fullscreen — don't close sidebar (second Escape will close it)
         } else if (isSidebarOpen) {
           closeSidebar()
         }
@@ -426,8 +505,11 @@ export function MissionSidebar() {
   }, [isSidebarOpen, isFullScreen, setFullScreen, closeSidebar])
 
   // Count missions needing attention
+  // Blocked missions are stuck waiting on user action (preflight failure,
+  // missing credentials, RBAC denial). Surfacing them in the attention
+  // indicator ensures the user sees the required action (#5933).
   const needsAttention = missions.filter(m =>
-    m.status === 'waiting_input' || m.status === 'failed'
+    m.status === 'waiting_input' || m.status === 'failed' || m.status === 'blocked'
   ).length
 
   const runningCount = missions.filter(m => m.status === 'running').length
@@ -444,24 +526,13 @@ export function MissionSidebar() {
     })
   }
 
-  // Helper to get provider string for AgentIcon
-  const getAgentProvider = (agent: string | null | undefined) => {
-    switch (agent) {
-      case 'claude': return 'anthropic'
-      case 'openai': return 'openai'
-      case 'gemini': return 'google'
-      case 'bob': return 'bob'
-      case 'claude-code': return 'anthropic-local'
-      default: return agent || 'anthropic'
-    }
-  }
 
   // Minimized sidebar view (thin strip) - desktop only
   if (isSidebarMinimized && !isMobile) {
     return (
       <div
         className={cn(
-        "fixed top-16 right-0 bottom-0 w-12 bg-card/95 backdrop-blur-sm border-l border-border shadow-xl z-40 flex flex-col items-center py-4",
+        "fixed top-16 right-0 bottom-0 w-12 bg-card/95 backdrop-blur-sm border-l border-border shadow-xl z-modal flex flex-col items-center py-4",
         "transition-transform duration-300 ease-in-out",
         !isSidebarOpen && "translate-x-full pointer-events-none"
       )}>
@@ -474,9 +545,9 @@ export function MissionSidebar() {
         </button>
 
         <div className="flex flex-col items-center gap-2">
-          <AgentIcon provider={getAgentProvider(selectedAgent)} className="w-5 h-5 text-primary" />
-          {missions.length > 0 && (
-            <span className="text-xs font-medium text-foreground">{missions.length}</span>
+          <LogoWithStar className="w-5 h-5" />
+          {activeMissions.length > 0 && (
+            <span className="text-xs font-medium text-foreground">{activeMissions.length}</span>
           )}
           {runningCount > 0 && (
             <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
@@ -496,7 +567,15 @@ export function MissionSidebar() {
       {/* Mobile backdrop */}
       {isMobile && isSidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/60 backdrop-blur-2xl z-30 md:hidden"
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-overlay md:hidden"
+          onClick={closeSidebar}
+        />
+      )}
+      {/* Tablet backdrop — the sidebar renders as an overlay at < lg so main
+          content isn't squeezed. A tap-out backdrop mirrors mobile UX (issue 6388). */}
+      {!isMobile && isTablet && isSidebarOpen && !isFullScreen && (
+        <div
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-overlay lg:hidden"
           onClick={closeSidebar}
         />
       )}
@@ -504,10 +583,10 @@ export function MissionSidebar() {
       <div
         data-tour="ai-missions"
         className={cn(
-          "fixed bg-card border-border z-40 flex flex-col overflow-hidden shadow-2xl",
+          "fixed bg-card border-border z-modal flex flex-col overflow-hidden shadow-2xl",
           !isResizing && "transition-[width,top,border,transform] duration-300 ease-in-out",
           // Mobile: bottom sheet
-          isMobile && "inset-x-0 bottom-0 rounded-t-2xl border-t max-h-[80vh]",
+          isMobile && "inset-x-0 bottom-0 rounded-t-2xl border-t max-h-[80dvh]",
           isMobile && !isSidebarOpen && "translate-y-full pointer-events-none",
           isMobile && isSidebarOpen && "translate-y-0",
           // Desktop: right sidebar
@@ -541,7 +620,7 @@ export function MissionSidebar() {
       {/* Header */}
       <div className="flex items-center justify-between p-3 md:p-4 border-b border-border min-w-0">
         <div className="flex items-center gap-2 flex-shrink-0">
-          <AgentIcon provider={getAgentProvider(selectedAgent)} className="w-5 h-5" />
+          <LogoWithStar className="w-5 h-5" />
           <h2 className="font-semibold text-foreground text-sm md:text-base whitespace-nowrap">{t('missionSidebar.aiMissions')}</h2>
           {needsAttention > 0 && (
             <StatusBadge color="purple" rounded="full">{needsAttention}</StatusBadge>
@@ -551,7 +630,9 @@ export function MissionSidebar() {
         <div className="flex items-center gap-1 min-w-0">
           {/* Optional toolbar buttons — clipped when sidebar is narrow */}
           <div className="flex items-center gap-1 overflow-hidden min-w-0 flex-shrink">
-            {/* New Mission Button */}
+            {/* New Mission Button — uses "+" for discoverability (#6095).
+                Styled with a purple accent and ring so it stands out from
+                the font-size Plus control and reads clearly as "add new". */}
             <button
               onClick={() => {
                 setShowNewMission(!showNewMission)
@@ -560,14 +641,18 @@ export function MissionSidebar() {
                 }
               }}
               className={cn(
-                "p-1.5 rounded transition-colors flex-shrink-0",
+                // mr-2 gives the accented "+ New mission" button breathing room
+                // from the adjacent toolbar group (#6132) so it doesn't visually
+                // merge with the Globe/Rocket icons next to it.
+                "p-1.5 mr-2 rounded transition-colors flex-shrink-0 ring-1",
                 showNewMission
-                  ? "bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/10"
+                  ? "bg-primary text-primary-foreground ring-primary"
+                  : "bg-purple-500/10 text-purple-400 ring-purple-500/30 hover:bg-purple-500/20 hover:text-purple-300"
               )}
-              title={t('missionSidebar.startNewMission')}
+              aria-label={t('missionSidebar.newMissionButton')}
+              title={t('missionSidebar.newMissionButton')}
             >
-              <Sparkles className="w-4 h-4" />
+              <Plus className="w-4 h-4" />
             </button>
             {/* Browse Community Missions */}
             <button
@@ -638,7 +723,7 @@ export function MissionSidebar() {
             ))}
             <button
               onClick={closeSidebar}
-              className="p-1 rounded transition-colors hover:bg-black/5 dark:hover:bg-white/10"
+              className="min-w-[44px] min-h-[44px] p-2 rounded transition-colors hover:bg-black/5 dark:hover:bg-white/10 flex items-center justify-center"
               title={t('missionSidebar.closeSidebar')}
             >
               <X className="w-5 h-5 text-muted-foreground" />
@@ -663,8 +748,7 @@ export function MissionSidebar() {
                     type: 'custom',
                     title: newMissionPrompt.slice(0, 50) + (newMissionPrompt.length > 50 ? '...' : ''),
                     description: newMissionPrompt,
-                    initialPrompt: newMissionPrompt,
-                  })
+                    initialPrompt: newMissionPrompt })
                   setNewMissionPrompt('')
                   setShowNewMission(false)
                 }
@@ -691,8 +775,7 @@ export function MissionSidebar() {
                         type: 'custom',
                         title: newMissionPrompt.slice(0, 50) + (newMissionPrompt.length > 50 ? '...' : ''),
                         description: newMissionPrompt,
-                        initialPrompt: newMissionPrompt,
-                      })
+                        initialPrompt: newMissionPrompt })
                       setNewMissionPrompt('')
                       setShowNewMission(false)
                     }
@@ -926,14 +1009,20 @@ export function MissionSidebar() {
             </div>
           )}
           <div className="flex-1 flex flex-col min-h-0 min-w-0">
-            {/* Back to list if multiple missions */}
-            {missions.length > 1 && (
+            {/* Back to missions list.
+             * Always visible when an activeMission is set — this is the only
+             * UI path that clears activeMission. Previously this was gated on
+             * listTotalMissions > 1 (#6137), but that trapped users who
+             * filtered via missionSearchQuery down to a single result with
+             * no way to return to the full list (#6145). Safest fix: always
+             * show the button when activeMission != null. */}
+            {activeMission != null && (
               <button
                 onClick={() => setActiveMission(null)}
                 className="flex items-center gap-1 px-4 py-2 text-xs text-muted-foreground hover:text-foreground border-b border-border flex-shrink-0"
               >
                 <ChevronLeft className="w-3 h-3" />
-                {t('missionSidebar.backToMissions', { count: missions.length })}
+                {t('missionSidebar.backToMissions', { count: listTotalMissions })}
               </button>
             )}
             <MissionChat mission={activeMission} isFullScreen={isFullScreen} fontSize={fontSize} onToggleFullScreen={() => setFullScreen(true)} />
@@ -966,6 +1055,21 @@ export function MissionSidebar() {
               )}
             </div>
           )}
+
+          {/* Mission type explainer — demo mode only */}
+          <MissionTypeExplainer />
+
+          {/* Add Orbit button — always visible above saved missions */}
+          <div className="mb-2 px-2">
+            <button
+              onClick={() => setShowOrbitDialog(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-purple-400 border border-purple-500/30 rounded-lg hover:bg-purple-500/10 transition-colors w-full justify-center"
+              title={t('orbit.addOrbit')}
+            >
+              <Satellite className="w-3.5 h-3.5" />
+              {t('orbit.addOrbit')}
+            </button>
+          </div>
 
           {/* Saved missions section */}
           {savedMissions.length > 0 && (
@@ -1023,6 +1127,15 @@ export function MissionSidebar() {
             </div>
           )}
 
+          {/* Orbit reminder banner — shows when orbit missions are due/overdue */}
+          <OrbitReminderBanner
+            missions={missions}
+            onRunMission={(missionId) => {
+              setActiveMission(missionId)
+              runSavedMission(missionId)
+            }}
+          />
+
           {/* Active missions section — paginated for performance (#4778) */}
           {activeMissions.length > 0 && (
             <>
@@ -1041,7 +1154,7 @@ export function MissionSidebar() {
                     // Always show the mission's chat first (#4549)
                     setActiveMission(mission.id)
                     // Also open Mission Control dialog for planning missions
-                    if (mission.title === 'Mission Control Planning') {
+                    if (mission.title === 'Mission Control Planning' || mission.context?.missionControl) {
                       setShowMissionControl(true)
                     }
                   }}
@@ -1050,7 +1163,7 @@ export function MissionSidebar() {
                   onExpand={() => {
                     setActiveMission(mission.id)
                     setFullScreen(true)
-                    if (mission.title === 'Mission Control Planning') {
+                    if (mission.title === 'Mission Control Planning' || mission.context?.missionControl) {
                       setShowMissionControl(true)
                     }
                   }}
@@ -1066,8 +1179,7 @@ export function MissionSidebar() {
                 >
                   {t('missionSidebar.loadMore', {
                     defaultValue: 'Load more ({{remaining}} remaining)',
-                    remaining: activeMissions.length - visibleMissionCount,
-                  })}
+                    remaining: activeMissions.length - visibleMissionCount })}
                 </button>
               )}
             </>
@@ -1093,9 +1205,9 @@ export function MissionSidebar() {
       {/* Saved Mission Detail Modal */}
       {viewingMission && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-2xl"
+          className="fixed inset-0 z-modal flex items-center justify-center bg-black/60 backdrop-blur-sm"
           onClick={(e) => { if (e.target === e.currentTarget) setViewingMission(null) }}
-          onKeyDown={(e) => { if (e.key === 'Escape') setViewingMission(null) }}
+          onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setViewingMission(null) } }}
           tabIndex={-1}
           ref={(el) => el?.focus()}
         >
@@ -1103,15 +1215,17 @@ export function MissionSidebar() {
             "relative bg-card border border-border rounded-xl shadow-2xl overflow-hidden flex flex-col",
             isMobile ? "inset-2 fixed" : "w-[900px] max-h-[85vh]"
           )}>
-            {/* Close button */}
-            <button
-              onClick={() => setViewingMission(null)}
-              className="absolute top-3 right-3 z-10 p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            {/* Close button — positioned above the content area to avoid overlapping Run/View Raw */}
+            <div className="flex justify-end p-3 pb-0 shrink-0">
+              <button
+                onClick={() => setViewingMission(null)}
+                className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
             {/* Scrollable content */}
-            <div className="flex-1 overflow-y-auto scroll-enhanced p-6">
+            <div className="flex-1 overflow-y-auto scroll-enhanced px-6 pb-6">
               <MissionDetailView
                 mission={viewingMission}
                 rawContent={JSON.stringify(viewingMission, null, 2)}
@@ -1148,6 +1262,11 @@ export function MissionSidebar() {
         onClose={() => setShowMissionControl(false)}
       />
 
+      {/* Standalone Orbit Mission Dialog */}
+      {showOrbitDialog && (
+        <StandaloneOrbitDialog onClose={() => setShowOrbitDialog(false)} />
+      )}
+
       {/* Cluster Selection Dialog for install missions */}
       {pendingRunMissionId && (
         <ClusterSelectionDialog
@@ -1177,26 +1296,23 @@ export function MissionSidebar() {
 // Toggle button for the sidebar (shown when sidebar is closed)
 export function MissionSidebarToggle() {
   const { t } = useTranslation(['common'])
-  const { missions, isSidebarOpen, openSidebar, selectedAgent } = useMissions()
+  const { missions, isSidebarOpen, openSidebar } = useMissions()
   const { isMobile } = useMobile()
 
+  // Blocked missions are stuck waiting on user action (preflight failure,
+  // missing credentials, RBAC denial). Surfacing them in the attention
+  // indicator ensures the user sees the required action (#5933).
   const needsAttention = missions.filter(m =>
-    m.status === 'waiting_input' || m.status === 'failed'
+    m.status === 'waiting_input' || m.status === 'failed' || m.status === 'blocked'
   ).length
 
   const runningCount = missions.filter(m => m.status === 'running').length
-
-  // Helper to get provider string for AgentIcon
-  const getAgentProvider = (agent: string | null | undefined) => {
-    switch (agent) {
-      case 'claude': return 'anthropic'
-      case 'openai': return 'openai'
-      case 'gemini': return 'google'
-      case 'bob': return 'bob'
-      case 'claude-code': return 'anthropic-local'
-      default: return agent || 'anthropic'
-    }
-  }
+  /**
+   * Active mission count — excludes saved/completed/failed/cancelled (#5947).
+   * Previously this only filtered out 'saved' missions, which caused the
+   * toggle-button badge to include terminal missions and overstate activity.
+   */
+  const activeCount = missions.filter(isActiveMission).length
 
   // Always show toggle when sidebar is closed (even with no missions)
   if (isSidebarOpen) {
@@ -1217,14 +1333,14 @@ export function MissionSidebarToggle() {
       )}
       title={t('missionSidebar.openAIMissions')}
     >
-      <AgentIcon provider={getAgentProvider(selectedAgent)} className={isMobile ? 'w-4 h-4' : 'w-5 h-5'} />
+      <LogoWithStar className={isMobile ? 'w-4 h-4' : 'w-5 h-5'} />
       {runningCount > 0 && (
         <Loader2 className={isMobile ? 'w-3 h-3 animate-spin' : 'w-4 h-4 animate-spin'} />
       )}
       {needsAttention > 0 ? (
         <span className={isMobile ? 'text-xs font-medium' : 'text-sm font-medium'}>{t('missionSidebar.needsAttention', { count: needsAttention })}</span>
-      ) : missions.length > 0 ? (
-        <span className={isMobile ? 'text-xs' : 'text-sm'}>{t('missionSidebar.missionCount', { count: missions.length })}</span>
+      ) : activeCount > 0 ? (
+        <span className={isMobile ? 'text-xs' : 'text-sm'}>{t('missionSidebar.missionCount', { count: activeCount })}</span>
       ) : (
         <span className={isMobile ? 'text-xs' : 'text-sm'}>{t('missionSidebar.aiMissions')}</span>
       )}

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { Server, Box, Wifi, WifiOff, Loader2 } from 'lucide-react'
 import { useLocalAgent } from '../../../hooks/useLocalAgent'
 import { useMissions } from '../../../hooks/useMissions'
@@ -28,12 +28,11 @@ export function AgentStatusIndicator() {
 
   // Fetch agents from kc-agent health endpoint (works even in demo mode
   // when the WebSocket is not connected)
-  const fetchAgentsFromHealth = useCallback(async () => {
+  const fetchAgentsFromHealth = async () => {
     setIsDiscoveringAgents(true)
     try {
       const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/health`, {
-        signal: AbortSignal.timeout(BACKEND_HEALTH_CHECK_TIMEOUT_MS),
-      })
+        signal: AbortSignal.timeout(BACKEND_HEALTH_CHECK_TIMEOUT_MS) })
       if (!res.ok) return
       const data = await res.json()
       if (data.availableProviders) {
@@ -46,23 +45,21 @@ export function AgentStatusIndicator() {
           'antigravity': 'google-ag',
           'bob': 'bob',
           'gh-copilot': 'github',
-          'vscode': 'microsoft',
-        }
+          'vscode': 'microsoft' }
         setDiscoveredAgents(data.availableProviders.map((p: { name: string; displayName: string; capabilities: number }) => ({
           name: p.name,
           displayName: p.displayName,
           description: '',
           provider: nameToProvider[p.name] || p.name,
           available: true,
-          capabilities: p.capabilities,
-        })))
+          capabilities: p.capabilities })))
       }
     } catch {
       // kc-agent not reachable
     } finally {
       setIsDiscoveringAgents(false)
     }
-  }, [])
+  }
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   // ── Stabilize pill status ──────────────────────────────────────────────
@@ -268,9 +265,29 @@ export function AgentStatusIndicator() {
                 </span>
               )}
             </div>
+            {/* Show selected agent name and model when connected */}
+            {isConnected && selectedAgent && selectedAgent !== 'none' && (() => {
+              const activeAgent = agents.find(a => a.name === selectedAgent)
+              return activeAgent ? (
+                <div className="flex items-center gap-2 mt-1.5">
+                  <span className="text-xs text-foreground font-medium">{activeAgent.displayName}</span>
+                  {activeAgent.model ? (
+                    <span className="text-2xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
+                      {activeAgent.model}
+                    </span>
+                  ) : activeAgent.provider === 'github-cli' ? (
+                    <span className="text-2xs text-muted-foreground italic">Default model</span>
+                  ) : null}
+                </div>
+              ) : null
+            })()}
             <p className="text-xs text-muted-foreground mt-1">
               {isDemoMode
-                ? t('agent.agentBypassedInDemo')
+                ? isDemoModeForced
+                  // Hosted demo (e.g. console.kubestellar.io): agent can never connect
+                  // from this origin, so point the user at the self-host path.
+                  ? t('agent.hostedDemoBypassed')
+                  : t('agent.agentBypassedInDemo')
                 : isDegraded
                 ? t('agent.connectedButErrors', { count: dataErrorCount })
                 : isConnected
@@ -280,6 +297,20 @@ export function AgentStatusIndicator() {
                 : t('agent.unableToConnect')
               }
             </p>
+            {/* When running on the hosted demo, surface a self-host link so
+                users who want real cluster data know where to go next. */}
+            {isDemoMode && isDemoModeForced && (
+              <p className="text-xs text-muted-foreground mt-1">
+                <a
+                  href="https://github.com/kubestellar/console#quick-start"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-purple-400 hover:text-purple-300 underline underline-offset-2"
+                >
+                  {t('agent.selfHostToConnect')}
+                </a>
+              </p>
+            )}
             {!isDemoMode && isDegraded && lastDataError && (
               <p className="text-xs text-yellow-400 mt-1">
                 {t('agent.lastError', { error: lastDataError })}

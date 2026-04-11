@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import { Bot, Wrench, Cpu } from 'lucide-react'
 import { useKagentCRDAgents, useKagentCRDTools, useKagentCRDModels } from '../../../hooks/mcp/kagent_crds'
 import { useCardLoadingState } from '../CardDataContext'
+import { DynamicCardErrorBoundary } from '../DynamicCardErrorBoundary'
 import { useTranslation } from 'react-i18next'
 import {
   KAGENT_RUNTIME_PYTHON, KAGENT_RUNTIME_GO, KAGENT_RUNTIME_BYO,
@@ -31,18 +32,28 @@ interface TopoEdge {
   type: 'agent-tool' | 'agent-model'
 }
 
-export function KagentTopology({ config }: { config?: Record<string, unknown> }) {
+// #6216 part 2: wrapped at the bottom of the file in DynamicCardErrorBoundary
+// so a runtime error in the 234-line topology renderer doesn't crash the
+// dashboard. Same pattern as #6237 part 1.
+function KagentTopologyInternal({ config }: { config?: Record<string, unknown> }) {
   const { t } = useTranslation('cards')
   const cluster = config?.cluster as string | undefined
-  const { data: agents, isLoading: agentsLoading, isDemoFallback: agentsDemo } = useKagentCRDAgents({ cluster })
-  const { data: tools, isLoading: toolsLoading, isDemoFallback: toolsDemo } = useKagentCRDTools({ cluster })
-  const { data: models, isLoading: modelsLoading, isDemoFallback: modelsDemo } = useKagentCRDModels({ cluster })
+  const { data: agents, isLoading: agentsLoading, isDemoFallback: agentsDemo, isFailed: agentsFailed, consecutiveFailures: agentsFails } = useKagentCRDAgents({ cluster })
+  const { data: tools, isLoading: toolsLoading, isDemoFallback: toolsDemo, isFailed: toolsFailed, consecutiveFailures: toolsFails } = useKagentCRDTools({ cluster })
+  const { data: models, isLoading: modelsLoading, isDemoFallback: modelsDemo, isFailed: modelsFailed, consecutiveFailures: modelsFails } = useKagentCRDModels({ cluster })
 
   const hasData = agents.length > 0 || tools.length > 0 || models.length > 0
+  // #6219: surface failure state to CardWrapper. We treat the card as
+  // failed when ALL three CRD hooks are failing — partial failure of one
+  // hook still leaves a useful topology.
+  const isFailed = agentsFailed && toolsFailed && modelsFailed
+  const consecutiveFailures = Math.max(agentsFails || 0, toolsFails || 0, modelsFails || 0)
   useCardLoadingState({
     isLoading: (agentsLoading || toolsLoading || modelsLoading) && !hasData,
     hasAnyData: hasData,
     isDemoData: agentsDemo || toolsDemo || modelsDemo,
+    isFailed,
+    consecutiveFailures,
   })
 
   const { nodes, edges } = useMemo(() => {
@@ -129,7 +140,14 @@ export function KagentTopology({ config }: { config?: Record<string, unknown> })
     return { nodes: nodesArr, edges: edgesArr }
   }, [agents, tools, models])
 
-  if (agentsLoading || toolsLoading || modelsLoading) {
+  // issue 6448 — Stale-while-revalidate: only show the blocking skeleton on
+  // the initial load. Once we have data cached, a background refresh should
+  // keep rendering the cached topology (the cache-level demo/refresh
+  // indicator already communicates that data is updating). Previously this
+  // unconditionally showed the skeleton on any hook `isLoading`, which
+  // hid the cached view during every refresh tick.
+  const anyLoading = agentsLoading || toolsLoading || modelsLoading
+  if (anyLoading && !hasData) {
     return (
       <div className="h-full flex flex-col min-h-card p-4 animate-pulse">
         <div className="flex-1 bg-secondary rounded-lg" />
@@ -230,5 +248,13 @@ export function KagentTopology({ config }: { config?: Record<string, unknown> })
         </svg>
       </div>
     </div>
+  )
+}
+
+export function KagentTopology(props: { config?: Record<string, unknown> }) {
+  return (
+    <DynamicCardErrorBoundary cardId="KagentTopology">
+      <KagentTopologyInternal {...props} />
+    </DynamicCardErrorBoundary>
   )
 }

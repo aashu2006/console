@@ -106,8 +106,7 @@ export function KubeKong(_props: CardComponentProps) {
     onGround: true,
     climbing: false,
     facingRight: true,
-    jumpedBarrels: new Set(),
-  })
+    jumpedBarrels: new Set() })
   const [barrels, setBarrels] = useState<Barrel[]>([])
   const [score, setScore] = useState(0)
   const [lives, setLives] = useState(3)
@@ -123,7 +122,14 @@ export function KubeKong(_props: CardComponentProps) {
     gameStateRef.current = { player, barrels }
   }, [player, barrels])
 
-  // Check if player is on a ladder
+  // Check if player is on a ladder.
+  // #6304: useCallback with [] so the reference is stable across
+  // renders. Previously this was a plain function redefined every
+  // render, which caused the game-loop useEffect (whose deps include
+  // this callback) to re-run on every render, clearing the
+  // setInterval and resetting `barrelSpawnCounter = 0` before it
+  // could reach the spawn threshold — so Kong never threw a single
+  // barrel. Reads only module-level constants, so [] is safe.
   const getOnLadder = useCallback((x: number, y: number): Ladder | null => {
     const playerCenterX = x + PLAYER_WIDTH / 2
     for (const ladder of LADDERS) {
@@ -136,7 +142,7 @@ export function KubeKong(_props: CardComponentProps) {
     return null
   }, [])
 
-  // Check platform collision for player
+  // Check platform collision for player. Same #6304 fix reasoning.
   const checkPlatformCollision = useCallback((x: number, y: number, vy: number): { onGround: boolean; groundY: number } => {
     const playerBottom = y + PLAYER_HEIGHT
     const playerCenterX = x + PLAYER_WIDTH / 2
@@ -512,8 +518,7 @@ export function KubeKong(_props: CardComponentProps) {
           y: 80,
           vx: BARREL_SPEED,
           vy: 0,
-          rolling: true,
-        }])
+          rolling: true }])
       }
 
       // Update barrels
@@ -635,11 +640,10 @@ export function KubeKong(_props: CardComponentProps) {
 
   // Keyboard controls — scoped to visible game container (KeepAlive-safe)
   useGameKeyTracking(gameContainerRef, keysRef, {
-    preventDefaultKeys: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'w', 'a', 's', 'd', 'W', 'A', 'S', 'D'],
-  })
+    preventDefaultKeys: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'w', 'a', 's', 'd', 'W', 'A', 'S', 'D'] })
 
   // Start game
-  const startGame = useCallback(() => {
+  const startGame = () => {
     setPlayer({
       x: 20,
       y: 276,
@@ -648,8 +652,7 @@ export function KubeKong(_props: CardComponentProps) {
       onGround: true,
       climbing: false,
       facingRight: true,
-      jumpedBarrels: new Set(),
-    })
+      jumpedBarrels: new Set() })
     setBarrels([])
     setScore(0)
     setLives(3)
@@ -659,7 +662,7 @@ export function KubeKong(_props: CardComponentProps) {
     setBossFrame(0)
     setIsPlaying(true)
     emitGameStarted('kube_kong')
-  }, [])
+  }
 
   const scale = isExpanded ? 1.5 : 1
 

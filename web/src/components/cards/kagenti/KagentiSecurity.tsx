@@ -1,4 +1,3 @@
-import { useMemo } from 'react'
 import { Shield, ShieldCheck, ShieldAlert, AlertTriangle } from 'lucide-react'
 import { useKagentiCards, type KagentiCard } from '../../../hooks/mcp/kagenti'
 import { useCardLoadingState } from '../CardDataContext'
@@ -11,10 +10,9 @@ export function KagentiSecurity({ config }: { config?: Record<string, unknown> }
   useCardLoadingState({
     isLoading: isLoading && !hasData,
     hasAnyData: hasData,
-    isDemoData: isDemoFallback,
-  })
+    isDemoData: isDemoFallback })
 
-  const stats = useMemo(() => {
+  const stats = (() => {
     const total = cards.length
     const strict = cards.filter((c: KagentiCard) => c.identityBinding === 'strict').length
     const permissive = cards.filter((c: KagentiCard) => c.identityBinding === 'permissive').length
@@ -22,11 +20,9 @@ export function KagentiSecurity({ config }: { config?: Record<string, unknown> }
     const bound = strict + permissive
     const pct = total > 0 ? Math.round((bound / total) * 100) : 0
     return { total, strict, permissive, unbound, bound, pct }
-  }, [cards])
+  })()
 
-  const unboundAgents = useMemo(() =>
-    cards.filter((c: KagentiCard) => c.identityBinding === 'none'),
-  [cards])
+  const unboundAgents = cards.filter((c: KagentiCard) => c.identityBinding === 'none')
 
   if (isLoading && !hasData) {
     return (
@@ -79,7 +75,10 @@ export function KagentiSecurity({ config }: { config?: Record<string, unknown> }
           </div>
           <div className="space-y-1">
             {unboundAgents.map((agent: KagentiCard) => (
-              <div key={`${agent.cluster}-${agent.name}`} className="flex items-center justify-between text-xs py-1 px-2 rounded bg-red-400/5 border border-red-400/10">
+              // issue 6449 — include namespace in the React key to avoid
+              // collisions when two cards share the same name across
+              // namespaces on the same cluster.
+              <div key={`${agent.cluster}:${agent.namespace}:${agent.name}`} className="flex items-center justify-between text-xs py-1 px-2 rounded bg-red-400/5 border border-red-400/10">
                 <div className="flex items-center gap-1.5">
                   <ShieldAlert className="w-3 h-3 text-red-400" />
                   <span className="text-foreground">{agent.agentName}</span>

@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback, useRef, ReactNode } from 'react'
+import { useState, useEffect, useRef, ReactNode } from 'react'
 import { useSearchParams, useLocation } from 'react-router-dom'
-import { Plus, LayoutGrid, ChevronDown, ChevronRight } from 'lucide-react'
+import { LayoutGrid, ChevronDown, ChevronRight } from 'lucide-react'
+import { EmptyState, EmptyStateAction } from '../../components/ui/EmptyState'
 import { getIcon } from '../icons'
 import {
   DndContext,
@@ -9,19 +10,16 @@ import {
   rectIntersection,
   DragOverlay,
   type DragEndEvent,
-  type CollisionDetection,
-} from '@dnd-kit/core'
+  type CollisionDetection } from '@dnd-kit/core'
 import {
   SortableContext,
-  rectSortingStrategy,
-} from '@dnd-kit/sortable'
+  rectSortingStrategy } from '@dnd-kit/sortable'
 import { useDashboard } from './dashboardHooks'
 import type { DashboardCard, DashboardCardPlacement } from './types'
 import { SortableDashboardCard, DragPreviewCard } from './DashboardComponents'
-import { AddCardModal } from '../../components/dashboard/AddCardModal'
-import { TemplatesModal } from '../../components/dashboard/TemplatesModal'
 import { ConfigureCardModal } from '../../components/dashboard/ConfigureCardModal'
 import { FloatingDashboardActions } from '../../components/dashboard/FloatingDashboardActions'
+import { DashboardCustomizer } from '../../components/dashboard/customizer/DashboardCustomizer'
 import { DashboardTemplate } from '../../components/dashboard/templates'
 import { StatsOverview, StatBlockValue } from '../../components/ui/StatsOverview'
 import { DashboardStatsType } from '../../components/ui/StatsBlockDefinitions'
@@ -70,10 +68,13 @@ export interface DashboardPageProps {
   headerExtra?: ReactNode
   /** Extra content rendered on the right side of the header (e.g., action buttons) */
   rightExtra?: ReactNode
-  /** Empty state configuration for no cards */
+  /** Empty state configuration for no cards. An optional `action` (primary CTA)
+   *  and `secondaryAction` surface next-step guidance — see issue 6392. */
   emptyState?: {
     title: string
     description: string
+    action?: EmptyStateAction
+    secondaryAction?: EmptyStateAction
   }
   /** Whether this dashboard shows demo/mock data */
   isDemoData?: boolean
@@ -105,8 +106,7 @@ export function DashboardPage({
   rightExtra,
   emptyState,
   isDemoData = false,
-  onDragEnd: externalDragEnd,
-}: DashboardPageProps) {
+  onDragEnd: externalDragEnd }: DashboardPageProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const location = useLocation()
   // Capture the route path at mount time — KeepAlive keeps this component alive
@@ -116,9 +116,9 @@ export function DashboardPage({
   const Icon = getIcon(icon)
 
   // Combine refresh with indicator
-  const combinedRefetch = useCallback(() => {
+  const combinedRefetch = () => {
     onRefresh?.()
-  }, [onRefresh])
+  }
   const { showIndicator, triggerRefresh } = useRefreshIndicator(combinedRefetch)
 
   // Use the shared dashboard hook for cards, DnD, modals, auto-refresh
@@ -133,8 +133,10 @@ export function DashboardPage({
     isCustomized,
     showAddCard,
     setShowAddCard,
-    showTemplates,
-    setShowTemplates,
+    // showTemplates and setShowTemplates are no longer used directly —
+    // templates are accessed via the unified DashboardCustomizer
+    showTemplates: _showTemplates,
+    setShowTemplates: _setShowTemplates,
     configuringCard,
     setConfiguringCard,
     openConfigureCard,
@@ -147,16 +149,14 @@ export function DashboardPage({
     undo,
     redo,
     canUndo,
-    canRedo,
-  } = useDashboard({
+    canRedo } = useDashboard({
     storageKey,
     defaultCards,
-    onRefresh,
-  })
+    onRefresh })
 
   // Workload-aware collision detection: when dragging a workload, prefer
   // cluster-group droppables over the larger sortable card containers.
-  const collisionDetection: CollisionDetection = useCallback((args) => {
+  const collisionDetection: CollisionDetection = (args) => {
     const isWorkloadDrag = args.active.data.current?.type === 'workload'
     if (isWorkloadDrag) {
       const allCollisions = [...pointerWithin(args), ...rectIntersection(args)]
@@ -180,13 +180,13 @@ export function DashboardPage({
       return []
     }
     return closestCenter(args)
-  }, [])
+  }
 
   // Combined drag-end: card reorder + external handler (e.g. workload deploy)
-  const handleDragEnd = useCallback((event: DragEndEvent) => {
+  const handleDragEnd = (event: DragEndEvent) => {
     baseDragEnd(event)
     externalDragEnd?.(event)
-  }, [baseDragEnd, externalDragEnd])
+  }
 
   // Prefetch React.lazy() chunks for cards on this dashboard
   useEffect(() => {
@@ -197,14 +197,21 @@ export function DashboardPage({
   const isRefreshing = externalRefreshing || showIndicator
   const isFetching = isLoading || isRefreshing
 
-  // Handle addCard URL param - open modal and clear param.
+  // Handle addCard and customizeSidebar URL params via the DashboardCustomizer.
   // Guard with mounted route: KeepAlive keeps hidden dashboards mounted,
   // so all of them see the same searchParams. Only process when active.
   const [addCardSearch, setAddCardSearch] = useState('')
+  // Determine initial section for DashboardCustomizer based on URL params
+  const [customizerInitialSection, setCustomizerInitialSection] = useState<'cards' | 'dashboards' | undefined>(undefined)
   useEffect(() => {
     if (location.pathname !== mountedRouteRef.current) return
     if (searchParams.get('addCard') === 'true') {
       setAddCardSearch(searchParams.get('cardSearch') || '')
+      setCustomizerInitialSection('cards')
+      setShowAddCard(true)
+      setSearchParams({}, { replace: true })
+    } else if (searchParams.get('customizeSidebar') === 'true') {
+      setCustomizerInitialSection('dashboards')
       setShowAddCard(true)
       setSearchParams({}, { replace: true })
     }
@@ -216,15 +223,14 @@ export function DashboardPage({
   insertAtIndexRef.current = insertAtIndex
 
   // Card handlers
-  const handleAddCards = useCallback((newCards: Array<{ type: string; title: string; config: Record<string, unknown> }>) => {
+  const handleAddCards = (newCards: Array<{ type: string; title: string; config: Record<string, unknown> }>) => {
     const idx = insertAtIndexRef.current
     if (idx !== null) {
       const cardsToAdd = newCards.map(c => ({
         id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         card_type: c.type,
         config: c.config || {},
-        title: c.title,
-      }))
+        title: c.title }))
       setCards(prev => [...prev.slice(0, idx), ...cardsToAdd, ...prev.slice(idx)])
       setInsertAtIndex(null)
     } else {
@@ -232,62 +238,63 @@ export function DashboardPage({
     }
     expandCards()
     setShowAddCard(false)
-  }, [addCards, setCards, expandCards, setShowAddCard])
+  }
 
-  const handleRemoveCard = useCallback((cardId: string) => {
+  const handleRemoveCard = (cardId: string) => {
     removeCard(cardId)
-  }, [removeCard])
+  }
 
-  const handleConfigureCard = useCallback((cardId: string) => {
+  const handleConfigureCard = (cardId: string) => {
     openConfigureCard(cardId)
-  }, [openConfigureCard])
+  }
 
-  const handleSaveCardConfig = useCallback((cardId: string, config: Record<string, unknown>) => {
+  const handleSaveCardConfig = (cardId: string, config: Record<string, unknown>) => {
     configureCard(cardId, config)
     setConfiguringCard(null)
-  }, [configureCard, setConfiguringCard])
+  }
 
-  const handleWidthChange = useCallback((cardId: string, newWidth: number) => {
+  const handleWidthChange = (cardId: string, newWidth: number) => {
     updateCardWidth(cardId, newWidth)
-  }, [updateCardWidth])
+  }
 
-  const applyTemplate = useCallback((template: DashboardTemplate) => {
+  const applyTemplate = (template: DashboardTemplate) => {
     const newCards = template.cards.map((card, i) => ({
       id: `card-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`,
       card_type: card.card_type,
       config: card.config || {},
-      title: card.title,
-    }))
+      title: card.title }))
     setCards(newCards)
     expandCards()
-    setShowTemplates(false)
-  }, [setCards, expandCards, setShowTemplates])
+    // Close DashboardCustomizer after applying template
+    setShowAddCard(false)
+  }
 
   // Merged stat value getter: dashboard-specific first, then universal fallback
-  const getStatValue = useCallback(
-    (blockId: string): StatBlockValue => {
+  const getStatValue = (blockId: string): StatBlockValue => {
       if (customGetStatValue) {
         return createMergedStatValueGetter(customGetStatValue, getUniversalStatValue)(blockId)
       }
       return getUniversalStatValue(blockId) ?? { value: '-', sublabel: '' }
-    },
-    [customGetStatValue, getUniversalStatValue]
-  )
+    }
 
   // Transform card for ConfigureCardModal
   const configureCardData = configuringCard ? {
     id: configuringCard.id,
     card_type: configuringCard.card_type,
     config: configuringCard.config,
-    title: configuringCard.title,
-  } : null
+    title: configuringCard.title } : null
 
   // Default empty state text
   const emptyTitle = emptyState?.title || `${title} Dashboard`
   const emptyDescription = emptyState?.description || `Add cards to monitor your ${title.toLowerCase()} across clusters.`
 
   return (
-    <div className="pt-16">
+    // `min-w-0 max-w-full` + overflow-x-hidden on the outer wrapper prevents
+    // wide inline content (tables, pre blocks, long URLs) from pushing the
+    // whole page past the viewport width at narrow breakpoints (issues 6385,
+    // 6387, 6394). Individual scrollable children (tables) still get their
+    // own horizontal scroll inside this clipped box.
+    <div className="pt-16 min-w-0 max-w-full overflow-x-hidden">
       {/* Header */}
       <DashboardHeader
         title={title}
@@ -343,22 +350,17 @@ export function DashboardPage({
         {showCards && (
           <>
             {cards.length === 0 ? (
-              <div className="glass p-8 rounded-lg border-2 border-dashed border-border/50 text-center">
-                <div className="flex justify-center mb-4">
-                  <Icon className="w-12 h-12 text-muted-foreground" />
-                </div>
-                <h3 className="text-lg font-medium text-foreground mb-2">{emptyTitle}</h3>
-                <p className="text-muted-foreground text-sm max-w-md mx-auto mb-4">
-                  {emptyDescription}
-                </p>
-                <button
-                  onClick={() => setShowAddCard(true)}
-                  className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 rounded-lg transition-colors"
-                >
-                  <Plus className="w-4 h-4" />
-                  Add Cards
-                </button>
-              </div>
+              <EmptyState
+                icon={<Icon className="w-12 h-12 text-muted-foreground" />}
+                title={emptyTitle}
+                description={emptyDescription}
+                action={emptyState?.action ?? {
+                  label: 'Add Cards',
+                  onClick: () => setShowAddCard(true),
+                }}
+                secondaryAction={emptyState?.secondaryAction}
+                data-testid="dashboard-empty-state"
+              />
             ) : (
               <DndContext
                 sensors={sensors}
@@ -408,32 +410,32 @@ export function DashboardPage({
       {/* Dashboard-specific content */}
       {children}
 
-      {/* Floating action buttons */}
+      {/* Floating action button — opens Dashboard Studio */}
       <FloatingDashboardActions
-        onAddCard={() => setShowAddCard(true)}
-        onOpenTemplates={() => setShowTemplates(true)}
-        onResetToDefaults={reset}
-        isCustomized={isCustomized}
+        onOpenCustomizer={() => setShowAddCard(true)}
         onUndo={undo}
         onRedo={redo}
         canUndo={canUndo}
         canRedo={canRedo}
       />
 
-      {/* Add Card Modal */}
-      <AddCardModal
+      {/* Dashboard Studio — unified customization panel */}
+      <DashboardCustomizer
         isOpen={showAddCard}
-        onClose={() => { setShowAddCard(false); setAddCardSearch(''); setInsertAtIndex(null) }}
+        onClose={() => { setShowAddCard(false); setAddCardSearch(''); setInsertAtIndex(null); setCustomizerInitialSection(undefined) }}
+        dashboardName={title}
         onAddCards={handleAddCards}
         existingCardTypes={cards.map(c => c.card_type)}
+        initialSection={customizerInitialSection}
         initialSearch={addCardSearch}
-      />
-
-      {/* Templates Modal */}
-      <TemplatesModal
-        isOpen={showTemplates}
-        onClose={() => setShowTemplates(false)}
         onApplyTemplate={applyTemplate}
+        /* onExport not available on generic DashboardPage — only on Dashboard.tsx */
+        onReset={reset}
+        isCustomized={isCustomized}
+        onUndo={undo}
+        onRedo={redo}
+        canUndo={canUndo}
+        canRedo={canRedo}
       />
 
       {/* Configure Card Modal */}

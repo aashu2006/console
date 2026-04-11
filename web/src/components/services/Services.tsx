@@ -1,6 +1,7 @@
-import { useCallback } from 'react'
-import { AlertCircle } from 'lucide-react'
+import { AlertCircle, Server } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { useClusters, useServices } from '../../hooks/useMCP'
+import { ROUTES } from '../../config/routes'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
@@ -15,6 +16,7 @@ const SERVICES_CARDS_KEY = 'kubestellar-services-cards'
 const DEFAULT_SERVICES_CARDS = getDefaultCards('services')
 
 export function Services() {
+  const navigate = useNavigate()
   const { clusters, isLoading, isRefreshing: dataRefreshing, lastUpdated, refetch, error: clustersError } = useClusters()
   const { services, error: servicesError } = useServices()
   const error = clustersError || servicesError
@@ -39,9 +41,18 @@ export function Services() {
   const loadBalancers = filteredServices.filter(s => s.type === 'LoadBalancer').length
   const nodePortServices = filteredServices.filter(s => s.type === 'NodePort').length
   const clusterIPServices = filteredServices.filter(s => s.type === 'ClusterIP').length
+  // Issue #6150: "Endpoints" stat must reflect the actual number of
+  // ready backend addresses (pods) across all services, not the number
+  // of services. Each service's `endpoints` field is the sum of ready
+  // addresses from its core/v1 Endpoints object as populated by the
+  // backend. Services with no matching pods contribute 0.
+  const totalEndpoints = filteredServices.reduce(
+    (sum, svc) => sum + (svc.endpoints ?? 0),
+    0,
+  )
 
   // Stats value getter
-  const getDashboardStatValue = useCallback((blockId: string): StatBlockValue => {
+  const getDashboardStatValue = (blockId: string): StatBlockValue => {
     switch (blockId) {
       case 'clusters':
         return { value: reachableClusters.length, sublabel: 'clusters', onClick: () => drillToAllClusters(), isClickable: reachableClusters.length > 0 }
@@ -58,16 +69,13 @@ export function Services() {
       case 'ingresses':
         return { value: 0, sublabel: 'ingresses', isClickable: false }
       case 'endpoints':
-        return { value: totalServices, sublabel: 'endpoints', onClick: () => drillToAllServices(), isClickable: totalServices > 0 }
+        return { value: totalEndpoints, sublabel: 'endpoints', onClick: () => drillToAllServices(), isClickable: totalEndpoints > 0 }
       default:
         return { value: 0 }
     }
-  }, [reachableClusters.length, totalServices, loadBalancers, nodePortServices, clusterIPServices, drillToAllServices, drillToAllClusters])
+  }
 
-  const getStatValue = useCallback(
-    (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId),
-    [getDashboardStatValue, getUniversalStatValue]
-  )
+  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
 
   return (
     <DashboardPage
@@ -85,8 +93,21 @@ export function Services() {
       lastUpdated={lastUpdated}
       hasData={reachableClusters.length > 0}
       emptyState={{
-        title: 'Services Dashboard',
-        description: 'Add cards to monitor Kubernetes services, endpoints, and network connectivity across your clusters.',
+        // Issues 6391/6392/6393: give the Services empty state actionable guidance.
+        // The primary CTA (add cards) is provided automatically by DashboardPage;
+        // we surface a secondary "Connect a cluster" action when there are no
+        // reachable clusters so the user knows what to do next.
+        title: reachableClusters.length === 0 ? 'No services yet' : 'Services Dashboard',
+        description: reachableClusters.length === 0
+          ? 'Connect a Kubernetes cluster to start monitoring services, endpoints, and network connectivity.'
+          : 'Add cards to monitor Kubernetes services, endpoints, and network connectivity across your clusters.',
+        secondaryAction: reachableClusters.length === 0
+          ? {
+              label: 'Connect a cluster',
+              icon: Server,
+              onClick: () => navigate(ROUTES.CLUSTERS),
+            }
+          : undefined,
       }}
     >
       {/* Error Display */}

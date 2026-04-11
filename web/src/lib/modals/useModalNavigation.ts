@@ -30,15 +30,17 @@ export function useModalNavigation({
   onBack,
   enableEscape = true,
   enableBackspace = true,
-  disableBodyScroll = true,
-}: UseModalNavigationOptions): UseModalNavigationResult {
+  disableBodyScroll = true }: UseModalNavigationOptions): UseModalNavigationResult {
   // Handle keyboard events
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      // Escape should always work, even in input fields
+      // Escape should always work, even in input fields.
+      // stopImmediatePropagation prevents parent modals from also closing
+      // when a nested modal handles Escape first.
       if (e.key === 'Escape') {
         if (enableEscape) {
           e.preventDefault()
+          e.stopImmediatePropagation()
           onClose()
         }
         return
@@ -92,8 +94,7 @@ export function useModalNavigation({
   }, [isOpen, disableBodyScroll])
 
   return {
-    handleKeyDown,
-  }
+    handleKeyDown }
 }
 
 /**
@@ -195,8 +196,7 @@ export function useModal({
   modalRef,
   backdropRef,
   enableFocusTrap = false,
-  enableBackdropClose = true,
-}: UseModalOptions) {
+  enableBackdropClose = true }: UseModalOptions) {
   // Keyboard navigation
   useModalNavigation({
     isOpen,
@@ -204,8 +204,7 @@ export function useModal({
     onBack,
     enableEscape,
     enableBackspace,
-    disableBodyScroll,
-  })
+    disableBodyScroll })
 
   // Backdrop close
   if (backdropRef && enableBackdropClose) {

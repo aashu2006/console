@@ -1,4 +1,4 @@
-import { useCallback, useRef, useEffect } from 'react'
+import { useRef, useEffect } from 'react'
 import { AlertCircle } from 'lucide-react'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedDeployments, useCachedDeploymentIssues, useCachedPodIssues } from '../../hooks/useCachedData'
@@ -35,20 +35,31 @@ export function Deployments() {
   const { getStatValue: getUniversalStatValue } = useUniversalStats()
   const { selectedClusters: globalSelectedClusters, isAllClustersSelected } = useGlobalFilters()
 
-  const handleRefresh = useCallback(() => {
+  const handleRefresh = () => {
     refetch()
     refetchIssues()
-  }, [refetch, refetchIssues])
+  }
 
   // Filter deployments based on global selection
   const filteredDeployments = deployments.filter(d =>
     isAllClustersSelected || (d.cluster && globalSelectedClusters.includes(d.cluster))
   )
 
+  // #5954 — Deployment and pod issues must be filtered by the same cluster
+  // selection so that per-cluster stats are consistent. Previously only
+  // `filteredDeployments` was filtered while issue counts remained global,
+  // producing misleading dashboards when a single cluster was selected.
+  const filteredDeploymentIssues = deploymentIssues.filter(i =>
+    isAllClustersSelected || (i.cluster && globalSelectedClusters.includes(i.cluster))
+  )
+  const filteredPodIssues = podIssues.filter(i =>
+    isAllClustersSelected || (i.cluster && globalSelectedClusters.includes(i.cluster))
+  )
+
   // Calculate current stats
   const currentTotalDeployments = filteredDeployments.length
   const currentHealthyDeployments = filteredDeployments.filter(d => d.readyReplicas === d.replicas && d.replicas > 0).length
-  const currentIssueCount = deploymentIssues.length
+  const currentIssueCount = filteredDeploymentIssues.length
 
   // Cache stats to prevent showing 0 during refresh
   const cachedStats = useRef({ total: 0, healthy: 0, issues: 0 })
@@ -57,8 +68,7 @@ export function Deployments() {
       cachedStats.current = {
         total: currentTotalDeployments,
         healthy: currentHealthyDeployments,
-        issues: currentIssueCount,
-      }
+        issues: currentIssueCount }
     }
   }, [currentTotalDeployments, currentHealthyDeployments, currentIssueCount])
 
@@ -68,7 +78,7 @@ export function Deployments() {
   const issueCount = currentTotalDeployments > 0 ? currentIssueCount : cachedStats.current.issues
 
   // Stats value getter for the configurable StatsOverview component
-  const getDashboardStatValue = useCallback((blockId: string): StatBlockValue => {
+  const getDashboardStatValue = (blockId: string): StatBlockValue => {
     switch (blockId) {
       case 'namespaces':
         return { value: totalDeployments, sublabel: 'total deployments', onClick: () => drillToAllDeployments(), isClickable: totalDeployments > 0 }
@@ -81,18 +91,15 @@ export function Deployments() {
       case 'deployments':
         return { value: totalDeployments, sublabel: 'deployments', onClick: () => drillToAllDeployments(), isClickable: totalDeployments > 0 }
       case 'pod_issues':
-        return { value: podIssues.length, sublabel: 'pod issues', onClick: () => drillToAllPods('issues'), isClickable: podIssues.length > 0 }
+        return { value: filteredPodIssues.length, sublabel: 'pod issues', onClick: () => drillToAllPods('issues'), isClickable: filteredPodIssues.length > 0 }
       case 'deployment_issues':
         return { value: issueCount, sublabel: 'deploy issues', onClick: () => drillToAllDeployments('issues'), isClickable: issueCount > 0 }
       default:
         return { value: 0 }
     }
-  }, [totalDeployments, healthyDeployments, issueCount, podIssues, drillToAllDeployments, drillToAllPods])
+  }
 
-  const getStatValue = useCallback(
-    (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId),
-    [getDashboardStatValue, getUniversalStatValue]
-  )
+  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
 
   return (
     <DashboardPage
@@ -111,8 +118,7 @@ export function Deployments() {
       hasData={deployments.length > 0}
       emptyState={{
         title: 'Deployments Dashboard',
-        description: 'Add cards to monitor deployment health, rollout progress, and issues across your clusters.',
-      }}
+        description: 'Add cards to monitor deployment health, rollout progress, and issues across your clusters.' }}
     >
       {/* Error Display */}
       {error && (

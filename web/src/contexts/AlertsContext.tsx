@@ -1,4 +1,4 @@
-import { createContext, use, useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense, type ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, type ReactNode } from 'react'
 import { settledWithConcurrency } from '../lib/utils/concurrency'
 import { useMissions } from '../hooks/useMissions'
 import { useDemoMode } from '../hooks/useDemoMode'
@@ -6,8 +6,7 @@ import type {
   Alert,
   AlertRule,
   AlertStats,
-  AlertChannel,
-} from '../types/alerts'
+  AlertChannel } from '../types/alerts'
 import type { GPUHealthCheckResult } from '../hooks/mcp/types'
 import type { NightlyGuideStatus } from '../lib/llmd/nightlyE2EDemoData'
 import type { AlertsMCPData } from './AlertsDataFetcher'
@@ -58,6 +57,8 @@ interface ResolveMutation {
   type: 'resolve'
   ruleId: string
   cluster?: string
+  /** When set, narrow the match to a specific resource (e.g., pod name) */
+  resource?: string
   /** When set, match any alert for this rule regardless of cluster */
   matchAny?: boolean
 }
@@ -183,8 +184,7 @@ function applyMutations(
             details: mut.details,
             resource: mut.resource,
             namespace: mut.namespace,
-            resourceKind: mut.resourceKind,
-          }
+            resourceKind: mut.resourceKind }
         }
         break
       }
@@ -201,7 +201,10 @@ function applyMutations(
             if (
               result[i].ruleId === mut.ruleId &&
               result[i].status === 'firing' &&
-              result[i].cluster === mut.cluster
+              result[i].cluster === mut.cluster &&
+              // When resource is specified, only resolve the exact resource match
+              // (e.g., a specific pod). Otherwise resolve all alerts for the cluster.
+              (!mut.resource || result[i].resource === mut.resource)
             ) {
               result[i] = { ...result[i], status: 'resolved', resolvedAt }
             }
@@ -369,8 +372,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         ...preset,
         id: generateId(),
         createdAt: now,
-        updatedAt: now,
-      }))
+        updatedAt: now }))
       saveToStorage(ALERT_RULES_KEY, presetRules)
       return presetRules
     }
@@ -391,8 +393,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     podIssues: [],
     clusters: [],
     isLoading: true,
-    error: null,
-  })
+    error: null })
 
   const { startMission } = useMissions()
   const { isDemoMode } = useDemoMode()
@@ -423,7 +424,23 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   // from sending repeated macOS notifications on every evaluation cycle.
   // Keys are NOT cleared on resolve — a cooldown period prevents re-notification
   // when clusters flap between reachable/unreachable states.
+  //
+  // Persisted to localStorage on every mutation to prevent duplicate
+  // notifications after page refresh (#5258). Previously keys were only
+  // saved at the end of evaluateConditions, so a refresh mid-cycle lost them.
   const notifiedAlertKeysRef = useRef<Map<string, number>>(loadNotifiedAlertKeys())
+
+  /** Set a notification dedup key and immediately persist to localStorage (#5258). */
+  const setNotifiedKey = useCallback((key: string, timestamp: number) => {
+    notifiedAlertKeysRef.current.set(key, timestamp)
+    saveNotifiedAlertKeys(notifiedAlertKeysRef.current)
+  }, [])
+
+  /** Delete a notification dedup key and immediately persist to localStorage (#5258). */
+  const deleteNotifiedKey = useCallback((key: string) => {
+    notifiedAlertKeysRef.current.delete(key)
+    saveNotifiedAlertKeys(notifiedAlertKeysRef.current)
+  }, [])
 
   // CronJob health results cache — fetched async, read synchronously by evaluator
   const cronJobResultsRef = useRef<Record<string, GPUHealthCheckResult[]>>({})
@@ -434,9 +451,10 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
 
   // Fetch CronJob results for all clusters periodically
   useEffect(() => {
+    let unmounted = false
     const fetchCronJobResults = async () => {
       const token = localStorage.getItem(STORAGE_KEY_AUTH_TOKEN)
-      if (!token) return
+      if (!token || unmounted) return
       const currentClusters = clustersRef.current
       if (!currentClusters.length) return
 
@@ -451,8 +469,6 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
               { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) }
             )
             if (resp.ok) {
-              // Use .catch() on .json() to prevent Firefox from firing unhandledrejection
-              // before the outer try/catch processes the rejection (microtask timing issue).
               const data = await resp.json().catch(() => null)
               if (data?.results && data.results.length > 0) {
                 results[cluster.name] = data.results
@@ -464,14 +480,13 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         })
       )
 
-      cronJobResultsRef.current = results
+      if (!unmounted) cronJobResultsRef.current = results
     }
 
-    // Initial fetch after short delay
     const timer = setTimeout(fetchCronJobResults, INITIAL_FETCH_DELAY_MS)
-    // Refresh every 60 seconds
     const interval = setInterval(fetchCronJobResults, POLL_INTERVAL_SLOW_MS)
     return () => {
+      unmounted = true
       clearTimeout(timer)
       clearInterval(interval)
     }
@@ -479,15 +494,14 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
 
   // Fetch nightly E2E run data periodically (public endpoint, no auth needed)
   useEffect(() => {
+    let unmounted = false
     const fetchNightlyE2E = async () => {
+      if (unmounted) return
       try {
         const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
         const resp = await fetch(`${API_BASE}/api/public/nightly-e2e/runs`, {
-          signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
-        })
-        if (resp.ok) {
-          // Use .catch() on .json() to prevent Firefox from firing unhandledrejection
-          // before the outer try/catch processes the rejection (microtask timing issue).
+          signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
+        if (resp.ok && !unmounted) {
           const data = await resp.json().catch(() => null)
           if (Array.isArray(data)) {
             nightlyE2ERef.current = data
@@ -501,6 +515,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     const timer = setTimeout(fetchNightlyE2E, SECONDARY_FETCH_DELAY_MS)
     const interval = setInterval(fetchNightlyE2E, NIGHTLY_E2E_POLL_INTERVAL_MS)
     return () => {
+      unmounted = true
       clearTimeout(timer)
       clearInterval(interval)
     }
@@ -524,8 +539,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         ...preset,
         id: generateId(),
         createdAt: now,
-        updatedAt: now,
-      }))
+        updatedAt: now }))
       return [...prev, ...newRules]
     })
   }, [])
@@ -576,19 +590,18 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   }, [isDemoMode])
 
   // Rule management
-  const createRule = useCallback((rule: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt'>) => {
+  const createRule = (rule: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt'>) => {
     const now = new Date().toISOString()
     const newRule: AlertRule = {
       ...rule,
       id: generateId(),
       createdAt: now,
-      updatedAt: now,
-    }
+      updatedAt: now }
     setRules(prev => [...prev, newRule])
     return newRule
-  }, [])
+  }
 
-  const updateRule = useCallback((id: string, updates: Partial<AlertRule>) => {
+  const updateRule = (id: string, updates: Partial<AlertRule>) => {
     setRules(prev =>
       prev.map(rule =>
         rule.id === id
@@ -596,13 +609,13 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           : rule
       )
     )
-  }, [])
+  }
 
-  const deleteRule = useCallback((id: string) => {
+  const deleteRule = (id: string) => {
     setRules(prev => prev.filter(rule => rule.id !== id))
-  }, [])
+  }
 
-  const toggleRule = useCallback((id: string) => {
+  const toggleRule = (id: string) => {
     setRules(prev =>
       prev.map(rule =>
         rule.id === id
@@ -610,9 +623,9 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           : rule
       )
     )
-  }, [])
+  }
 
-  // Calculate alert statistics
+  // Calculate alert statistics — memoize to prevent unstable references in context consumers
   const stats: AlertStats = useMemo(() => {
     const unacknowledgedFiring = alerts.filter(a => a.status === 'firing' && !a.acknowledgedAt)
     return {
@@ -622,8 +635,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
       critical: unacknowledgedFiring.filter(a => a.severity === 'critical').length,
       warning: unacknowledgedFiring.filter(a => a.severity === 'warning').length,
       info: unacknowledgedFiring.filter(a => a.severity === 'info').length,
-      acknowledged: alerts.filter(a => a.acknowledgedAt && a.status === 'firing').length,
-    }
+      acknowledged: alerts.filter(a => a.acknowledgedAt && a.status === 'firing').length }
   }, [alerts])
 
   // Get active (firing) alerts - exclude acknowledged alerts. Deduplicated via shared helper.
@@ -639,7 +651,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   }, [alerts, rules])
 
   // Acknowledge an alert
-  const acknowledgeAlert = useCallback((alertId: string, acknowledgedBy?: string) => {
+  const acknowledgeAlert = (alertId: string, acknowledgedBy?: string) => {
     setAlerts(prev =>
       prev.map(alert =>
         alert.id === alertId
@@ -647,10 +659,10 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           : alert
       )
     )
-  }, [])
+  }
 
   // Acknowledge multiple alerts at once
-  const acknowledgeAlerts = useCallback((alertIds: string[], acknowledgedBy?: string) => {
+  const acknowledgeAlerts = (alertIds: string[], acknowledgedBy?: string) => {
     const now = new Date().toISOString()
     setAlerts(prev =>
       prev.map(alert =>
@@ -659,10 +671,10 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           : alert
       )
     )
-  }, [])
+  }
 
   // Resolve an alert
-  const resolveAlert = useCallback((alertId: string) => {
+  const resolveAlert = (alertId: string) => {
     const resolvedAt = new Date().toISOString()
     // Find the alert BEFORE the state updater to avoid capturing mutable
     // variables inside the updater (which React may replay in Strict Mode /
@@ -689,20 +701,19 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         }
       })
     }
-  }, [rules])
+  }
 
   // Delete an alert
-  const deleteAlert = useCallback((alertId: string) => {
+  const deleteAlert = (alertId: string) => {
     setAlerts(prev => prev.filter(a => a.id !== alertId))
-  }, [])
+  }
 
   // Create a new alert — batching-aware.
   // When called during an evaluateConditions cycle (mutationAccRef.current is non-null),
   // mutations are collected into the accumulator and flushed in a single setAlerts call.
   // When called outside an evaluation cycle (e.g., manual trigger), falls back to a
   // direct setAlerts call so the alert appears immediately.
-  const createAlert = useCallback(
-    (
+  const createAlert = (
       rule: AlertRule,
       message: string,
       details: Record<string, unknown>,
@@ -740,8 +751,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
             details,
             resource,
             namespace,
-            resourceKind,
-          })
+            resourceKind })
         } else if (!alreadyQueued) {
           const alert: Alert = {
             id: generateId(),
@@ -756,8 +766,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
             resource,
             resourceKind,
             firedAt: new Date().toISOString(),
-            isDemo: isDemoMode,
-          }
+            isDemo: isDemoMode }
           acc.mutations.push({ type: 'create', rule, alert })
 
           // Queue notification for after the flush
@@ -799,8 +808,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         resource,
         resourceKind,
         firedAt,
-        isDemo: isDemoMode,
-      }
+        isDemo: isDemoMode }
 
       setAlerts(prev => {
         const existingAlert = prev.find(
@@ -851,14 +859,11 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           }
         })
       }
-    },
-    [isDemoMode]
-  )
+    }
 
   // Helper: queue an auto-resolve mutation — batching-aware.
   // During evaluation cycles, pushes to the accumulator; outside, calls setAlerts directly.
-  const queueAutoResolve = useCallback(
-    (ruleId: string, cluster?: string, matchAny?: boolean) => {
+  const queueAutoResolve = (ruleId: string, cluster?: string, matchAny?: boolean) => {
       const acc = mutationAccRef.current
       if (acc) {
         acc.mutations.push({ type: 'resolve', ruleId, cluster, matchAny })
@@ -881,9 +886,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         }
         return prev
       })
-    },
-    []
-  )
+    }
 
   // Send notifications for an alert (best-effort, silent on auth failures)
   const sendNotifications = async (alert: Alert, channels: AlertChannel[]) => {
@@ -898,11 +901,9 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
+          Authorization: `Bearer ${token}` },
         body: JSON.stringify({ alert, channels }),
-        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
-      })
+        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
 
       // Silently ignore auth errors - user may not be logged in
       if (response.status === 401 || response.status === 403) return
@@ -943,11 +944,9 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${token}`,
-              },
+                Authorization: `Bearer ${token}` },
               body: JSON.stringify({ alert, channels }),
-              signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
-            })
+              signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
             if (response.status === 401 || response.status === 403) return
             if (!response.ok) {
               const data = await response.json().catch(() => ({}))
@@ -965,8 +964,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   }
 
   // Run AI diagnosis on an alert
-  const runAIDiagnosis = useCallback(
-    (alertId: string) => {
+  const runAIDiagnosis = (alertId: string) => {
       const alert = alerts.find(a => a.id === alertId)
       if (!alert) return null
 
@@ -998,8 +996,7 @@ Please provide:
           namespace: alert.namespace,
           resource: alert.resource,
           resourceKind: alert.resourceKind,
-          alertMessage: alert.message,
-        }).then(result => {
+          alertMessage: alert.message }).then(result => {
           if (result.enrichedPrompt) {
             // The mission has already started; the enriched prompt will be
             // available for subsequent AI interactions in the mission context.
@@ -1020,9 +1017,7 @@ Please provide:
           alertId,
           alertType: alert.ruleName,
           details: alert.details,
-          runbookId: runbook?.id,
-        },
-      })
+          runbookId: runbook?.id } })
 
       setAlerts(prev =>
         prev.map(a =>
@@ -1034,21 +1029,16 @@ Please provide:
                   rootCause: '',
                   suggestions: [],
                   missionId,
-                  analyzedAt: new Date().toISOString(),
-                },
-              }
+                  analyzedAt: new Date().toISOString() } }
             : a
         )
       )
 
       return missionId
-    },
-    [alerts, rules, startMission]
-  )
+    }
 
   // Evaluate GPU usage condition — reads from refs for stable identity
-  const evaluateGPUUsage = useCallback(
-    (rule: AlertRule) => {
+  const evaluateGPUUsage = (rule: AlertRule) => {
       const threshold = rule.condition.threshold || 90
       const currentClusters = clustersRef.current
       const currentGPUNodes = gpuNodesRef.current
@@ -1065,7 +1055,7 @@ Please provide:
 
         const usagePercent = (allocatedGPUs / totalGPUs) * 100
 
-        if (usagePercent > threshold) {
+        if (usagePercent >= threshold) {
           createAlert(
             rule,
             `GPU usage is ${usagePercent.toFixed(1)}% (${allocatedGPUs}/${totalGPUs} GPUs allocated)`,
@@ -1073,8 +1063,7 @@ Please provide:
               usagePercent,
               allocatedGPUs,
               totalGPUs,
-              threshold,
-            },
+              threshold },
             cluster.name,
             undefined,
             'nvidia.com/gpu',
@@ -1084,13 +1073,10 @@ Please provide:
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate node ready condition — reads from refs for stable identity
-  const evaluateNodeReady = useCallback(
-    (rule: AlertRule) => {
+  const evaluateNodeReady = (rule: AlertRule) => {
       const currentClusters = clustersRef.current
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
@@ -1103,8 +1089,7 @@ Please provide:
             `Cluster ${cluster.name} has nodes not in Ready state`,
             {
               clusterHealthy: cluster.healthy,
-              nodeCount: cluster.nodeCount,
-            },
+              nodeCount: cluster.nodeCount },
             cluster.name,
             undefined,
             cluster.name,
@@ -1114,14 +1099,15 @@ Please provide:
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate pod crash condition — reads from refs for stable identity
-  const evaluatePodCrash = useCallback(
-    (rule: AlertRule) => {
+  const evaluatePodCrash = (rule: AlertRule) => {
       const threshold = rule.condition.threshold || 5
+
+      // Track which (cluster, pod) combos are still above threshold so we can
+      // auto-resolve alerts whose pods have recovered or been removed.
+      const stillFiringKeys = new Set<string>()
 
       for (const issue of podIssuesRef.current) {
         if (issue.restarts && issue.restarts >= threshold) {
@@ -1133,14 +1119,14 @@ Please provide:
             rule.condition.namespaces.includes(issue.namespace || '')
 
           if (clusterMatch && namespaceMatch) {
+            stillFiringKeys.add(alertDedupKey(rule.id, rule.condition.type, issue.cluster, issue.name))
             createAlert(
               rule,
               `Pod ${issue.name} has restarted ${issue.restarts} times (${issue.status})`,
               {
                 restarts: issue.restarts,
                 status: issue.status,
-                reason: issue.reason,
-              },
+                reason: issue.reason },
               issue.cluster,
               issue.namespace,
               issue.name,
@@ -1149,9 +1135,22 @@ Please provide:
           }
         }
       }
-    },
-    [createAlert]
-  )
+
+      // Auto-resolve any firing pod_crash alerts whose pods are no longer above
+      // the threshold (pod recovered, deleted, or restarts dropped).
+      const currentAlerts = alertsRef.current
+      for (const a of currentAlerts) {
+        if (a.ruleId === rule.id && a.status === 'firing') {
+          const key = alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource)
+          if (!stillFiringKeys.has(key)) {
+            const acc = mutationAccRef.current
+            if (acc) {
+              acc.mutations.push({ type: 'resolve', ruleId: rule.id, cluster: a.cluster, resource: a.resource })
+            }
+          }
+        }
+      }
+    }
 
   // Evaluate weather alerts condition - mock implementation for demo purposes
   // This is intentionally a demo feature to showcase conditional alerting capabilities
@@ -1168,8 +1167,7 @@ Please provide:
       if (shouldAlert) {
         let message = ''
         const details: Record<string, unknown> = {
-          weatherCondition: mockWeatherCondition,
-        }
+          weatherCondition: mockWeatherCondition }
 
         switch (mockWeatherCondition) {
           case 'severe_storm':
@@ -1218,8 +1216,7 @@ Please provide:
   )
 
   // Evaluate GPU Health CronJob — reads cached results from ref
-  const evaluateGPUHealthCronJob = useCallback(
-    (rule: AlertRule) => {
+  const evaluateGPUHealthCronJob = (rule: AlertRule) => {
       const cachedResults = cronJobResultsRef.current
       const currentClusters = clustersRef.current
       const relevantClusters = rule.condition.clusters?.length
@@ -1253,10 +1250,8 @@ Please provide:
                 (n.checks || []).filter(c => !c.passed).map(c => ({
                   node: n.nodeName,
                   check: c.name,
-                  message: c.message,
-                }))
-              ),
-            },
+                  message: c.message }))
+              ) },
             cluster.name,
             undefined,
             nodeNames,
@@ -1269,7 +1264,7 @@ Please provide:
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
             (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             const firstNode = failedNodes[0]
             sendNotificationWithDeepLink(
               `GPU Health Alert: ${cluster.name}`,
@@ -1277,8 +1272,7 @@ Please provide:
               {
                 drilldown: 'node',
                 cluster: cluster.name,
-                node: firstNode.nodeName,
-              }
+                node: firstNode.nodeName }
             )
           }
         } else {
@@ -1286,13 +1280,10 @@ Please provide:
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate disk pressure condition — checks for DiskPressure in cluster issues
-  const evaluateDiskPressure = useCallback(
-    (rule: AlertRule) => {
+  const evaluateDiskPressure = (rule: AlertRule) => {
       const currentClusters = clustersRef.current
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
@@ -1315,8 +1306,7 @@ Please provide:
               clusterName: cluster.name,
               issue: diskPressureIssue,
               nodeCount: cluster.nodeCount,
-              affectedNode,
-            },
+              affectedNode },
             cluster.name,
             undefined,
             cluster.name,
@@ -1330,7 +1320,7 @@ Please provide:
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
             (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Disk Pressure: ${cluster.name}`,
               diskPressureIssue,
@@ -1345,13 +1335,10 @@ Please provide:
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate memory pressure condition — checks for MemoryPressure in cluster issues
-  const evaluateMemoryPressure = useCallback(
-    (rule: AlertRule) => {
+  const evaluateMemoryPressure = (rule: AlertRule) => {
       const currentClusters = clustersRef.current
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
@@ -1369,8 +1356,7 @@ Please provide:
             {
               clusterName: cluster.name,
               issue: memPressureIssue,
-              nodeCount: cluster.nodeCount,
-            },
+              nodeCount: cluster.nodeCount },
             cluster.name,
             undefined,
             cluster.name,
@@ -1380,13 +1366,10 @@ Please provide:
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate DNS failures — checks for CoreDNS pods crashing or not ready
-  const evaluateDNSFailure = useCallback(
-    (rule: AlertRule) => {
+  const evaluateDNSFailure = (rule: AlertRule) => {
       const currentPodIssues = podIssuesRef.current
       const relevantClusters = rule.condition.clusters?.length
         ? rule.condition.clusters
@@ -1426,7 +1409,7 @@ Please provide:
           rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
           (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
         ) {
-          notifiedAlertKeysRef.current.set(notifKey, Date.now())
+          setNotifiedKey(notifKey, Date.now())
           sendNotificationWithDeepLink(
             `DNS Failure: ${cluster}`,
             `${pods.length} CoreDNS pod(s) unhealthy — ${issues || 'check pod status'}`,
@@ -1443,13 +1426,10 @@ Please provide:
           queueAutoResolve(rule.id, a.cluster)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate certificate errors — checks for clusters with certificate connection failures
-  const evaluateCertificateError = useCallback(
-    (rule: AlertRule) => {
+  const evaluateCertificateError = (rule: AlertRule) => {
       const currentClusters = clustersRef.current
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
@@ -1464,8 +1444,7 @@ Please provide:
               clusterName: cluster.name,
               errorType: cluster.errorType,
               errorMessage: cluster.errorMessage,
-              server: cluster.server,
-            },
+              server: cluster.server },
             cluster.name,
             undefined,
             cluster.name,
@@ -1482,7 +1461,7 @@ Please provide:
           if (
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) && shouldNotify
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Certificate Error: ${cluster.name}`,
               cluster.errorMessage || 'TLS certificate validation failed',
@@ -1492,17 +1471,14 @@ Please provide:
         } else {
           // Auto-resolve if cert error clears — also clear dedup so next failure re-notifies
           const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          notifiedAlertKeysRef.current.delete(notifKey)
+          deleteNotifiedKey(notifKey)
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate cluster unreachable — checks for clusters with network/auth/timeout failures
-  const evaluateClusterUnreachable = useCallback(
-    (rule: AlertRule) => {
+  const evaluateClusterUnreachable = (rule: AlertRule) => {
       const currentClusters = clustersRef.current
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
@@ -1523,8 +1499,7 @@ Please provide:
               errorType: cluster.errorType,
               errorMessage: cluster.errorMessage,
               server: cluster.server,
-              lastSeen: cluster.lastSeen,
-            },
+              lastSeen: cluster.lastSeen },
             cluster.name,
             undefined,
             cluster.name,
@@ -1539,7 +1514,7 @@ Please provide:
           if (
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) && shouldNotify
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Cluster Unreachable: ${cluster.name}`,
               `${errorLabel}${cluster.lastSeen ? ` — last seen ${cluster.lastSeen}` : ''}`,
@@ -1549,17 +1524,14 @@ Please provide:
         } else if (cluster.reachable !== false) {
           // Auto-resolve when cluster becomes reachable — clear dedup so next failure re-notifies
           const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          notifiedAlertKeysRef.current.delete(notifKey)
+          deleteNotifiedKey(notifKey)
           queueAutoResolve(rule.id, cluster.name)
         }
       }
-    },
-    [createAlert, queueAutoResolve]
-  )
+    }
 
   // Evaluate nightly E2E failures — reads cached run data from ref
-  const evaluateNightlyE2EFailure = useCallback(
-    (rule: AlertRule) => {
+  const evaluateNightlyE2EFailure = (rule: AlertRule) => {
       const guides = nightlyE2ERef.current
       if (!guides.length) return
 
@@ -1597,8 +1569,7 @@ Please provide:
               failureReason: run.failureReason || 'unknown',
               model: run.model,
               gpuType: run.gpuType,
-              gpuCount: run.gpuCount,
-            },
+              gpuCount: run.gpuCount },
             guide.platform,
             undefined,
             `${guide.acronym}-run-${run.runNumber}`,
@@ -1611,7 +1582,7 @@ Please provide:
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
             (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Nightly E2E Failed: ${guide.acronym} (${guide.platform})`,
               `Run #${run.runNumber} failed — ${guide.guide}`,
@@ -1627,9 +1598,7 @@ Please provide:
           nightlyAlertedRunsRef.current.delete(id)
         }
       }
-    },
-    [createAlert]
-  )
+    }
 
   // Evaluate alert conditions — uses refs so callback identity is stable.
   // All evaluate* functions push mutations into the accumulator; we flush
@@ -1737,7 +1706,7 @@ Please provide:
     }
   }, [])
 
-  const value: AlertsContextValue = useMemo(() => ({
+  const value: AlertsContextValue = {
     alerts,
     activeAlerts,
     acknowledgedAlerts,
@@ -1755,8 +1724,7 @@ Please provide:
     createRule,
     updateRule,
     deleteRule,
-    toggleRule,
-  }), [alerts, activeAlerts, acknowledgedAlerts, stats, rules, isEvaluating, isLoadingData, dataError, acknowledgeAlert, acknowledgeAlerts, resolveAlert, deleteAlert, runAIDiagnosis, evaluateConditions, createRule, updateRule, deleteRule, toggleRule])
+    toggleRule }
 
   return (
     <AlertsContext.Provider value={value}>
@@ -1769,7 +1737,7 @@ Please provide:
 }
 
 export function useAlertsContext() {
-  const context = use(AlertsContext)
+  const context = useContext(AlertsContext)
   if (!context) {
     throw new Error('useAlertsContext must be used within an AlertsProvider')
   }

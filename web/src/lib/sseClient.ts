@@ -45,6 +45,13 @@ const SSE_MAX_RECONNECT_ATTEMPTS = 5
 // Dedup: prevent duplicate concurrent SSE requests to the same URL
 const inflightRequests = new Map<string, Promise<unknown[]>>()
 
+/** Subscribers waiting for callbacks on an in-flight SSE stream */
+interface SSESubscriber<T = unknown> {
+  onClusterData: (clusterName: string, items: T[]) => void
+  onDone?: (summary: Record<string, unknown>) => void
+}
+const inflightSubscribers = new Map<string, SSESubscriber[]>()
+
 // Result cache: serve cached data on re-navigation within 10s
 const resultCache = new Map<string, { data: unknown[]; at: number }>()
 /** Cache TTL: 10 seconds */
@@ -57,6 +64,7 @@ const RESULT_CACHE_TTL_MS = 10_000
 export function clearSSECache(): void {
   resultCache.clear()
   inflightRequests.clear()
+  inflightSubscribers.clear()
 }
 
 /**
@@ -139,14 +147,26 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
     return Promise.resolve(items)
   }
 
-  // Dedup: if same URL is already in-flight, return the existing promise
+  // Dedup: if same URL is already in-flight, register as a subscriber and
+  // return the existing promise so all consumers get progressive callbacks.
   const inflight = inflightRequests.get(cacheKey)
   if (inflight) {
+    const subscribers = inflightSubscribers.get(cacheKey) || []
+    subscribers.push({ onClusterData: onClusterData as SSESubscriber['onClusterData'], onDone })
+    inflightSubscribers.set(cacheKey, subscribers)
     return inflight as Promise<T[]>
   }
 
+  // Register the first caller as a subscriber too
+  inflightSubscribers.set(cacheKey, [])
+
   const promise = new Promise<T[]>((resolve, reject) => {
     const accumulated: T[] = []
+    /**
+     * Track items already received per-cluster so that reconnect retries
+     * replace stale data instead of appending duplicates (#5403).
+     */
+    const clusterItemCounts = new Map<string, number>()
     let aborted = false
     /** Whether we received a proper "done" event from the server */
     let receivedDone = false
@@ -155,6 +175,7 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
 
     const cleanup = (wasAborted = false) => {
       inflightRequests.delete(cacheKey)
+      inflightSubscribers.delete(cacheKey)
       if (reconnectTimerId !== null) {
         clearTimeout(reconnectTimerId)
         reconnectTimerId = null
@@ -173,7 +194,9 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
     const timeoutController = new AbortController()
     const timeoutId = setTimeout(() => {
       timeoutController.abort()
-      cleanup()
+      // Timeout with partial data — do NOT cache incomplete results (#5402).
+      // Pass wasAborted=true so the partial accumulation is not stored.
+      cleanup(/* wasAborted */ true)
       resolve(accumulated)
     }, SSE_TIMEOUT_MS)
 
@@ -233,8 +256,30 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
                   return rec.cluster ? item : ({ ...item, cluster: clusterName } as T)
                 })
 
+                // Deduplicate: if this cluster was already received (e.g. on a
+                // reconnect retry), remove the previous items before appending
+                // the fresh set so rows are not duplicated (#5403).
+                const prevCount = clusterItemCounts.get(clusterName)
+                if (prevCount !== undefined && prevCount > 0) {
+                  // Remove old items for this cluster from accumulated
+                  let removed = 0
+                  for (let i = accumulated.length - 1; i >= 0 && removed < prevCount; i--) {
+                    const rec = accumulated[i] as Record<string, unknown>
+                    if (rec.cluster === clusterName) {
+                      accumulated.splice(i, 1)
+                      removed++
+                    }
+                  }
+                }
+
                 accumulated.push(...tagged)
+                clusterItemCounts.set(clusterName, tagged.length)
                 onClusterData(clusterName, tagged)
+                // Fan out to additional subscribers that joined via dedup
+                const subs = inflightSubscribers.get(cacheKey) || []
+                for (const sub of subs) {
+                  try { sub.onClusterData(clusterName, tagged) } catch { /* subscriber error */ }
+                }
               } catch (e) {
                 console.error('[SSE] Failed to parse cluster_data:', e)
               }
@@ -245,9 +290,15 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
               try {
                 const summary = JSON.parse(data) as Record<string, unknown>
                 onDone?.(summary)
+                // Fan out onDone to additional subscribers
+                const doneSubs = inflightSubscribers.get(cacheKey) || []
+                for (const sub of doneSubs) {
+                  try { sub.onDone?.(summary) } catch { /* subscriber error */ }
+                }
               } catch {
                 /* ignore parse errors on summary */
               }
+              inflightSubscribers.delete(cacheKey)
               resolve(accumulated)
             }
           }
@@ -260,12 +311,16 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
                 if (sseBuffer.trim()) {
                   parseSSEChunk(sseBuffer + '\n\n', handleEvent)
                 }
-                if (!receivedDone && accumulated.length > 0) {
+                // Only cache results if we received a proper "done" event.
+                // Without it, the data is incomplete and should not be
+                // served from cache on re-navigation (#5402).
+                const isPartial = !receivedDone
+                if (isPartial && accumulated.length > 0) {
                   console.warn(
-                    `[SSE] Stream ended without "done" event — returning ${accumulated.length} partial items`,
+                    `[SSE] Stream ended without "done" event — returning ${accumulated.length} partial items (not cached)`,
                   )
                 }
-                cleanup()
+                cleanup(/* wasAborted */ isPartial)
                 clearTimeout(timeoutId)
                 resolve(accumulated)
                 return
@@ -281,6 +336,19 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {
           if (aborted) return
           if (err.name === 'AbortError') {
             // Timeout — already resolved above
+            return
+          }
+
+          // Don't retry on auth (401) or service unavailable (503) — expected in demo mode
+          const isNonRetryable = err.message?.includes('401') || err.message?.includes('503')
+          if (isNonRetryable) {
+            console.debug('[SSE] Non-retryable error — skipping retries (demo mode)')
+            // Clear the in-flight entry and timers so future requests for the
+            // same URL start a fresh stream instead of reusing this stale
+            // resolved promise (#5404).
+            clearTimeout(timeoutId)
+            cleanup(/* wasAborted */ true)
+            resolve(accumulated)
             return
           }
 

@@ -3,6 +3,8 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,8 +16,27 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/kubestellar/console/pkg/models"
 )
+
+// maxConcurrentClusterRBACQueries bounds how many clusters GetAllPermissionsSummaries
+// fans out to at once. A plain unbounded errgroup would let 50+ clusters each
+// hammer the kube-apiserver with five SelfSubjectAccessReview calls
+// concurrently, which can saturate a control plane. 5 is a deliberate
+// compromise — high enough that a typical 5-10 cluster setup sees near-zero
+// serialization, low enough that a 50-cluster fleet queues requests in
+// batches of 5 and stays inside the handler's overall rbacAnalysisTimeout.
+const maxConcurrentClusterRBACQueries = 5
+
+// perClusterRBACTimeout caps the per-cluster RBAC summary fetch. The previous
+// code relied only on the caller's parent timeout (rbacAnalysisTimeout ~45s),
+// which let a single slow cluster consume the entire UI-facing budget. 15s
+// is short enough that the UI is never held hostage by one dead cluster and
+// long enough that a healthy cluster with 5 SelfSubjectAccessReview calls
+// finishes comfortably within budget.
+const perClusterRBACTimeout = 15 * time.Second
 
 // ListServiceAccounts returns all service accounts in a cluster
 func (m *MultiClusterClient) ListServiceAccounts(ctx context.Context, contextName, namespace string) ([]models.K8sServiceAccount, error) {
@@ -680,18 +701,98 @@ func (m *MultiClusterClient) listAllNamespaces(ctx context.Context, contextName 
 	return namespaces, nil
 }
 
-// getAccessibleNamespaces finds namespaces user can access when they can't list all
+// probeNamespacesEnvVar is the environment variable that operators can set to
+// extend the list of namespaces probed when a user lacks cluster-wide list
+// namespaces permission. Comma-separated. Probed namespaces are de-duplicated
+// against the default list (#6512).
+const probeNamespacesEnvVar = "KC_PROBE_NAMESPACES"
+
+// defaultProbeNamespaces is the built-in fallback list. These names cover the
+// classic Kubernetes ones plus two conventions commonly seen in multi-tenant
+// installs (#6512).
+var defaultProbeNamespaces = []string{"default", "kube-system", "kube-public", "application", "workloads"}
+
+// buildProbeNamespaces returns the ordered list of namespaces to probe when a
+// user cannot list cluster namespaces. Priority order:
+//  1. The user's own namespace (from JWT claims via request ctx), if present
+//  2. Namespaces from the KC_PROBE_NAMESPACES env var, comma-separated
+//  3. defaultProbeNamespaces
+//
+// Duplicates are removed while preserving first-seen order.
+func buildProbeNamespaces(userNamespace string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(defaultProbeNamespaces)+2)
+	add := func(ns string) {
+		ns = strings.TrimSpace(ns)
+		if ns == "" {
+			return
+		}
+		if _, dup := seen[ns]; dup {
+			return
+		}
+		seen[ns] = struct{}{}
+		out = append(out, ns)
+	}
+	add(userNamespace)
+	if env := os.Getenv(probeNamespacesEnvVar); env != "" {
+		for _, ns := range strings.Split(env, ",") {
+			add(ns)
+		}
+	}
+	for _, ns := range defaultProbeNamespaces {
+		add(ns)
+	}
+	return out
+}
+
+// userNamespaceFromContext returns the namespace claimed by the authenticated
+// user, if any, via the request context. Returns empty string when unset.
+// Uses a typed context key to avoid collisions.
+func userNamespaceFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(userNamespaceCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// userNamespaceCtxKey is an unexported type used as a context key for the
+// authenticated user's namespace. Handlers that know the user's namespace
+// can WithValue it to make getAccessibleNamespaces probe that namespace
+// first. Kept unexported so callers inside this package attach it via
+// WithUserNamespace below.
+type userNamespaceCtxKey struct{}
+
+// WithUserNamespace returns a derived context carrying the authenticated
+// user's namespace. Callers that authenticate requests and know the user's
+// namespace from JWT claims should wrap the request ctx with this before
+// calling into k8s client helpers so namespace probing prefers the user's
+// own namespace (#6512).
+func WithUserNamespace(ctx context.Context, ns string) context.Context {
+	if ns == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, userNamespaceCtxKey{}, ns)
+}
+
+// getAccessibleNamespaces finds namespaces user can access when they can't
+// list all. Previously hard-coded to {default, kube-system, kube-public}
+// which left users scoped to an application namespace with an empty
+// Permissions panel (#6512). Now driven by buildProbeNamespaces which
+// honors the user's claimed namespace, KC_PROBE_NAMESPACES env var, and a
+// broader default list.
 func (m *MultiClusterClient) getAccessibleNamespaces(ctx context.Context, contextName string) ([]string, error) {
 	client, err := m.GetClient(contextName)
 	if err != nil {
 		return nil, err
 	}
 
-	// Try common namespaces
-	commonNamespaces := []string{"default", "kube-system", "kube-public"}
+	probeNamespaces := buildProbeNamespaces(userNamespaceFromContext(ctx))
 	var accessible []string
 
-	for _, ns := range commonNamespaces {
+	for _, ns := range probeNamespaces {
 		// Try to get the namespace
 		_, err := client.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
 		if err == nil {
@@ -706,25 +807,57 @@ func (m *MultiClusterClient) getAccessibleNamespaces(ctx context.Context, contex
 	return accessible, nil
 }
 
-// GetAllPermissionsSummaries returns permission summaries for all clusters
+// GetAllPermissionsSummaries returns permission summaries for all clusters.
+//
+// Previously this iterated clusters sequentially: N clusters × 5 RBAC probes
+// × up-to-45s-per-cluster meant a 10-cluster fleet could block the UI for
+// minutes when even one cluster was slow (#6487). The fan-out now:
+//
+//   - runs per-cluster probes concurrently with errgroup
+//   - caps concurrency at maxConcurrentClusterRBACQueries so a large fleet
+//     doesn't hammer every apiserver at once
+//   - enforces perClusterRBACTimeout as an inner cap so one slow cluster
+//     can't consume the caller's entire budget
+//   - preserves the "partial info on error" contract: a failed cluster still
+//     appears in the result with just its Cluster field set, so callers can
+//     distinguish "no info" from "cluster missing"
+//
+// Results are written by index into a preallocated slice so cluster order
+// matches the input listing (no nondeterminism from scheduler race).
 func (m *MultiClusterClient) GetAllPermissionsSummaries(ctx context.Context) ([]PermissionsSummary, error) {
 	clusters, err := m.ListClusters(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var summaries []PermissionsSummary
-	for _, cluster := range clusters {
-		summary, err := m.GetPermissionsSummary(ctx, cluster.Name)
-		if err != nil {
-			// Include partial info on error
-			summaries = append(summaries, PermissionsSummary{
-				Cluster: cluster.Name,
-			})
-			continue
-		}
-		summaries = append(summaries, *summary)
+	summaries := make([]PermissionsSummary, len(clusters))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrentClusterRBACQueries)
+
+	for i, cluster := range clusters {
+		i, cluster := i, cluster // capture per-iteration
+		g.Go(func() error {
+			clusterCtx, cancel := context.WithTimeout(gctx, perClusterRBACTimeout)
+			defer cancel()
+
+			summary, err := m.GetPermissionsSummary(clusterCtx, cluster.Name)
+			if err != nil {
+				// Partial info on error — same contract as the old code.
+				summaries[i] = PermissionsSummary{Cluster: cluster.Name}
+				return nil
+			}
+			summaries[i] = *summary
+			return nil
+		})
 	}
+
+	// None of the goroutines return a non-nil error (we swallow per-cluster
+	// failures into partial summaries above), so g.Wait() only surfaces
+	// context cancellation. Ignore by design — a cancelled parent context
+	// will already have propagated into the per-cluster calls and produced
+	// partial entries.
+	_ = g.Wait()
 
 	return summaries, nil
 }

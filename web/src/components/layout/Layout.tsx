@@ -1,4 +1,4 @@
-import { ReactNode, Suspense, lazy, useState, useEffect, useRef, useCallback } from 'react'
+import { ReactNode, Suspense, lazy, useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useLocation } from 'react-router-dom'
 import { Box, Wifi, WifiOff, X, Settings, Rocket, RotateCcw, Check, Loader2, RefreshCw, Plug } from 'lucide-react'
@@ -27,7 +27,7 @@ import { TourProvider } from '../../hooks/useTour'
 import { SetupInstructionsDialog } from '../setup/SetupInstructionsDialog'
 import { InClusterAgentDialog } from '../setup/InClusterAgentDialog'
 import { AgentSetupDialog } from '../agent/AgentSetupDialog'
-import { KeepAliveOutlet } from './KeepAliveOutlet'
+import { Outlet } from 'react-router-dom'
 import { PageErrorBoundary } from '../PageErrorBoundary'
 import { UpdateProgressBanner } from '../updates/UpdateProgressBanner'
 import { useUpdateProgress } from '../../hooks/useUpdateProgress'
@@ -51,8 +51,7 @@ const STAR_POSITIONS = Array.from({ length: 30 }, () => ({
   height: Math.random() * 2 + 1 + 'px',
   left: Math.random() * 100 + '%',
   top: Math.random() * 100 + '%',
-  animationDelay: Math.random() * 3 + 's',
-}))
+  animationDelay: Math.random() * 3 + 's' }))
 
 // Thin progress bar shown during route transitions so the user
 // gets immediate visual feedback that navigation is happening.
@@ -91,7 +90,7 @@ interface LayoutProps {
   children?: ReactNode
 }
 
-export function Layout({ children }: LayoutProps) {
+export function Layout({ children: _children }: LayoutProps) {
   const { t } = useTranslation()
   const { config } = useSidebarConfig()
   const { isMobile } = useMobile()
@@ -119,7 +118,7 @@ export function Layout({ children }: LayoutProps) {
   const [restartState, setRestartState] = useState<'idle' | 'restarting' | 'waiting' | 'copied'>('idle')
   const [restartError, setRestartError] = useState<string | null>(null)
 
-  const handleCopyFallback = useCallback(async () => {
+  const handleCopyFallback = async () => {
     try {
       await copyToClipboard('./startup-oauth.sh')
       setRestartState('copied')
@@ -127,16 +126,15 @@ export function Layout({ children }: LayoutProps) {
     } catch {
       setRestartState('idle')
     }
-  }, [])
+  }
 
-  const handleRestartBackend = useCallback(async () => {
+  const handleRestartBackend = async () => {
     setRestartState('restarting')
     try {
       const resp = await fetch(`${LOCAL_AGENT_HTTP_URL}/restart-backend`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
-      })
+        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
       if (resp.ok) {
         const data = await resp.json()
         if (data.success) {
@@ -151,7 +149,7 @@ export function Layout({ children }: LayoutProps) {
       setRestartError('Could not reach agent — please restart manually')
       handleCopyFallback()
     }
-  }, [handleCopyFallback])
+  }
 
   // Clear stale cache failure metadata on fresh page load so previous-session
   // "Refresh failed" badges don't persist across restarts.
@@ -252,7 +250,8 @@ export function Layout({ children }: LayoutProps) {
 
   // Banner stacking: each banner's top offset depends on how many banners above it are visible.
   // Dev bar (20px) → Navbar (64px) → Banners (36px each).
-  // Z-index hierarchy: Navbar + dropdowns (z-50) > Network banner (z-40) > Demo banner (z-30) > In-cluster / Offline banner (z-20)
+  // Z-index hierarchy: Sidebar/Modals (z-modal=400) > Navbar + dropdowns (z-50) > Network banner (z-40) > Demo banner (z-30) > In-cluster / Offline banner (z-20)
+  // Sidebar/MissionSidebar/Mobile menus escalated to z-modal so they sit above their overlays/banners (issues #6486/#6488/#6489/#6490/#6493).
   // Stack order: Network (top) → Demo → In-cluster agent / Agent Offline (bottom)
   const networkBannerTop = NAVBAR_HEIGHT_PX
   const demoBannerTop = NAVBAR_HEIGHT_PX + (showNetworkBanner ? BANNER_HEIGHT_PX : 0)
@@ -360,7 +359,7 @@ export function Layout({ children }: LayoutProps) {
           <div
             style={{ top: demoBannerTop, left: sidebarWidthPx }}
             className={cn(
-              "fixed right-0 z-30 bg-background border-b border-yellow-500/20 transition-[left] duration-300",
+              "fixed right-0 z-30 bg-background border-b border-border/30 transition-[left] duration-300",
             )}>
             <div className="flex flex-wrap items-center justify-center gap-2 md:gap-3 py-1.5 px-3 md:px-4">
               {isAuthenticatedNoAgent
@@ -463,14 +462,14 @@ export function Layout({ children }: LayoutProps) {
             <div className="flex items-center gap-2 shrink-0">
               <Link
                 to="/settings"
-                className="flex items-center gap-1 text-xs px-2 py-0.5 bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 rounded transition-colors whitespace-nowrap"
+                className="flex items-center gap-1 text-xs px-2 py-2 bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 rounded transition-colors whitespace-nowrap"
               >
                 <Settings className="w-3 h-3" />
                 <span className="hidden sm:inline">{t('navigation.settings')}</span>
               </Link>
               <button
                 onClick={toggleDemoMode}
-                className="text-xs px-2 py-0.5 bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 rounded transition-colors whitespace-nowrap"
+                className="text-xs px-2 py-2 bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 rounded transition-colors whitespace-nowrap"
               >
                 <span className="hidden sm:inline">{t('layout.switchTo')} </span>{t('layout.demo')}
               </button>
@@ -498,20 +497,17 @@ export function Layout({ children }: LayoutProps) {
           id="main-content"
           style={{
             marginLeft: isMobile ? 0 : sidebarWidthPx + SIDEBAR_CONTROLS_OFFSET_PX,
-            marginRight: 'var(--mission-sidebar-width, 0px)',
-          }}
-          className="relative flex-1 p-4 pb-24 md:p-6 md:pb-28 transition-[margin] duration-300 overflow-y-auto scroll-enhanced min-w-0"
+            marginRight: 'var(--mission-sidebar-width, 0px)' }}
+          // overflow-x-hidden prevents stray wide children from pushing the
+          // entire main column past the viewport at narrow breakpoints
+          // (issues 6385, 6387, 6394). Individual scrollable children
+          // (tables, code blocks) still scroll horizontally inside wrappers.
+          className="relative flex-1 p-4 pb-[calc(6rem+env(safe-area-inset-bottom))] md:p-6 md:pb-[calc(7rem+env(safe-area-inset-bottom))] transition-[margin] duration-300 overflow-y-auto overflow-x-hidden scroll-enhanced min-w-0"
         >
           <NavigationProgress />
-          {children ? (
-            <PageErrorBoundary>
-              <Suspense fallback={<ContentLoadingSkeleton />}>
-                {children}
-              </Suspense>
-            </PageErrorBoundary>
-          ) : (
-            <KeepAliveOutlet />
-          )}
+          <Suspense fallback={<ContentLoadingSkeleton />}>
+            <Outlet />
+          </Suspense>
         </main>
       </div>
 
@@ -538,7 +534,7 @@ export function Layout({ children }: LayoutProps) {
 
       {/* Backend connection lost snackbar — fixed bottom center */}
       {showBackendBanner && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-bottom-2 duration-300">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-toast animate-in fade-in slide-in-from-bottom-2 duration-300">
           <div className={cn(
             "flex items-center gap-2 px-4 py-3 rounded-lg border shadow-lg text-sm",
             backendDown
@@ -586,7 +582,7 @@ export function Layout({ children }: LayoutProps) {
       )}
       {/* Startup snackbar — non-blocking info while backend initializes */}
       {showStartupSnackbar && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-bottom-2 duration-300">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-toast animate-in fade-in slide-in-from-bottom-2 duration-300">
           <div className="flex items-center gap-3 px-4 py-3 rounded-lg border shadow-lg text-sm bg-blue-950/90 border-blue-800/50 text-blue-200">
             <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
             <span>{t('layout.startingUp')}</span>
@@ -596,7 +592,7 @@ export function Layout({ children }: LayoutProps) {
 
       {/* Version changed snackbar — persistent until user reloads */}
       {versionChanged && !showStartupSnackbar && !showBackendBanner && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-bottom-2 duration-300">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-toast animate-in fade-in slide-in-from-bottom-2 duration-300">
           <div className="flex items-center gap-3 px-4 py-3 rounded-lg border shadow-lg text-sm bg-blue-950/90 border-blue-800/50 text-blue-200">
             <RefreshCw className="w-4 h-4 text-blue-400" />
             <span>{t('layout.newVersionAvailable')}</span>

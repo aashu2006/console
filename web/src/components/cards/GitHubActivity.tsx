@@ -149,6 +149,7 @@ interface CachedGitHubData {
 
 // Get cached data for a repo
 function getCachedData(repo: string): CachedGitHubData | null {
+  if (typeof window === 'undefined') return null
   try {
     const cached = localStorage.getItem(CACHE_KEY_PREFIX + repo.replace('/', '_'))
     if (!cached) return null
@@ -179,6 +180,7 @@ function setCachedData(repo: string, data: Omit<CachedGitHubData, 'timestamp'>) 
 
 // Get saved repos from localStorage
 function getSavedRepos(): string[] {
+  if (typeof window === 'undefined') return [DEFAULT_REPO]
   try {
     const saved = localStorage.getItem(SAVED_REPOS_KEY)
     return saved ? JSON.parse(saved) : [DEFAULT_REPO]
@@ -189,7 +191,11 @@ function getSavedRepos(): string[] {
 
 // Save repos to localStorage
 function saveRepos(repos: string[]) {
-  localStorage.setItem(SAVED_REPOS_KEY, JSON.stringify(repos))
+  try {
+    localStorage.setItem(SAVED_REPOS_KEY, JSON.stringify(repos))
+  } catch {
+    // Silently ignore quota errors or private browsing restrictions
+  }
 }
 
 // Demo data for GitHub Activity card
@@ -225,8 +231,7 @@ function getDemoGitHubData(repoName: string) {
     full_name: repoName,
     stargazers_count: 1247,
     open_issues_count: 23,
-    html_url: '#',
-  }
+    html_url: '#' }
   return { prs, issues, releases, contributors, repoInfo, openPRCount: 2, openIssueCount: 2 }
 }
 
@@ -246,7 +251,7 @@ function useGitHubActivity(config?: GitHubActivityConfig) {
   const { isDemoMode } = useDemoMode()
 
   // Use configured repos or default to kubestellar/console
-  const repos = useMemo(() => config?.repos?.length ? config.repos : [DEFAULT_REPO], [config?.repos])
+  const repos = config?.repos?.length ? config.repos : [DEFAULT_REPO]
   const org = config?.org
   // Note: Token stored in localStorage base64 encoded - decode before use
   // Token is injected server-side by the GitHub proxy — no client-side token needed
@@ -314,8 +319,7 @@ function useGitHubActivity(config?: GitHubActivityConfig) {
 
     try {
       const headers: HeadersInit = {
-        'Accept': 'application/vnd.github.v3+json',
-      }
+        'Accept': 'application/vnd.github.v3+json' }
       // Use the provided signal for all fetch calls to support cancellation
       const fetchOptions = { headers, signal }
 
@@ -404,8 +408,7 @@ function useGitHubActivity(config?: GitHubActivityConfig) {
         releases: releasesData,
         contributors: contributorsData,
         openPRCount: openPRsData.length,
-        openIssueCount: calculatedOpenIssueCount,
-      })
+        openIssueCount: calculatedOpenIssueCount })
 
       setLastRefresh(new Date())
     } catch (err) {
@@ -458,8 +461,9 @@ function useGitHubActivity(config?: GitHubActivityConfig) {
       controller.abort()
       if (interval) clearInterval(interval)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reposKey, org, isDemoMode, fetchGitHubData])
+     
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reposKey, org, isDemoMode])
 
   return {
     prs,
@@ -473,8 +477,7 @@ function useGitHubActivity(config?: GitHubActivityConfig) {
     lastRefresh,
     openPRCount,
     openIssueCount,
-    refetch: () => fetchGitHubData(true),
-  }
+    refetch: () => fetchGitHubData(true) }
 }
 
 // Sort comparators for GitHub items (open-first sorting applied separately after)
@@ -500,8 +503,7 @@ const SORT_COMPARATORS: Record<SortByOption, (a: GitHubItem, b: GitHubItem) => n
     const aStatus = aUnknown.merged_at ? 'merged' : ((aUnknown.state as string) || '')
     const bStatus = bUnknown.merged_at ? 'merged' : ((bUnknown.state as string) || '')
     return (statusOrder[aStatus] ?? 999) - (statusOrder[bStatus] ?? 999)
-  },
-}
+  } }
 
 // Custom search predicate for GitHub items (handles heterogeneous item types)
 function githubSearchPredicate(item: GitHubItem, query: string): boolean {
@@ -530,15 +532,17 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
   // Multi-repo state - inline CRUD pattern (matching GitHubCIMonitor)
   const [savedRepos, setSavedRepos] = useState<string[]>(() => getSavedRepos())
   const [currentRepo, setCurrentRepo] = useState<string>(() => {
-    return localStorage.getItem(CURRENT_REPO_KEY) || savedRepos[0] || DEFAULT_REPO
+    try {
+      return (typeof window !== 'undefined' && localStorage.getItem(CURRENT_REPO_KEY)) || savedRepos[0] || DEFAULT_REPO
+    } catch {
+      return savedRepos[0] || DEFAULT_REPO
+    }
   })
   const [repoInput, setRepoInput] = useState('')
   const [isEditingRepos, setIsEditingRepos] = useState(false)
 
   // Use current repo for data fetching
-  const effectiveConfig = useMemo(() => {
-    return { ...config, repos: [currentRepo] }
-  }, [config, currentRepo])
+  const effectiveConfig = { ...config, repos: [currentRepo] }
 
   const {
     prs,
@@ -548,8 +552,7 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
     repoInfo,
     isLoading,
     error,
-    refetch,
-  } = useGitHubActivity(effectiveConfig)
+    refetch } = useGitHubActivity(effectiveConfig)
   const { isDemoMode } = useDemoMode()
 
   const hasData = !!repoInfo
@@ -561,13 +564,13 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
   }), [refetch])
 
   // Select a repo from the list
-  const handleSelectRepo = useCallback((repo: string) => {
+  const handleSelectRepo = (repo: string) => {
     setCurrentRepo(repo)
-    localStorage.setItem(CURRENT_REPO_KEY, repo)
-  }, [])
+    try { localStorage.setItem(CURRENT_REPO_KEY, repo) } catch { /* ignore quota errors */ }
+  }
 
   // Add a new repo to saved list (inline CRUD)
-  const handleAddRepo = useCallback(() => {
+  const handleAddRepo = () => {
     const repo = repoInput.trim()
     if (!repo) return
     // Validate format: owner/repo
@@ -580,21 +583,21 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
     setSavedRepos(newRepos)
     saveRepos(newRepos)
     setCurrentRepo(repo)
-    localStorage.setItem(CURRENT_REPO_KEY, repo)
+    try { localStorage.setItem(CURRENT_REPO_KEY, repo) } catch { /* ignore quota errors */ }
     setRepoInput('')
-  }, [repoInput, savedRepos])
+  }
 
   // Remove a repo from saved list
-  const handleRemoveRepo = useCallback((repo: string) => {
+  const handleRemoveRepo = (repo: string) => {
     const newRepos = savedRepos.filter(r => r !== repo)
     if (newRepos.length === 0) return // Keep at least one repo
     setSavedRepos(newRepos)
     saveRepos(newRepos)
     if (currentRepo === repo) {
       setCurrentRepo(newRepos[0])
-      localStorage.setItem(CURRENT_REPO_KEY, newRepos[0])
+      try { localStorage.setItem(CURRENT_REPO_KEY, newRepos[0]) } catch { /* ignore quota errors */ }
     }
-  }, [savedRepos, currentRepo])
+  }
 
   // Pre-filter data by viewMode and timeRange before passing to useCardData
   const preFilteredData = useMemo(() => {
@@ -603,8 +606,7 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
       '7d': 7 * 24 * 60 * 60 * 1000,
       '30d': 30 * 24 * 60 * 60 * 1000,
       '90d': 90 * 24 * 60 * 60 * 1000,
-      '1y': 365 * 24 * 60 * 60 * 1000,
-    }[timeRange]
+      '1y': 365 * 24 * 60 * 60 * 1000 }[timeRange]
 
     if (viewMode === 'prs') {
       // Sort PRs: open first, then by date within each group
@@ -646,28 +648,23 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
     setItemsPerPage,
     filters: {
       search: searchQuery,
-      setSearch: setSearchQuery,
-    },
+      setSearch: setSearchQuery },
     sorting,
     containerRef,
-    containerStyle,
-  } = useCardData<GitHubItem, SortByOption>(preFilteredData, {
+    containerStyle } = useCardData<GitHubItem, SortByOption>(preFilteredData, {
     filter: {
       searchFields: [] as (keyof GitHubItem)[],
       customPredicate: githubSearchPredicate,
-      storageKey: 'github-activity',
-    },
+      storageKey: 'github-activity' },
     sort: {
       defaultField: 'date',
       defaultDirection: 'desc' as SortDirection,
-      comparators: SORT_COMPARATORS,
-    },
-    defaultLimit: 10,
-  })
+      comparators: SORT_COMPARATORS },
+    defaultLimit: 10 })
 
   // Always show open items first (regardless of sort direction)
   // This is a stable sort that preserves the relative order within each group
-  const paginatedItems = useMemo(() => {
+  const paginatedItems = (() => {
     if (viewMode === 'contributors' || viewMode === 'releases') {
       return rawPaginatedItems // No open/closed concept for these
     }
@@ -678,10 +675,10 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
       const bOpen = bUnknown.state === 'open' ? 0 : 1
       return aOpen - bOpen // Open (0) comes before closed (1)
     })
-  }, [rawPaginatedItems, viewMode])
+  })()
 
   // Calculate stats - use accurate counts from fetched data
-  const stats = useMemo(() => {
+  const stats = (() => {
     const openPRs = prs.filter(pr => pr.state === 'open').length
     const mergedPRs = prs.filter(pr => pr.merged_at != null).length
     // Count open issues directly from fetched issues (already filtered to exclude PRs)
@@ -696,9 +693,8 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
       stalePRs,
       staleIssues,
       stars: repoInfo?.stargazers_count || 0,
-      totalContributors: contributors.length,
-    }
-  }, [prs, issues, contributors, repoInfo])
+      totalContributors: contributors.length }
+  })()
 
   if (isLoading && !repoInfo) {
     return (
@@ -883,8 +879,7 @@ export function GitHubActivity({ config, ref }: { config?: GitHubActivityConfig;
             sortOptions: SORT_OPTIONS,
             onSortChange: (v) => sorting.setSortBy(v as SortByOption),
             sortDirection: sorting.sortDirection,
-            onSortDirectionChange: sorting.setSortDirection,
-          }}
+            onSortDirectionChange: sorting.setSortDirection }}
         />
       </div>
 

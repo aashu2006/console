@@ -34,11 +34,11 @@ export default defineConfig({
   // Fail the build on CI if test.only is left in
   forbidOnly: !!process.env.CI,
 
-  // Retry failed tests (more in CI)
-  retries: process.env.CI ? 2 : 0,
+  // Retry failed tests once in CI (balances flake detection vs run time)
+  retries: process.env.CI ? 1 : 0,
 
-  // Workers - limit in CI for stability
-  workers: process.env.CI ? 2 : '50%',
+  // Workers — CI gets 4 workers per shard, local uses half of available cores
+  workers: process.env.CI ? 4 : '50%',
 
   // Reporter configuration
   reporter: process.env.CI
@@ -61,8 +61,15 @@ export default defineConfig({
 
   // Shared settings for all projects
   use: {
-    // Base URL for all tests
-    baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:5174',
+    // Base URL for all tests.
+    //
+    // #6452 — Default to the Go backend port (8080). In production the Go
+    // backend serves BOTH the API and the built frontend on 8080, which is
+    // also how startup-oauth.sh launches the console. Tests must match the
+    // real deployment, not a standalone vite dev server. Override with
+    // PLAYWRIGHT_BASE_URL=http://localhost:5174 if running against a detached
+    // vite dev server (e.g. for fast local UI iteration).
+    baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8080',
 
     // Collect trace on first retry
     trace: 'on-first-retry',
@@ -122,15 +129,32 @@ export default defineConfig({
     },
   ],
 
-  // Web server config - starts dev server before tests
-  // Skip webServer if PLAYWRIGHT_BASE_URL is set (using existing server)
+  // Web server config - starts dev server before tests.
+  //
+  // #6452/#6474 — When PLAYWRIGHT_BASE_URL is not set, launch the Go backend
+  // (`go run .` from the repo root) on port 8080. In production the Go backend
+  // serves BOTH the API and the built frontend on 8080, which is how
+  // startup-oauth.sh launches the console. Tests must match the real
+  // deployment topology, not a standalone vite dev server.
+  //
+  // If PLAYWRIGHT_BASE_URL explicitly points somewhere else (e.g. at a
+  // pre-running server), we skip webServer and expect the caller to manage
+  // the process. This is the path CI uses with a shared backend.
+  //
+  // Local dev: just `npm run test:e2e` and playwright will start the backend
+  // itself. Previously this was `webServer: undefined`, which hung on connect.
   webServer: process.env.PLAYWRIGHT_BASE_URL
     ? undefined
     : {
-        command: 'npm run dev -- --port 5174',
-        url: 'http://localhost:5174',
-        reuseExistingServer: true,
-        timeout: 120000,
+        // Run `go run .` from the repo root (one level up from web/).
+        command: 'cd .. && go run .',
+        url: 'http://localhost:8080',
+        // Go backend can take a while to build on first run.
+        // 3 minutes covers a cold `go run` compile on modest hardware.
+        timeout: 180_000,
+        reuseExistingServer: !process.env.CI,
+        stdout: 'pipe',
+        stderr: 'pipe',
       },
 
   // Output directory
