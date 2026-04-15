@@ -70,19 +70,20 @@ vi.mock('../../../../hooks/useIntoto', async (importOriginal) => {
 
 import { IntotoSupplyChain } from '../IntotoSupplyChain'
 import { useIntoto, computeIntotoStats } from '../../../../hooks/useIntoto'
+import type { IntotoLayout } from '../../../../hooks/useIntoto'
 
-const mockLayouts = [
+const mockLayouts: Partial<IntotoLayout>[] = [
   {
     name: 'web-app-layout',
     cluster: 'cluster-1',
-    steps: [{ name: 'build' }, { name: 'test' }],
+    steps: [{ name: 'build' }, { name: 'test' }] as any[],
     verifiedSteps: 1,
     failedSteps: 1,
   },
   {
     name: 'api-layout',
     cluster: 'cluster-2',
-    steps: [{ name: 'compile' }],
+    steps: [{ name: 'compile' }] as any[],
     verifiedSteps: 1,
     failedSteps: 0,
   }
@@ -149,7 +150,7 @@ describe('IntotoSupplyChain', () => {
           cluster: 'prod-cluster',
           installed: true,
           loading: false,
-          layouts: [mockLayouts[0] as any],
+          layouts: [mockLayouts[0] as IntotoLayout],
           totalLayouts: 1,
           totalSteps: 2,
           verifiedSteps: 1,
@@ -281,7 +282,7 @@ describe('IntotoSupplyChain', () => {
 
   describe('computeIntotoStats', () => {
     it('aggregates counts correctly from multiple layouts', () => {
-      const stats = computeIntotoStats(mockLayouts as any)
+      const stats = computeIntotoStats(mockLayouts as IntotoLayout[])
       expect(stats.totalLayouts).toBe(2)
       expect(stats.totalSteps).toBe(3)
       expect(stats.verifiedSteps).toBe(2)
@@ -300,7 +301,7 @@ describe('IntotoSupplyChain', () => {
         failedSteps: 0,
       }
       
-      const stats = computeIntotoStats([multiLinkLayout] as any)
+      const stats = computeIntotoStats([multiLinkLayout] as IntotoLayout[])
       expect(stats.totalSteps).toBe(1)
       expect(stats.verifiedSteps).toBe(1)
       expect(stats.missingSteps).toBe(0)
@@ -316,7 +317,7 @@ describe('IntotoSupplyChain', () => {
         // missing should be 1
       }
       
-      const stats = computeIntotoStats([missingLayout] as any)
+      const stats = computeIntotoStats([missingLayout] as IntotoLayout[])
       expect(stats.missingSteps).toBe(1)
     })
   })

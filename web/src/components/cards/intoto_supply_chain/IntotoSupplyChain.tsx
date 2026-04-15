@@ -37,12 +37,6 @@ const DEFAULT_PAGE_SIZE = 5
 
 type SortField = 'name' | 'failedSteps' | 'verifiedSteps'
 
-const SORT_OPTIONS: { value: SortField; label: string }[] = [
-  { value: 'name', label: 'Name' },
-  { value: 'failedSteps', label: 'Failed' },
-  { value: 'verifiedSteps', label: 'Verified' },
-]
-
 interface IntotoSupplyChainProps {
   config?: Record<string, unknown>
 }
@@ -50,16 +44,16 @@ interface IntotoSupplyChainProps {
 /** Icon and colour for each step verification status */
 const STEP_STATUS_CONFIG: Record<
   IntotoStep['status'],
-  { icon: typeof CheckCircle; color: string; label: string }
+  { icon: typeof CheckCircle; color: string; key: string }
 > = {
-  verified: { icon: CheckCircle, color: 'text-green-400', label: 'Verified' },
-  failed: { icon: XCircle, color: 'text-red-400', label: 'Failed' },
-  missing: { icon: MinusCircle, color: 'text-yellow-400', label: 'Missing' },
-  unknown: { icon: AlertCircle, color: 'text-muted-foreground', label: 'Unknown' },
+  verified: { icon: CheckCircle, color: 'text-green-400', key: 'verified' },
+  failed: { icon: XCircle, color: 'text-red-400', key: 'failed' },
+  missing: { icon: MinusCircle, color: 'text-yellow-400', key: 'missing' },
+  unknown: { icon: AlertCircle, color: 'text-muted-foreground', key: 'unknown' },
 }
 
 function IntotoSupplyChainInternal({ config: _config }: IntotoSupplyChainProps) {
-  const { t } = useTranslation('cards')
+  const { t } = useTranslation(['cards', 'common'])
   const {
     statuses,
     isLoading,
@@ -136,6 +130,16 @@ function IntotoSupplyChainInternal({ config: _config }: IntotoSupplyChainProps) 
     },
     defaultLimit: DEFAULT_PAGE_SIZE,
   })
+
+  // Localized sort options built via useMemo so t is in scope
+  const sortOptions = useMemo<{ value: SortField; label: string }[]>(
+    () => [
+      { value: 'name', label: t('intoto_supply_chain.sortName') },
+      { value: 'failedSteps', label: t('intoto_supply_chain.sortFailed') },
+      { value: 'verifiedSteps', label: t('intoto_supply_chain.sortVerified') },
+    ],
+    [t]
+  )
 
   const hasData = installed || isDemoData
   useCardLoadingState({
@@ -233,7 +237,7 @@ Please proceed step by step.`,
           onLimitChange={setItemsPerPage}
           sortBy={sortBy}
           onSortChange={setSortBy}
-          sortOptions={SORT_OPTIONS}
+          sortOptions={sortOptions}
           showSort={allLayouts.length > 1}
         />
       </div>
@@ -274,9 +278,18 @@ Please proceed step by step.`,
           <div className="flex-1">
             <p className="text-red-400 font-medium">{t('intoto_supply_chain.fetchError')}</p>
             <p className="mt-1 text-red-400/80 leading-relaxed">
-              {Object.values(statuses).find(s => s.error)?.error?.includes('.') 
-                ? t(Object.values(statuses).find(s => s.error)?.error as any) 
-                : t('intoto_supply_chain.fetchErrorHint')}{' '}
+              {(() => {
+                const error = Object.values(statuses).find(s => s.error)?.error
+                const ALLOWED_ERROR_KEYS = [
+                  'intoto_supply_chain.fetchErrorLayouts',
+                  'intoto_supply_chain.connectionFailed',
+                ]
+                if (error && ALLOWED_ERROR_KEYS.includes(error)) {
+                  const key = error as 'intoto_supply_chain.fetchErrorLayouts' | 'intoto_supply_chain.connectionFailed'
+                  return t(key)
+                }
+                return t('intoto_supply_chain.fetchErrorHint')
+              })()}{' '}
               <button
                 onClick={() => window.location.reload()}
                 className="text-red-400 underline hover:text-red-300 transition-colors"
@@ -359,7 +372,7 @@ Please proceed step by step.`,
       <CardSearchInput
         value={localSearch}
         onChange={setLocalSearch}
-        placeholder={t('searchLayouts' as any)}
+        placeholder={t('common:common.searchLayouts')}
       />
 
       {/* Layouts list */}
@@ -387,7 +400,10 @@ Please proceed step by step.`,
                   setExpandedLayout(isExpanded ? null : `${layout.cluster}-${layout.name}`)
                 }
                 aria-expanded={isExpanded}
-                aria-label={`${isExpanded ? 'Collapse' : 'Expand'} layout: ${layout.name} on ${layout.cluster}`}
+                aria-label={t(
+                  isExpanded ? 'intoto_supply_chain.ariaCollapse' : 'intoto_supply_chain.ariaExpand',
+                  { name: layout.name, cluster: layout.cluster }
+                )}
               >
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-sm font-medium text-foreground truncate">
@@ -428,7 +444,9 @@ Please proceed step by step.`,
                         </div>
                         <div className="flex items-center gap-2 text-muted-foreground">
                           <span className="text-2xs">{step.functionary}</span>
-                          <span className={`text-2xs ${cfg.color}`}>{cfg.label}</span>
+                          <span className={`text-2xs ${cfg.color}`}>
+                            {t(`intoto_supply_chain.status.${cfg.key}` as never)}
+                          </span>
                         </div>
                       </div>
                     )

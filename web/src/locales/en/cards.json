@@ -3104,7 +3104,18 @@
     "featureSlsaCompliance": "SLSA Compliance",
     "footerDocs": "Documentation",
     "footerGitHub": "GitHub",
-    "footerSlsa": "SLSA"
+    "footerSlsa": "SLSA",
+    "sortName": "Name",
+    "sortFailed": "Failed",
+    "sortVerified": "Verified",
+    "status": {
+      "verified": "Verified",
+      "failed": "Failed",
+      "missing": "Missing",
+      "unknown": "Unknown"
+    },
+    "ariaExpand": "Expand layout: {{name}} on {{cluster}}",
+    "ariaCollapse": "Collapse layout: {{name}} on {{cluster}}"
   },
   "recommendedPolicies": {
     "scanningClusters": "Scanning clusters..."

@@ -27,6 +27,11 @@ const CRD_CHECK_TIMEOUT_MS = 8_000
 /** Timeout for layout and link data fetch */
 const DATA_FETCH_TIMEOUT_MS = 30_000
 
+/** Demo data time offsets */
+const OFFSET_TWO_HOURS_MS = 2 * 60 * 60 * 1000
+const OFFSET_ONE_HOUR_MS = 1 * 60 * 60 * 1000
+const OFFSET_THIRTY_MINS_MS = 30 * 60 * 1000
+
 // ── Types ────────────────────────────────────────────────────────────────
 
 export interface IntotoStep {
@@ -152,7 +157,7 @@ function getDemoLayouts(cluster: string): IntotoLayout[] {
       expectedProducts: 4,
       verifiedSteps: 4,
       failedSteps: 0,
-      createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      createdAt: new Date(Date.now() - OFFSET_TWO_HOURS_MS).toISOString(),
     },
     {
       name: 'deploy-pipeline',
@@ -165,7 +170,7 @@ function getDemoLayouts(cluster: string): IntotoLayout[] {
       expectedProducts: 3,
       verifiedSteps: 1,
       failedSteps: 2,
-      createdAt: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(),
+      createdAt: new Date(Date.now() - OFFSET_ONE_HOUR_MS).toISOString(),
     },
     {
       name: 'release-signing',
@@ -177,7 +182,7 @@ function getDemoLayouts(cluster: string): IntotoLayout[] {
       expectedProducts: 2,
       verifiedSteps: 2,
       failedSteps: 0,
-      createdAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      createdAt: new Date(Date.now() - OFFSET_THIRTY_MINS_MS).toISOString(),
     },
   ]
 }
