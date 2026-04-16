@@ -168,6 +168,10 @@ const ResourceMarshall = safeLazy(() => _deployBundle, 'ResourceMarshall')
 const _workloadMonitorBundle = import('./workload-monitor').catch(() => undefined as never)
 const WorkloadMonitor = safeLazy(() => _workloadMonitorBundle, 'WorkloadMonitor')
 const DynamicCard = safeLazy(() => import('./DynamicCard'), 'DynamicCard')
+const ACMMLevel = safeLazy(() => import('./ACMMLevel'), 'ACMMLevel')
+const ACMMBalance = safeLazy(() => import('./ACMMBalance'), 'ACMMBalance')
+const ACMMFeedbackLoops = safeLazy(() => import('./ACMMFeedbackLoops'), 'ACMMFeedbackLoops')
+const ACMMRecommendations = safeLazy(() => import('./ACMMRecommendations'), 'ACMMRecommendations')
 const LLMdStackMonitor = safeLazy(() => _workloadMonitorBundle, 'LLMdStackMonitor')
 const ProwCIMonitor = safeLazy(() => _workloadMonitorBundle, 'ProwCIMonitor')
 
@@ -258,7 +262,8 @@ const ThanosStatus = safeLazy(() => import('./thanos_status'), 'ThanosStatus')
 const OpenFeatureStatus = safeLazy(() => import('./openfeature_status'), 'OpenFeatureStatus')
 // OpenKruise advanced workloads + sidecar injection card
 const OpenKruiseStatus = safeLazy(() => import('./openkruise_status'), 'OpenKruiseStatus')
-
+// Keycloak Identity & Access Management card
+const KeycloakStatus = safeLazy(() => import('./keycloak_status'), 'KeycloakStatus')
 // Inspektor Gadget cards
 const NetworkTraceCard = safeLazy(() => import('./gadget/NetworkTraceCard'), 'NetworkTraceCard')
 const DNSTraceCard = safeLazy(() => import('./gadget/DNSTraceCard'), 'DNSTraceCard')
@@ -320,6 +325,11 @@ export type CardComponent = ComponentType<CardComponentProps>
  * lazy-loaded chunks don't cause the entire page to flash.
  */
 const RAW_CARD_COMPONENTS: Record<string, CardComponent> = {
+  // ACMM (AI Codebase Maturity Model) cards
+  acmm_level: ACMMLevel,
+  acmm_balance: ACMMBalance,
+  acmm_feedback_loops: ACMMFeedbackLoops,
+  acmm_recommendations: ACMMRecommendations,
   // Core cards
   cluster_health: ClusterHealth,
   event_stream: EventStream,
@@ -579,7 +589,8 @@ const RAW_CARD_COMPONENTS: Record<string, CardComponent> = {
   openfeature_status: OpenFeatureStatus,
   // OpenKruise advanced workloads + sidecar injection
   openkruise_status: OpenKruiseStatus,
-
+  // Keycloak Identity & Access Management
+  keycloak_status: KeycloakStatus,
   // Inspektor Gadget cards
   network_trace: NetworkTraceCard,
   dns_trace: DNSTraceCard,
@@ -986,6 +997,8 @@ const CARD_CHUNK_PRELOADERS: Record<string, () => Promise<unknown>> = {
   openfeature_status: () => import('./openfeature_status'),
   // OpenKruise advanced workloads + sidecar injection
   openkruise_status: () => import('./openkruise_status'),
+  // Keycloak Identity & Access Management
+  keycloak_status: () => import('./keycloak_status'),
   // Flatcar Container Linux
   flatcar_status: () => import('./flatcar_status'),
   // CoreDNS
@@ -1161,6 +1174,7 @@ export const LIVE_DATA_CARDS = new Set([
   'keda_status',
   'crio_status',
   'strimzi_status',
+  'keycloak_status',
   'kubevela_status',
   // KubeRay, SLO, Failover, Trino - demo until detected
   'kuberay_fleet',
@@ -1324,7 +1338,8 @@ export const CARD_DEFAULT_WIDTHS: Record<string, number> = {
   openfeature_status: 6,
   // OpenKruise advanced workloads + sidecar injection
   openkruise_status: 6,
-
+  // Keycloak Identity & Access Management
+  keycloak_status: 6,
   // Multi-cluster insights cards
   cross_cluster_event_correlation: 6,
   cluster_delta_detector: 6,

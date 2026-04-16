@@ -1,3 +1,30 @@
+// Package k8s provides the multi-cluster k8s client used by both the Go
+// backend (cmd/console) and kc-agent (cmd/kc-agent). The underlying type
+// is MultiClusterClient; post-#7993 it is ALSO exported as PrivilegedClient
+// to signal — at the type name — that in the Go backend's context it
+// carries the pod ServiceAccount's privileges and must only be used for
+// the three legitimate pod-SA exceptions:
+//
+//  1. GPU reservation (pkg/api/handlers/mcp_resources.go ResourceQuota
+//     handlers): users cannot create namespaces or set quotas themselves;
+//     the console is the authorized policy layer.
+//  2. Self-upgrade (pkg/api/handlers/self_upgrade.go): the console pod
+//     patches its own Deployment. No other identity could perform a
+//     self-upgrade.
+//  3. The system-internal persistence reconciler
+//     (pkg/api/handlers/console_persistence.go): reacts to CR state
+//     changes without a human in the loop. User-initiated CR writes go
+//     through kc-agent at /console-cr/* per #7993 Phase 2.5.
+//
+// Every other k8s operation against a managed cluster must go through
+// kc-agent with the caller's own kubeconfig. The architectural rule is
+// enforced on every PR by .github/workflows/privileged-client-lint.yml
+// (added in #7993 Phase 5).
+//
+// In kc-agent, the same type carries the USER's identity via their
+// kubeconfig, so the name "PrivilegedClient" is a slight overstatement
+// there — but the type alias is only a hint, not a runtime check, and
+// kc-agent's only k8s surface is user-initiated work anyway.
 package k8s
 
 import (
@@ -20,6 +47,41 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
+
+// PrivilegedClient is an alias for MultiClusterClient whose sole purpose is
+// to mark — at the type name — that a handler field carries the pod
+// ServiceAccount's privileges (see the package doc above for the three
+// legitimate pod-SA exceptions).
+//
+// This alias is a documentation / code-review signal for human readers. It
+// is NOT what the privileged-client lint rule actually checks. The lint in
+// .github/workflows/privileged-client-lint.yml is call-pattern based: it
+// greps pkg/api/handlers/ for mutation-method calls of the form
+//
+//	h.k8sClient.(Create|Update|Delete|Patch)<Name>(
+//	s.k8sClient.(Create|Update|Delete|Patch)<Name>(
+//	persistence.(Create|Update|Delete)<Name>(
+//
+// and fails the PR if any such call site lives outside the file allowlist
+// in .github/allowlist-privileged-client-callers.txt. The lint never looks
+// at the field's declared Go type, so declaring a field as PrivilegedClient
+// neither satisfies nor trips the rule on its own.
+//
+// Practical guidance for new privileged handlers:
+//  1. If the handler legitimately needs to mutate a managed cluster via the
+//     pod SA, declare the field as *PrivilegedClient to flag intent for
+//     reviewers, AND add the handler's file basename to
+//     .github/allowlist-privileged-client-callers.txt in the same PR. The
+//     allowlist file itself takes only plain basenames (no inline
+//     justifications); explain the rationale for the new exception in the
+//     PR description, as the lint workflow's failure message instructs.
+//  2. If the handler is user-initiated work, it must go through kc-agent
+//     with the caller's kubeconfig instead — neither the type alias nor an
+//     allowlist entry is appropriate.
+//
+// Existing MultiClusterClient fields stay put; this is an intent-signalling
+// alias, not a rename.
+type PrivilegedClient = MultiClusterClient
 
 const (
 	clusterHealthCheckTimeout = 8 * time.Second

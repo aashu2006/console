@@ -5,10 +5,34 @@ import { kubectlProxy } from '../../lib/kubectlProxy'
 import { isDemoMode } from '../../lib/demoMode'
 import { LOCAL_AGENT_URL, agentFetch, clusterCacheRef } from './shared'
 import type { PodInfo, NamespaceStats } from './types'
+import { LOCAL_AGENT_HTTP_URL } from '../../lib/constants/network'
 
 // Large clusters (100+ namespaces) can take 30s+ to list all namespaces.
 // Use a generous timeout to avoid aborting valid but slow requests.
 const NAMESPACE_FETCH_TIMEOUT_MS = 45000
+
+// mergeWithClusterCache unions `fetched` with any namespaces the cluster
+// cache has recorded for `cluster`. PR #3962 originally applied this merge
+// only to the REST fallback tier, but tiers 1/2 (kc-agent HTTP, kubectl
+// proxy) can also return lists that are missing user namespaces — e.g. a
+// caller without cluster-wide `list namespaces` gets a 403 that short-
+// circuits the List() call, or the agent surfaces only namespaces with
+// running pods. Unioning with the cache at every tier ensures namespaces
+// discovered during cluster-health checks still appear in the dropdown
+// (#3945 regression fix). See useNamespaces callers for the consumer.
+function mergeWithClusterCache(fetched: string[], cluster: string): string[] {
+  const set = new Set<string>()
+  for (const ns of fetched) {
+    if (ns) set.add(ns)
+  }
+  const cachedCluster = clusterCacheRef.clusters.find(c => c.name === cluster)
+  if (cachedCluster?.namespaces) {
+    for (const ns of cachedCluster.namespaces) {
+      if (ns) set.add(ns)
+    }
+  }
+  return Array.from(set).sort()
+}
 
 // When forceLive is true, skip demo mode fallback and always query the real API.
 // Used by GPU Reservations to show live namespaces when running in-cluster with OAuth.
@@ -72,7 +96,8 @@ export function useNamespaces(cluster?: string, forceLive = false) {
           if (nsData.length > 0) {
             // Extract just the namespace names
             const nsNames = nsData.map((ns: { name?: string; Name?: string }) => ns.name || ns.Name || '').filter(Boolean)
-            setNamespaces(nsNames)
+            // Merge with cluster cache — see mergeWithClusterCache (#3945).
+            setNamespaces(mergeWithClusterCache(nsNames, cluster))
             setError(null)
             setIsLoading(false)
             reportAgentDataSuccess()
@@ -86,54 +111,49 @@ export function useNamespaces(cluster?: string, forceLive = false) {
 
     // Try kubectl proxy as fallback
     if (!isAgentUnavailable()) {
+      let timerId: ReturnType<typeof setTimeout> | null = null
       try {
         const clusterInfo = clusterCacheRef.clusters.find(c => c.name === cluster)
         const kubectlContext = clusterInfo?.context || cluster
 
         const nsPromise = kubectlProxy.getNamespaces(kubectlContext)
-        const timeoutPromise = new Promise<null>((resolve) =>
-          setTimeout(() => resolve(null), NAMESPACE_FETCH_TIMEOUT_MS)
-        )
+        const timeoutPromise = new Promise<null>((resolve) => {
+          timerId = setTimeout(() => resolve(null), NAMESPACE_FETCH_TIMEOUT_MS)
+        })
         const nsData = await Promise.race([nsPromise, timeoutPromise])
+        // Clear the timer unconditionally. If nsPromise won, this cancels the
+        // pending timer; if the timer already fired, clearTimeout is a safe no-op.
+        if (timerId !== null) clearTimeout(timerId)
 
         if (nsData && nsData.length > 0) {
-          setNamespaces(nsData)
+          // Merge with cluster cache — see mergeWithClusterCache.
+          setNamespaces(mergeWithClusterCache(nsData, cluster))
           setError(null)
           setIsLoading(false)
           return
         }
       } catch (err) {
+        if (timerId !== null) clearTimeout(timerId)
         console.error(`[useNamespaces] kubectl proxy failed for ${cluster}:`, err)
       }
     }
 
-    // Fall back to REST API — merge pod-based namespaces with cluster cache
-    // to include namespaces that have no running pods (#3945)
+    // Fall back to REST API — pod-based discovery, then union with the
+    // cluster cache via mergeWithClusterCache (#3945).
     try {
-      const nsSet = new Set<string>()
-
-      // Seed with cluster cache namespaces (discovered during health checks)
-      // so namespaces without pods still appear in the dropdown
-      const cachedCluster = clusterCacheRef.clusters.find(c => c.name === cluster)
-      if (cachedCluster?.namespaces) {
-        for (const ns of cachedCluster.namespaces) {
-          nsSet.add(ns)
-        }
-      }
-
-      // Also add namespaces from pods (may discover recently created namespaces
-      // that the cache hasn't seen yet)
+      const podNs: string[] = []
       try {
-        const { data } = await api.get<{ pods: PodInfo[] }>(`/api/mcp/pods?cluster=${encodeURIComponent(cluster)}`)
+        const { data } = await api.get<{ pods: PodInfo[] }>(`${LOCAL_AGENT_HTTP_URL}/pods?cluster=${encodeURIComponent(cluster)}`)
         for (const pod of (data.pods || [])) {
-          if (pod.namespace) nsSet.add(pod.namespace)
+          if (pod.namespace) podNs.push(pod.namespace)
         }
       } catch {
-        // Non-fatal: we may still have cache namespaces above
+        // Non-fatal: cluster-cache namespaces may still surface below
       }
 
-      if (nsSet.size > 0) {
-        setNamespaces(Array.from(nsSet).sort())
+      const merged = mergeWithClusterCache(podNs, cluster)
+      if (merged.length > 0) {
+        setNamespaces(merged)
         setError(null)
       } else {
         setNamespaces(['default', 'kube-system'])
@@ -174,7 +194,7 @@ export function useNamespaceStats(cluster?: string) {
     setIsLoading(true)
     try {
       // Fetch all pods for the cluster (no limit)
-      const { data } = await api.get<{ pods: PodInfo[] }>(`/api/mcp/pods?cluster=${encodeURIComponent(cluster)}&limit=1000`)
+      const { data } = await api.get<{ pods: PodInfo[] }>(`${LOCAL_AGENT_HTTP_URL}/pods?cluster=${encodeURIComponent(cluster)}&limit=1000`)
 
       // Group pods by namespace and calculate stats
       const nsMap: Record<string, NamespaceStats> = {}

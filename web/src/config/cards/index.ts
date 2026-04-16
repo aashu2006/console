@@ -91,6 +91,7 @@ import { kubedleConfig } from './kubedle'
 import { kubescapeScanConfig } from './kubescape-scan'
 import { kubevirtStatusConfig } from './kubevirt-status'
 import { kustomizationStatusConfig } from './kustomization-status'
+import { keycloakStatusConfig } from './keycloak-status'
 import { kyvernoPoliciesConfig } from './kyverno-policies'
 import { limitRangeStatusConfig } from './limit-range-status'
 import { llmInferenceConfig } from './llm-inference'
@@ -178,8 +179,16 @@ import { complianceDriftConfig } from './compliance-drift'
 import { crossClusterPolicyComparisonConfig } from './cross-cluster-policy-comparison'
 import { recommendedPoliciesConfig } from './recommended-policies'
 import { drasiReactiveGraphConfig } from './drasi-reactive-graph'
+import { acmmLevelConfig } from './acmm-level'
+import { acmmBalanceConfig } from './acmm-balance'
+import { acmmFeedbackLoopsConfig } from './acmm-feedback-loops'
+import { acmmRecommendationsConfig } from './acmm-recommendations'
 
 export const CARD_CONFIGS: CardConfigRegistry = {
+  acmm_level: acmmLevelConfig,
+  acmm_balance: acmmBalanceConfig,
+  acmm_feedback_loops: acmmFeedbackLoopsConfig,
+  acmm_recommendations: acmmRecommendationsConfig,
   active_alerts: activeAlertsConfig,
   alert_rules: alertRulesConfig,
   app_status: appStatusConfig,
@@ -257,6 +266,7 @@ export const CARD_CONFIGS: CardConfigRegistry = {
   kubescape_scan: kubescapeScanConfig,
   kubevirt_status: kubevirtStatusConfig,
   kustomization_status: kustomizationStatusConfig,
+  keycloak_status: keycloakStatusConfig,
   kyverno_policies: kyvernoPoliciesConfig,
   limit_range_status: limitRangeStatusConfig,
   llm_inference: llmInferenceConfig,
@@ -438,6 +448,10 @@ export function isCardVisibleForProject(cardType: string): boolean {
 
 // Re-export configs
 export {
+  acmmLevelConfig,
+  acmmBalanceConfig,
+  acmmFeedbackLoopsConfig,
+  acmmRecommendationsConfig,
   activeAlertsConfig,
   alertRulesConfig,
   appStatusConfig,

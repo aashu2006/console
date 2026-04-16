@@ -4,6 +4,7 @@ import {
   BarChart3, Table2, ChevronDown, ArrowUpDown } from 'lucide-react'
 import ReactECharts from 'echarts-for-react'
 import { useMetricsHistory } from '../../hooks/useMetricsHistory'
+import type { MetricsSnapshot } from '../../types/predictions'
 import { useCachedGPUNodes } from '../../hooks/useCachedData'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
@@ -461,7 +462,7 @@ export function GPUInventoryHistory() {
       return generateDemoData()
     }
 
-    return (history || []).map(snapshot => {
+    const points = (history || []).map(snapshot => {
       const filtered = filterGPUNodes(snapshot.gpuNodes || [])
       const allocated = filtered.reduce((sum, g) => sum + (g.gpuAllocated || 0), 0)
       const total = filtered.reduce((sum, g) => sum + (g.gpuTotal || 0), 0)
@@ -488,6 +489,19 @@ export function GPUInventoryHistory() {
 
       return point
     })
+
+    // Defensive filter: if any point in the series has a non-zero total, drop
+    // points whose total is zero. A zero-total point next to non-zero points
+    // is almost always a transient GPU-fetch glitch that slipped through
+    // carry-forward protection in useMetricsHistory. Keeps the chart,
+    // stats, and trend math from showing misleading flapping zero bars.
+    // If EVERY point has total === 0 (legitimate no-GPU state) we leave the
+    // series alone so the empty-state paths still fire correctly.
+    const anyNonZero = points.some(p => p.total > 0)
+    if (anyNonZero) {
+      return points.filter(p => p.total > 0)
+    }
+    return points
   }, [history, showDemo, filterGPUNodes, chartMode])
 
   /** All GPU type keys present in chart data */
@@ -559,15 +573,24 @@ export function GPUInventoryHistory() {
 
   // ── Churn metrics ──────────────────────────────────────────────────
   const churnMetrics = useMemo<ChurnMetrics | null>(() => {
-    if (showDemo || (history || []).length < MIN_CHURN_SNAPSHOTS) return null
+    // Drop snapshots with zero total GPUs before diffing so transient empty
+    // captures don't show up as massive departure/arrival churn.
+    const churnHistory = (history || []).filter(s => {
+      const nodes = s.gpuNodes || []
+      if (nodes.length === 0) return false
+      const total = nodes.reduce((sum, g) => sum + (g.gpuTotal || 0), 0)
+      return total > 0
+    })
+
+    if (showDemo || churnHistory.length < MIN_CHURN_SNAPSHOTS) return null
 
     let totalArrivals = 0
     let totalDepartures = 0
     let diffCount = 0
 
-    for (let i = 1; i < (history || []).length; i++) {
-      const prev = filterGPUNodes((history || [])[i - 1].gpuNodes || [])
-      const curr = filterGPUNodes((history || [])[i].gpuNodes || [])
+    for (let i = 1; i < churnHistory.length; i++) {
+      const prev = filterGPUNodes(churnHistory[i - 1].gpuNodes || [])
+      const curr = filterGPUNodes(churnHistory[i].gpuNodes || [])
 
       // Per-node diffing captures churn even when allocations and frees cancel at aggregate level
       const prevMap: Record<string, number> = {}
@@ -631,7 +654,24 @@ export function GPUInventoryHistory() {
   const tableRows = (() => {
     if (showDemo) return generateDemoTableRows()
 
-    const latestSnapshot = (history || []).length > 0 ? (history || [])[(history || []).length - 1] : null
+    // Walk history from the end and pick the most recent snapshot whose
+    // total GPU count is non-zero. Falls back to the literal latest (even if
+    // zero) so genuine no-GPU clusters still render an empty table rather
+    // than a stale one.
+    let latestSnapshot: MetricsSnapshot | null = null
+    const hist = history || []
+    for (let i = hist.length - 1; i >= 0; i--) {
+      const s = hist[i]
+      const nodes = s.gpuNodes || []
+      const total = nodes.reduce((sum, g) => sum + (g.gpuTotal || 0), 0)
+      if (total > 0) {
+        latestSnapshot = s
+        break
+      }
+    }
+    if (!latestSnapshot && hist.length > 0) {
+      latestSnapshot = hist[hist.length - 1]
+    }
     if (!latestSnapshot) return []
 
     const filtered = filterGPUNodes(latestSnapshot.gpuNodes || [])
@@ -674,8 +714,8 @@ export function GPUInventoryHistory() {
   // ── Loading state ──────────────────────────────────────────────────
   if (isLoading) {
     return (
-      <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-2">
+      <div className="h-full w-full min-w-0 flex flex-col min-h-card">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
           <Skeleton variant="text" width={120} height={16} />
           <Skeleton variant="rounded" width={28} height={28} />
         </div>
@@ -688,7 +728,7 @@ export function GPUInventoryHistory() {
   // ── Empty state ────────────────────────────────────────────────────
   if ((gpuNodes || []).length === 0 && (history || []).length === 0 && !showDemo) {
     return (
-      <div className="h-full flex flex-col content-loaded">
+      <div className="h-full w-full min-w-0 flex flex-col content-loaded">
         <div className="flex-1 flex flex-col items-center justify-center text-center">
           <div className="w-12 h-12 rounded-full bg-secondary flex items-center justify-center mb-3">
             <Cpu className="w-6 h-6 text-muted-foreground" />
@@ -701,17 +741,21 @@ export function GPUInventoryHistory() {
   }
 
   // ── Main render ────────────────────────────────────────────────────
+  // Header uses flex-wrap so controls reflow onto a second line when the card
+  // is narrow, preventing overlap and ensuring the snapshots label stays
+  // visible. w-full + min-w-0 on the root and inner flex containers ensures
+  // the card fills its grid column without forcing horizontal overflow.
   return (
-    <div className="h-full flex flex-col content-loaded">
+    <div className="h-full w-full min-w-0 flex flex-col content-loaded">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <Clock className="w-3.5 h-3.5 text-muted-foreground" />
-          <span className="text-xs text-muted-foreground">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 mb-2">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <Clock className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+          <span className="text-xs text-muted-foreground truncate min-w-0 flex-1">
             {(chartData || []).length} {t('cards:gpuInventoryHistory.snapshots', 'snapshots')}
           </span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5 min-w-0">
           {/* GPU Type filter dropdown */}
           {availableGPUTypes.length > 1 && (
             <div className="relative" ref={typeDropdownRef}>
@@ -842,8 +886,8 @@ export function GPUInventoryHistory() {
         </div>
       </div>
 
-      {/* Stats row */}
-      <div className="grid grid-cols-4 gap-2 mb-3">
+      {/* Stats row — 2 columns on narrow widths, 4 columns from sm (>=640px) */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
         <div className="p-2 rounded-lg bg-blue-500/10 border border-blue-500/20" title={`${currentTotals.total} total GPUs`}>
           <div className="flex items-center gap-1 mb-1">
             <Cpu className="w-3 h-3 text-blue-400" />
@@ -875,7 +919,7 @@ export function GPUInventoryHistory() {
       </div>
 
       {/* Main content area */}
-      <div className="flex-1 min-h-[160px]">
+      <div className="flex-1 min-w-0 min-h-[160px]">
         {viewMode === 'chart' ? (
           <>
             {/* Chart mode toggle (aggregate vs by-type) */}

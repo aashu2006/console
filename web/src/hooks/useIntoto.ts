@@ -31,7 +31,6 @@ const DATA_FETCH_TIMEOUT_MS = 30_000
 const OFFSET_TWO_HOURS_MS = 2 * 60 * 60 * 1000
 const OFFSET_ONE_HOUR_MS = 1 * 60 * 60 * 1000
 const OFFSET_THIRTY_MINS_MS = 30 * 60 * 1000
-
 // ── Types ────────────────────────────────────────────────────────────────
 
 export interface IntotoStep {

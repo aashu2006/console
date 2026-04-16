@@ -1,3 +1,4 @@
+import { startTransition } from 'react'
 import { api, isBackendUnavailable } from '../../lib/api'
 import { reportAgentDataError, reportAgentDataSuccess, isAgentUnavailable } from '../useLocalAgent'
 import { isDemoMode, isNetlifyDeployment, isDemoToken, subscribeDemoMode } from '../../lib/demoMode'
@@ -58,15 +59,57 @@ export function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promis
 // ============================================================================
 // Shared Cluster State - ensures all useClusters() consumers see the same data
 // ============================================================================
+//
+// NOTE (#7865): the cache is internally split into two slices so that heavy
+// cluster-data updates can be wrapped in React.startTransition() (interruptible,
+// yielding to SPA navigation) while small UI-indicator updates stay urgent
+// (so the refresh spinner on the logo reliably paints on → off). See the
+// `dataSubscribers` / `uiSubscribers` split below.
+//
+// The public `ClusterCache` shape is kept as a single merged object so all
+// existing consumers (`useClusters()`, `clusterCache.clusters.find(...)`, etc.)
+// continue to work unchanged.
 export interface ClusterCache {
+  // --- Data slice (heavy; notified inside startTransition) ---
   clusters: ClusterInfo[]
   lastUpdated: Date | null
+  consecutiveFailures: number
+  isFailed: boolean
+  // --- UI slice (tiny; notified urgently, outside startTransition) ---
   isLoading: boolean
   isRefreshing: boolean
   error: string | null
-  consecutiveFailures: number
-  isFailed: boolean
   lastRefresh: Date | null
+}
+
+/** Fields that belong to the heavy data slice. Source of truth for the split. */
+const DATA_FIELDS: ReadonlyArray<keyof ClusterCache> = [
+  'clusters',
+  'lastUpdated',
+  'consecutiveFailures',
+  'isFailed',
+]
+
+/** Fields that belong to the tiny UI-indicator slice. */
+const UI_FIELDS: ReadonlyArray<keyof ClusterCache> = [
+  'isLoading',
+  'isRefreshing',
+  'error',
+  'lastRefresh',
+]
+
+function updatesTouchData(updates: Partial<ClusterCache>): boolean {
+  for (const field of DATA_FIELDS) {
+    if (field in updates) return true
+  }
+  return false
+}
+
+function updatesTouchUI(updates: Partial<ClusterCache>): boolean {
+  for (const field of UI_FIELDS) {
+    if (field in updates) return true
+  }
+  return false
 }
 
 // Cache cluster distribution in localStorage to prevent logo flickering on page load
@@ -248,13 +291,61 @@ export let clusterCache: ClusterCache = {
   lastRefresh: storedClusters.length > 0 ? new Date() : null,
 }
 
-// Subscribers that get notified when cluster data changes
+// Subscribers that get notified when cluster state changes.
+// Split into two sets (#7865):
+//  - dataSubscribers: notified inside React.startTransition(), so navigation
+//    can pre-empt the heavy re-render that a new cluster list triggers.
+//  - uiSubscribers: notified urgently (outside startTransition) so the
+//    refresh-spinner / loading flags always commit and paint immediately.
 type ClusterSubscriber = (cache: ClusterCache) => void
-export const clusterSubscribers = new Set<ClusterSubscriber>()
+export const dataSubscribers = new Set<ClusterSubscriber>()
+export const uiSubscribers = new Set<ClusterSubscriber>()
 
-// Notify all subscribers of state change
+/**
+ * Back-compat alias for the pre-split single subscriber set. Subscribers
+ * added here receive BOTH data and UI updates (same as the old behavior),
+ * but the notification path still honors the split (startTransition for
+ * data, urgent for UI). New code should prefer `dataSubscribers` or
+ * `uiSubscribers` directly, or the `subscribeClusterCache*` helpers below.
+ */
+export const clusterSubscribers: Set<ClusterSubscriber> = new Set<ClusterSubscriber>()
+
+/** Notify only data subscribers, wrapped in startTransition (interruptible). */
+export function notifyClusterDataSubscribers() {
+  const snapshot = clusterCache
+  startTransition(() => {
+    dataSubscribers.forEach(subscriber => subscriber(snapshot))
+  })
+}
+
+/** Notify only UI subscribers, urgently (outside startTransition). */
+export function notifyClusterUISubscribers() {
+  const snapshot = clusterCache
+  uiSubscribers.forEach(subscriber => subscriber(snapshot))
+}
+
+/**
+ * Back-compat: notify every legacy subscriber exactly once. Legacy
+ * subscribers (added to `clusterSubscribers`) receive both data and UI
+ * updates on a single call, so we fire them here — NOT inside
+ * `notifyClusterDataSubscribers` / `notifyClusterUISubscribers`, which
+ * would double-notify them whenever both slices change. Data-subscriber
+ * notification still goes through `startTransition` via the split APIs.
+ *
+ * Used by code paths that mutate the cache directly (not via
+ * updateClusterCache) — see `updateSingleClusterInCache`,
+ * `refreshSingleCluster`, HMR reset, and mode-transition / demo-toggle
+ * handlers.
+ */
 export function notifyClusterSubscribers() {
-  clusterSubscribers.forEach(subscriber => subscriber(clusterCache))
+  const snapshot = clusterCache
+  // Urgent leg — UI subscribers + legacy (merged) subscribers.
+  uiSubscribers.forEach(subscriber => subscriber(snapshot))
+  clusterSubscribers.forEach(subscriber => subscriber(snapshot))
+  // Interruptible leg — only the heavy-data subscribers.
+  startTransition(() => {
+    dataSubscribers.forEach(subscriber => subscriber(snapshot))
+  })
 }
 
 /**
@@ -353,14 +444,20 @@ if (typeof window !== 'undefined') {
   })
 }
 
-// Debounced notification for batching rapid updates (prevents flashing during health checks)
+// Debounced notification for batching rapid updates (prevents flashing during health checks).
+// This path is used by `updateSingleClusterInCache`, which mutates the heavy
+// `clusters` array, so we dispatch to DATA subscribers inside startTransition.
+// Legacy merged subscribers also receive the update (urgent) so the
+// pre-split contract is preserved.
 let notifyTimeout: ReturnType<typeof setTimeout> | null = null
 export function notifyClusterSubscribersDebounced() {
   if (notifyTimeout) {
     clearTimeout(notifyTimeout)
   }
   notifyTimeout = setTimeout(() => {
-    notifyClusterSubscribers()
+    const snapshot = clusterCache
+    clusterSubscribers.forEach(subscriber => subscriber(snapshot))
+    notifyClusterDataSubscribers()
     notifyTimeout = null
   }, CLUSTER_NOTIFY_DEBOUNCE_MS)
 }
@@ -378,7 +475,29 @@ export function updateClusterCache(updates: Partial<ClusterCache>) {
     updateDistributionCache(updates.clusters)
   }
   clusterCache = { ...clusterCache, ...updates }
-  notifyClusterSubscribers()
+
+  // Route notifications based on which slice the updates touch (#7865).
+  // UI fires first (urgent) so spinner on/off commits immediately, then
+  // data fires inside startTransition so navigation can pre-empt the
+  // heavy re-render caused by a new cluster list.
+  const touchesUI = updatesTouchUI(updates)
+  const touchesData = updatesTouchData(updates)
+  if (touchesUI) {
+    notifyClusterUISubscribers()
+  }
+  if (touchesData) {
+    notifyClusterDataSubscribers()
+  }
+  // Legacy merged subscribers are fired exactly once per updateClusterCache
+  // call so the pre-split contract (one notify per update) is preserved.
+  if (touchesUI || touchesData) {
+    const snapshot = clusterCache
+    clusterSubscribers.forEach(subscriber => subscriber(snapshot))
+  } else {
+    // If the updates somehow touch neither slice, fall back to notifying
+    // every subscriber so nothing gets silently dropped.
+    notifyClusterSubscribers()
+  }
 
   // When clusters become available for the first time, reset all cache
   // failures and trigger immediate refetch. This fixes the race condition
@@ -839,6 +958,8 @@ if (import.meta.hot) {
       lastRefresh: null,
     }
     clusterSubscribers.clear()
+    dataSubscribers.clear()
+    uiSubscribers.clear()
   })
 }
 
@@ -953,7 +1074,7 @@ export async function fetchSingleClusterHealth(clusterName: string, kubectlConte
   const token = localStorage.getItem(STORAGE_KEY_TOKEN)
   try {
     const response = await fetch(
-      `/api/mcp/clusters/${encodeURIComponent(clusterName)}/health`,
+      `${LOCAL_AGENT_HTTP_URL}/clusters/${encodeURIComponent(clusterName)}/health`,
       {
         signal: AbortSignal.timeout(MCP_HOOK_TIMEOUT_MS),
         headers: token ? { 'Authorization': `Bearer ${token}` } : {},
@@ -1081,7 +1202,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
   // Try pods endpoint first
   try {
     const response = await fetch(
-      `/api/mcp/pods?cluster=${encodeURIComponent(clusterName)}&limit=500`,
+      `${LOCAL_AGENT_HTTP_URL}/pods?cluster=${encodeURIComponent(clusterName)}&limit=500`,
       { signal: AbortSignal.timeout(METRICS_SERVER_TIMEOUT_MS), headers }
     )
     if (response.ok) {
@@ -1103,7 +1224,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
   // Fallback: try events endpoint
   try {
     const response = await fetch(
-      `/api/mcp/events?cluster=${encodeURIComponent(clusterName)}&limit=200`,
+      `${LOCAL_AGENT_HTTP_URL}/events?cluster=${encodeURIComponent(clusterName)}&limit=200`,
       { signal: AbortSignal.timeout(METRICS_SERVER_TIMEOUT_MS), headers }
     )
     if (response.ok) {
@@ -1125,7 +1246,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
   // Fallback: try deployments endpoint
   try {
     const response = await fetch(
-      `/api/mcp/deployments?cluster=${encodeURIComponent(clusterName)}`,
+      `${LOCAL_AGENT_HTTP_URL}/deployments?cluster=${encodeURIComponent(clusterName)}`,
       { signal: AbortSignal.timeout(METRICS_SERVER_TIMEOUT_MS), headers }
     )
     if (response.ok) {
@@ -1473,7 +1594,7 @@ export async function fullFetchClusters() {
     }
 
     // Fall back to backend API
-    const { data } = await api.get<{ clusters: ClusterInfo[] }>('/api/mcp/clusters')
+    const { data } = await api.get<{ clusters: ClusterInfo[] }>(`${LOCAL_AGENT_HTTP_URL}/clusters`)
     // Merge new cluster list with existing cached data (preserve distribution, health, etc.)
     const existingClusters = clusterCache.clusters
     const mergedClusters = (data.clusters || []).map(newCluster => {
@@ -1627,10 +1748,24 @@ export const clusterCacheRef = {
   },
 }
 
-// Subscribe to cluster cache changes (for modules that need reactive updates)
+// Subscribe to cluster cache changes (for modules that need reactive updates).
+// Back-compat API: receives BOTH data and UI updates. Prefer the split
+// variants below for new code.
 export function subscribeClusterCache(callback: (cache: ClusterCache) => void): () => void {
   clusterSubscribers.add(callback)
   return () => clusterSubscribers.delete(callback)
+}
+
+/** Subscribe to heavy cluster-data updates only (notifications are interruptible). */
+export function subscribeClusterData(callback: (cache: ClusterCache) => void): () => void {
+  dataSubscribers.add(callback)
+  return () => dataSubscribers.delete(callback)
+}
+
+/** Subscribe to tiny UI-indicator updates only (notifications are urgent). */
+export function subscribeClusterUI(callback: (cache: ClusterCache) => void): () => void {
+  uiSubscribers.add(callback)
+  return () => uiSubscribers.delete(callback)
 }
 
 // Setter functions for module-level state (ES modules can't assign to imported bindings)

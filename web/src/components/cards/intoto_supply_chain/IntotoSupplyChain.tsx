@@ -140,7 +140,6 @@ function IntotoSupplyChainInternal({ config: _config }: IntotoSupplyChainProps) 
     ],
     [t]
   )
-
   const hasData = installed || isDemoData
   useCardLoadingState({
     isLoading: isLoading && !hasData,
@@ -278,10 +277,9 @@ Please proceed step by step.`,
                 const ALLOWED_ERROR_KEYS = [
                   'intoto_supply_chain.fetchErrorLayouts',
                   'intoto_supply_chain.connectionFailed',
-                ]
-                if (error && ALLOWED_ERROR_KEYS.includes(error)) {
-                  const key = error as 'intoto_supply_chain.fetchErrorLayouts' | 'intoto_supply_chain.connectionFailed'
-                  return t(key)
+                ] as const
+                if (error && ALLOWED_ERROR_KEYS.includes(error as any)) {
+                  return t(error as any)
                 }
                 return t('intoto_supply_chain.fetchErrorHint')
               })()}{' '}

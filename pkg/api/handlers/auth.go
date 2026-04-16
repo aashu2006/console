@@ -714,20 +714,19 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 		h.wsHub.DisconnectUser(claims.UserID)
 	}
 
-	// Cancel any active /ws/exec sessions for this user (#6024). Exec
-	// sessions are not tracked by the WebSocket Hub — they run their own
-	// read loop against executor.StreamWithContext — so Hub.DisconnectUser
-	// cannot reach them. The exec handler registers its stream cancel func
-	// in a per-user registry on session start; cancelling those funcs here
-	// unblocks the stream and tears the connection down promptly.
+	// Cancel any active SSE streams for this user (#6029). SSE streams
+	// run inside SetBodyStreamWriter callbacks that block for up to
+	// sseOverallDeadline (~30s); without this, a logged-out user would
+	// continue to receive cluster_data events until the deadline fires.
+	// streamClusters registers each stream's cancel func in a per-user
+	// registry on start; cancelling those funcs here ends the stream.
+	//
+	// /ws/exec was previously cancelled here via CancelUserExecSessions
+	// (#6024), but Phase 3d of #7993 moved the exec WebSocket to kc-agent
+	// — it's a per-user local process that goes away when the browser tab
+	// closes, so there's no cross-session state that Logout needs to tear
+	// down. #5406 is closed as part of the same migration.
 	if claims.UserID != uuid.Nil {
-		CancelUserExecSessions(claims.UserID)
-		// Cancel any active SSE streams for this user (#6029). SSE streams
-		// run inside SetBodyStreamWriter callbacks that block for up to
-		// sseOverallDeadline (~30s); without this, a logged-out user would
-		// continue to receive cluster_data events until the deadline fires.
-		// streamClusters registers each stream's cancel func in a per-user
-		// registry on start; cancelling those funcs here ends the stream.
 		CancelUserSSEStreams(claims.UserID)
 	}
 
@@ -809,15 +808,17 @@ func (h *AuthHandler) RefreshToken(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to generate token")
 	}
 
-	// Update HttpOnly cookie with the fresh token.
+	// Update HttpOnly cookie with the fresh token. The token is delivered
+	// EXCLUSIVELY via the HttpOnly kc_auth cookie (#6590) so JavaScript can
+	// never read it. Returning the token in the JSON body would defeat the
+	// purpose of HttpOnly: any XSS or browser-extension content script could
+	// scrape it from `fetch().then(r => r.json())`. The cookie is enough —
+	// JWTAuth middleware reads kc_auth on every subsequent API request, and
+	// the stale-bearer-fallback path (#6026) handles in-flight requests that
+	// still carry the previous token in their Authorization header.
 	h.setJWTCookie(c, newToken)
 
-	// Return the token in the JSON body so AuthCallback can pass it to
-	// setToken() and refreshUser(). The cookie is HttpOnly (JS can't read
-	// it directly), so the token must also be in the response for the
-	// initial OAuth callback flow.
 	return c.JSON(fiber.Map{
-		"token":     newToken,
 		"refreshed": true,
 		"onboarded": user.Onboarded,
 	})

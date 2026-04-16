@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api } from '../lib/api'
+import { api, isBackendUnavailable } from '../lib/api'
 import { mapSettledWithConcurrency } from '../lib/utils/concurrency'
 import { getDemoMode } from './useDemoMode'
 import { LOCAL_AGENT_HTTP_URL, STORAGE_KEY_TOKEN } from '../lib/constants'
@@ -688,16 +688,32 @@ export function useClusterPermissions(cluster?: string) {
   const [error, setError] = useState<string | null>(null)
 
   const fetchPermissions = useCallback(async () => {
+    // Skip in demo / Netlify mode — kc-agent is not running.
+    if (isBackendUnavailable()) {
+      setIsLoading(false)
+      return
+    }
     setIsLoading(true)
     setError(null)
     try {
+      // #7993 Phase 6: route through kc-agent so SelfSubjectAccessReviews run
+      // under the user's kubeconfig instead of the backend pod ServiceAccount.
+      // Reuse agentAuthHeaders() so the Authorization header is omitted when
+      // no token is configured (agent accepts unauthenticated requests from
+      // allowed origins when KC_AGENT_TOKEN is unset). Sending an empty
+      // Authorization header would fail token validation on the agent side.
       const params = cluster ? `?cluster=${cluster}` : ''
-      const { data } = await api.get<ClusterPermissions | ClusterPermissions[]>(
-        `/api/rbac/permissions${params}`
-      )
+      const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/rbac/permissions${params}`, {
+        headers: agentAuthHeaders(),
+        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
+      if (!response.ok) {
+        setIsLoading(false)
+        return
+      }
+      const data = (await response.json()) as ClusterPermissions | ClusterPermissions[]
       setPermissions(Array.isArray(data) ? data : [data])
     } catch {
-      // Silently fail - backend may be unavailable
+      // Silently fail - kc-agent may be unavailable
     } finally {
       setIsLoading(false)
     }

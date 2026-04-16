@@ -3,6 +3,7 @@ import {
   BACKEND_HEALTH_CHECK_TIMEOUT_MS,
   STORAGE_KEY_TOKEN,
   STORAGE_KEY_USER_CACHE,
+  STORAGE_KEY_HAS_SESSION,
   DEMO_TOKEN_VALUE,
   FETCH_DEFAULT_TIMEOUT_MS,
 } from './constants'
@@ -174,12 +175,12 @@ try {
  * @param forceCheck - If true, ignores cache and always checks (used by login)
  */
 export async function checkBackendAvailability(forceCheck = false): Promise<boolean> {
-  // If we already know the status and it was checked recently, return it
+  // If we already know the status and it was checked recently, return it.
+  // The TTL gate must always run so a previously-available backend is
+  // re-probed periodically instead of being cached forever.
   if (!forceCheck && backendAvailable !== null) {
     const now = Date.now()
-    // If backend was already determined available, return immediately
-    // If unavailable, allow re-check after interval
-    if (backendAvailable || now - backendLastCheckTime < BACKEND_CHECK_INTERVAL) {
+    if (now - backendLastCheckTime < BACKEND_CHECK_INTERVAL) {
       return backendAvailable
     }
   }
@@ -330,21 +331,33 @@ class ApiClient {
     if (this.refreshInProgress) return
     this.refreshInProgress = (async () => {
       try {
+        // #8108 — /auth/refresh must NOT receive the Authorization header.
+        // Backend RefreshToken revokes the JTI of whatever bearer is presented
+        // before minting the replacement. Sending the stale localStorage token
+        // would revoke a token we still rely on for the rest of the session
+        // and race against the cookie delivery. Cookie-only flow: send the
+        // HttpOnly kc_auth cookie via credentials + CSRF header only.
         const response = await fetch(`${API_BASE}/auth/refresh`, {
           method: 'POST',
-          headers: this.getHeaders(),
+          headers: {
+            'Content-Type': 'application/json',
+            // #6588 — CSRF gate on /auth/refresh
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          credentials: 'same-origin',
           signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
         })
         if (response.ok) {
-          const data = await response.json().catch(() => null)
-          if (data?.token) {
-            localStorage.setItem(STORAGE_KEY_TOKEN, data.token)
-            // Notify AuthProvider (and other tabs) that the token changed
-            window.dispatchEvent(new StorageEvent('storage', {
-              key: STORAGE_KEY_TOKEN,
-              newValue: data.token,
-              storageArea: localStorage,
-            }))
+          // #6590 — /auth/refresh delivers the new JWT exclusively via the
+          // HttpOnly kc_auth cookie; the JSON body carries only
+          // { refreshed: true, onboarded }. There is no token to copy into
+          // localStorage. The browser sends the refreshed cookie automatically
+          // on subsequent requests, and the JWTAuth middleware reads it.
+          // Nothing else to do here on success.
+          try {
+            localStorage.setItem(STORAGE_KEY_HAS_SESSION, 'true')
+          } catch {
+            // localStorage quota — best-effort hint
           }
         }
       } catch {
@@ -378,8 +391,17 @@ class ApiClient {
 
   private hasToken(): boolean {
     const token = localStorage.getItem(STORAGE_KEY_TOKEN)
-    // Demo token doesn't count as a real token for backend API calls
-    return !!token && token !== DEMO_TOKEN_VALUE
+    if (token && token !== DEMO_TOKEN_VALUE) return true
+    // #6590 / #8087 — A cookie-only session has no JS-readable token, only
+    // the HttpOnly kc_auth cookie. The kc-has-session marker is set after
+    // /auth/refresh succeeds; treat its presence as a real session so API
+    // calls go through (the cookie is sent automatically same-origin and
+    // JWTAuth middleware accepts it).
+    try {
+      return localStorage.getItem(STORAGE_KEY_HAS_SESSION) === 'true'
+    } catch {
+      return false
+    }
   }
 
   private createAbortController(timeout: number): { controller: AbortController; timeoutId: ReturnType<typeof setTimeout> } {

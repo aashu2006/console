@@ -296,9 +296,13 @@ export const handlers = [
   }),
 
   // Permissions
+  // #7993 Phase 6: Permissions endpoints (/permissions/summary, /rbac/can-i,
+  // /rbac/permissions) moved to kc-agent. The frontend hooks short-circuit
+  // via isBackendUnavailable() in demo mode, so no MSW handler is required.
+  // Keeping a no-op stub for legacy `/api/permissions/summary` callers in
+  // case any are added during demo flows.
   http.get('/api/permissions/summary', async () => {
     await delay(50)
-    // Return proper PermissionsSummary structure with clusters map
     const clusterPermissions = {
       isClusterAdmin: true,
       canListNodes: true,
@@ -702,6 +706,12 @@ export const handlers = [
   http.get('/api/missions/file', () => passthrough()),
   http.get('/api/missions/browse', () => passthrough()),
   http.get('/api/rewards/github', () => passthrough()),
+  // NPS (voluntary feedback) — use http.all so the CORS preflight
+  // OPTIONS request also passes through. Without this, the catch-all
+  // http.all('/api/*') below returns 503 on the preflight and the
+  // browser blocks the actual POST.
+  http.all('/api/nps', () => passthrough()),
+  http.get('/api/acmm/scan', () => passthrough()),
 
   // ── Kubara Platform Catalog (demo) ──────────────────────────────
   http.get('/api/github/repos/kubara-io/kubara/contents/*', () => {
@@ -715,6 +725,39 @@ export const handlers = [
       { name: 'velero-backups', path: 'helm/velero-backups', type: 'directory', description: 'Cluster backup and disaster recovery' },
       { name: 'external-secrets', path: 'helm/external-secrets', type: 'directory', description: 'Sync secrets from external providers' },
     ])
+  }),
+
+  // ── Optional feature status endpoints (issue #8162) ──────────────
+  // These endpoints probe for optional in-cluster integrations. In demo
+  // mode the integrations are not installed, so we return a success (200)
+  // response with `available: false`. Returning 200 here (instead of
+  // letting the catch-all return 503) keeps the DevTools network tab
+  // clean for demo visitors and avoids the MSW "unhandled request"
+  // warning. Source callers already branch on `available` so semantics
+  // are unchanged. See web/src/lib/kagentBackend.ts and related files.
+  http.get('/api/kagent/status', () => {
+    return HttpResponse.json({ available: false, reason: 'not configured in demo mode' })
+  }),
+  http.get('/api/kagent/agents', () => {
+    return HttpResponse.json({ agents: [] })
+  }),
+  http.get('/api/kagenti-provider/status', () => {
+    return HttpResponse.json({ available: false, reason: 'not configured in demo mode' })
+  }),
+  http.get('/api/kagenti-provider/agents', () => {
+    return HttpResponse.json({ agents: [] })
+  }),
+  http.get('/api/gadget/status', () => {
+    return HttpResponse.json({ available: false, reason: 'not configured in demo mode' })
+  }),
+  http.get('/api/mcs/status', () => {
+    return HttpResponse.json({ available: false, reason: 'not configured in demo mode' })
+  }),
+  http.get('/api/persistence/status', () => {
+    return HttpResponse.json({ available: false, reason: 'not configured in demo mode' })
+  }),
+  http.get('/api/self-upgrade/status', () => {
+    return HttpResponse.json({ available: false, reason: 'not configured in demo mode' })
   }),
 
   // ── Catch-all for unmocked API routes ────────────────────────────

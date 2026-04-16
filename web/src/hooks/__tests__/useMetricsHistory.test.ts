@@ -789,6 +789,80 @@ describe('useMetricsHistory', () => {
     })
   })
 
+  // ── GPU carry-forward protection (issue referenced in commit/PR body) ──
+  describe('GPU carry-forward protection for transient empty fetches', () => {
+    it('carries forward last known gpuNodes when a single capture has empty GPUs', async () => {
+      // Seed with a snapshot that has real GPU nodes
+      mockClusters.push({ name: 'c1', cpuCores: 4, cpuUsageCores: 2, memoryGB: 8, memoryUsageGB: 4, nodeCount: 1, healthy: true })
+      mockGPUNodes.push({ name: 'gpu-node-1', cluster: 'c1', gpuType: 'NVIDIA H100', gpuAllocated: 3, gpuCount: 8 })
+
+      const { useMetricsHistory } = await importFresh()
+      const { result } = renderHook(() => useMetricsHistory())
+
+      // First capture: real GPU data
+      act(() => { result.current.captureNow() })
+      const firstLatest = result.current.history[result.current.history.length - 1]
+      expect(firstLatest.gpuNodes).toHaveLength(1)
+      expect(firstLatest.gpuNodes[0].gpuTotal).toBe(8)
+
+      // Simulate transient fetch failure: gpuNodes list goes empty
+      mockGPUNodes.length = 0
+
+      // Second capture: should carry forward the previous gpuNodes
+      act(() => { result.current.captureNow() })
+      const secondLatest = result.current.history[result.current.history.length - 1]
+      expect(secondLatest.gpuNodes).toHaveLength(1)
+      expect(secondLatest.gpuNodes[0].name).toBe('gpu-node-1')
+      expect(secondLatest.gpuNodes[0].gpuTotal).toBe(8)
+    })
+
+    it('eventually accepts empty GPU state after the carry-forward window expires', async () => {
+      // MAX_GPU_CARRY_FORWARD = 6 (widened in #8080/#8081 to absorb longer
+      // slow-rolling flaps on GPU-bearing clusters). After six consecutive
+      // empty captures the seventh must reflect the empty state so truly
+      // removed GPUs eventually propagate into history.
+      const CARRY_FORWARD_WINDOW = 6
+      mockClusters.push({ name: 'c1', cpuCores: 4, cpuUsageCores: 2, memoryGB: 8, memoryUsageGB: 4, nodeCount: 1, healthy: true })
+      mockGPUNodes.push({ name: 'gpu-node-1', cluster: 'c1', gpuType: 'NVIDIA H100', gpuAllocated: 3, gpuCount: 8 })
+
+      const { useMetricsHistory } = await importFresh()
+      const { result } = renderHook(() => useMetricsHistory())
+
+      // Capture with real GPU data
+      act(() => { result.current.captureNow() })
+
+      // Now transition to empty GPU state
+      mockGPUNodes.length = 0
+
+      // CARRY_FORWARD_WINDOW empty captures — all should be carried-forward
+      for (let i = 0; i < CARRY_FORWARD_WINDOW; i += 1) {
+        act(() => { result.current.captureNow() })
+      }
+      const afterCarryForward = result.current.history[result.current.history.length - 1]
+      expect(afterCarryForward.gpuNodes).toHaveLength(1)
+
+      // One more consecutive empty capture — must accept the empty state
+      act(() => { result.current.captureNow() })
+      const afterWindow = result.current.history[result.current.history.length - 1]
+      expect(afterWindow.gpuNodes).toHaveLength(0)
+    })
+
+    it('does not carry-forward when previous snapshot also had empty gpuNodes', async () => {
+      // Non-GPU cluster: every capture has empty gpuNodes — must not carry forward.
+      mockClusters.push({ name: 'c1', cpuCores: 4, cpuUsageCores: 2, memoryGB: 8, memoryUsageGB: 4, nodeCount: 1, healthy: true })
+      // mockGPUNodes intentionally left empty
+
+      const { useMetricsHistory } = await importFresh()
+      const { result } = renderHook(() => useMetricsHistory())
+
+      act(() => { result.current.captureNow() })
+      act(() => { result.current.captureNow() })
+
+      const latest = result.current.history[result.current.history.length - 1]
+      expect(latest.gpuNodes).toHaveLength(0)
+    })
+  })
+
   describe('trend edge cases', () => {
     it('getClusterTrend returns "stable" for a non-existent cluster', async () => {
       const snaps = [
@@ -1130,6 +1204,82 @@ describe('useMetricsHistory', () => {
 
       expect(result1.current.snapshotCount).toBe(0)
       expect(result2.current.snapshotCount).toBe(0)
+    })
+  })
+
+  describe('useMetricsHistoryReadOnly', () => {
+    const INITIAL_CAPTURE_DELAY_MS = 5000
+    const TEN_MINUTES_MS = 10 * 60 * 1000
+
+    it('does not start a capture timer (read-only)', async () => {
+      mockClusters.push({
+        name: 'readonly-cluster',
+        cpuCores: 4,
+        cpuUsageCores: 2,
+        memoryGB: 8,
+        memoryUsageGB: 4,
+        nodeCount: 1,
+        healthy: true,
+      })
+
+      const { useMetricsHistoryReadOnly } = await importFresh()
+      const { result } = renderHook(() => useMetricsHistoryReadOnly())
+
+      const startTime = Date.now()
+      act(() => {
+        vi.setSystemTime(startTime + INITIAL_CAPTURE_DELAY_MS + TEN_MINUTES_MS)
+        vi.advanceTimersByTime(INITIAL_CAPTURE_DELAY_MS + TEN_MINUTES_MS)
+      })
+
+      // Singleton snapshot count stays at 0 — the read-only hook is not
+      // driving the capture interval.
+      expect(result.current.history).toHaveLength(0)
+      const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
+      expect(stored).toHaveLength(0)
+    })
+
+    it('stays in sync with the singleton when the driver captures a snapshot', async () => {
+      mockClusters.push({
+        name: 'driver-cluster',
+        cpuCores: 4,
+        cpuUsageCores: 2,
+        memoryGB: 8,
+        memoryUsageGB: 4,
+        nodeCount: 1,
+        healthy: true,
+      })
+
+      const { useMetricsHistory, useMetricsHistoryReadOnly } = await importFresh()
+      const { result: driver } = renderHook(() => useMetricsHistory())
+      const { result: reader } = renderHook(() => useMetricsHistoryReadOnly())
+
+      expect(reader.current.history).toHaveLength(0)
+
+      act(() => {
+        driver.current.captureNow()
+      })
+
+      // Read-only hook must reflect the driver's snapshot via the subscriber
+      // pattern, without doing any MCP polling or capture of its own.
+      expect(reader.current.history.length).toBeGreaterThanOrEqual(1)
+      expect(driver.current.history.length).toBe(reader.current.history.length)
+    })
+
+    it('reflects HISTORY_CHANGED_EVENT updates (cross-tab sync)', async () => {
+      const { useMetricsHistoryReadOnly } = await importFresh()
+      const { result } = renderHook(() => useMetricsHistoryReadOnly())
+
+      expect(result.current.history).toHaveLength(0)
+
+      // Simulate another tab writing to localStorage and firing the event.
+      const snap = makeSnapshot({ timestamp: new Date().toISOString() })
+      localStorage.setItem(STORAGE_KEY, JSON.stringify([snap]))
+
+      act(() => {
+        window.dispatchEvent(new Event(HISTORY_CHANGED_EVENT))
+      })
+
+      expect(result.current.history).toHaveLength(1)
     })
   })
 

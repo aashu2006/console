@@ -506,11 +506,22 @@ function markGtagDecided(available: boolean) {
   flushPendingEvents()
 }
 
+interface SendOptions {
+  /**
+   * Bypass the analytics opt-out gate. Reserved for voluntary, user-initiated
+   * feedback events (e.g. NPS survey submissions) where the user explicitly
+   * clicks to send the data. Passive tracking must never set this.
+   */
+  bypassOptOut?: boolean
+}
+
 function send(
   eventName: string,
   params?: Record<string, string | number | boolean>,
+  options?: SendOptions,
 ) {
-  if (!initialized || isOptedOut()) return
+  if (!initialized) return
+  if (isOptedOut() && !options?.bypassOptOut) return
 
   // Don't send any events until a real user has interacted.
   // This prevents automated/headless page loads from generating traffic.
@@ -982,10 +993,14 @@ export function emitScreenshotUploadSuccess(screenshotCount: number) {
 }
 
 // ── NPS Survey ────────────────────────────────────────────────────
+// NPS is voluntary, user-initiated product feedback — the user explicitly
+// clicks an emoji and hits submit. These three events bypass the analytics
+// opt-out gate so GA4 stays in sync with the NPS backend (Netlify Blobs),
+// which already records responses regardless of opt-out. See useNPSSurvey.ts.
 
 /** Fired when the NPS survey widget becomes visible */
 export function emitNPSSurveyShown() {
-  send('ksc_nps_survey_shown')
+  send('ksc_nps_survey_shown', undefined, { bypassOptOut: true })
 }
 
 /** Fired when user submits an NPS response */
@@ -994,12 +1009,12 @@ export function emitNPSResponse(score: number, category: string, feedbackLength?
     nps_score: score,
     nps_category: category,
     ...(feedbackLength !== undefined && { nps_feedback_length: feedbackLength }),
-  })
+  }, { bypassOptOut: true })
 }
 
 /** Fired when user dismisses the NPS widget without responding */
 export function emitNPSDismissed(dismissCount: number) {
-  send('ksc_nps_dismissed', { dismiss_count: dismissCount })
+  send('ksc_nps_dismissed', { dismiss_count: dismissCount }, { bypassOptOut: true })
 }
 
 // ── Orbit (Recurring Maintenance) ─────────────────────────────────
@@ -1052,6 +1067,37 @@ function wasAlreadyReported(msg: string): boolean {
     return false
   }
   return true
+}
+
+/**
+ * Detect promise rejections injected by browser extensions (wallet
+ * providers, adblockers, password managers) that throw against our
+ * window but have nothing to do with our code. GA4 was counting these
+ * as product errors and polluting ksc_error metrics — 5 of 9 errors on
+ * 2026-04-14 were "Failed to connect to MetaMask" from users who
+ * happened to have the extension installed.
+ *
+ * Match on:
+ *  - Message substrings for known extension errors
+ *  - Stack frames that reference chrome-extension:// or moz-extension://
+ *    URLs, which is a strong signal the code throwing isn't ours
+ */
+function isBrowserExtensionNoise(msg: string, reason: unknown): boolean {
+  if (
+    msg.includes('MetaMask') ||
+    msg.includes('ethereum') ||
+    msg.includes('web3') ||
+    msg.includes('evmAsk') ||
+    msg.includes('solana') ||
+    msg.includes('Could not establish connection. Receiving end does not exist')
+  ) return true
+  const stack = (reason as { stack?: string } | null)?.stack
+  if (typeof stack === 'string' && (
+    stack.includes('chrome-extension://') ||
+    stack.includes('moz-extension://') ||
+    stack.includes('safari-extension://')
+  )) return true
+  return false
 }
 
 export function emitError(category: string, detail: string, cardId?: string) {
@@ -1149,6 +1195,10 @@ export function startGlobalErrorTracking() {
       if (wasAlreadyReported(msg)) return
       // Skip clipboard API errors — expected on non-HTTPS and in restricted contexts
       if (msg.includes('writeText') || msg.includes('clipboard') || msg.includes('copy')) return
+      // Skip browser-extension promise rejections (wallet providers, etc.)
+      // that throw against our window but aren't our code. See
+      // isBrowserExtensionNoise() for rationale.
+      if (isBrowserExtensionNoise(msg, event.reason)) return
       // Stale chunks can surface as unhandled rejections from dynamic import()
       if (tryChunkReloadRecovery(msg)) return
       // Skip AbortError / TimeoutError — expected when fetches are cancelled on unmount
@@ -1212,6 +1262,16 @@ export function startGlobalErrorTracking() {
       if (wasAlreadyReported(event.message)) return
       // Skip clipboard API errors — expected on non-HTTPS and in restricted contexts
       if (event.message.includes('writeText') || event.message.includes('clipboard') || event.message.includes('copy')) return
+      // Skip browser-extension runtime errors — wallet/adblocker content
+      // scripts occasionally throw against our window.
+      if (isBrowserExtensionNoise(event.message, event.error)) return
+      // Also skip when the source filename itself points at an extension URL,
+      // regardless of whether stack parsing catches it.
+      if (typeof event.filename === 'string' && (
+        event.filename.startsWith('chrome-extension://') ||
+        event.filename.startsWith('moz-extension://') ||
+        event.filename.startsWith('safari-extension://')
+      )) return
       // Stale chunks can surface as runtime errors (Safari: "Importing a module script failed")
       if (tryChunkReloadRecovery(event.message)) return
       emitError('runtime', event.message)

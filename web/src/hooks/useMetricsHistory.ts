@@ -10,10 +10,31 @@ const MAX_SNAPSHOTS = 1008 // 7 days at 10-min intervals (6 per hour * 24 hours 
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 /** Maximum number of increasing-restart pods to include in AI context */
 const MAX_INCREASING_RESTART_PODS = 10
+/**
+ * Maximum consecutive snapshots whose empty GPU data will be carried-forward
+ * from the last known non-empty gpuNodes list. Prevents a transient GPU fetch
+ * glitch (SSE race, partial cluster reachability) from being persisted as a
+ * zero-total snapshot in GPU Inventory History while still allowing truly
+ * removed GPUs to reflect after roughly this-many capture intervals.
+ *
+ * At the default 10-minute capture interval, 6 consecutive carries covers
+ * ~1 hour of flapping — long enough to absorb a slow-rolling cluster outage
+ * on the GPU-bearing cluster (see issues #8080, #8081 from Mike Spreitzer's
+ * vllm-d cluster where partial fetch failures flapped inventory for multiple
+ * polling windows). Previously this was 2, which only covered ~20 minutes
+ * and still let zero bars leak into the persisted history.
+ */
+const MAX_GPU_CARRY_FORWARD = 6
 
 // Singleton state - shared across all hook instances
 let snapshots: MetricsSnapshot[] = []
 const subscribers = new Set<(snapshots: MetricsSnapshot[]) => void>()
+/**
+ * Tracks how many consecutive captures have had an empty gpuNodes list while
+ * the last persisted snapshot still had GPU inventory. Used to carry-forward
+ * the last known gpuNodes for up to MAX_GPU_CARRY_FORWARD captures.
+ */
+let consecutiveEmptyGPUCaptures = 0
 
 // Initialize from localStorage
 if (typeof window !== 'undefined') {
@@ -97,23 +118,65 @@ function addSnapshot(snapshot: MetricsSnapshot) {
 }
 
 /**
- * Hook to manage metrics history for trend detection
- * Automatically captures snapshots every 10 minutes (configurable)
+ * Applies carry-forward protection against transient empty gpuNodes results.
+ *
+ * When the current capture has an empty gpuNodes list but the most recent
+ * persisted snapshot still had GPU inventory, replace the empty list with the
+ * previous snapshot's gpuNodes — up to MAX_GPU_CARRY_FORWARD consecutive
+ * captures. This prevents transient fetch glitches from being persisted as
+ * zero-total snapshots that then render as flapping zero bars in GPU
+ * Inventory History.
+ *
+ * Returns the gpuNodes to use for the new snapshot.
  */
-export function useMetricsHistory() {
-  const [history, setHistory] = useState<MetricsSnapshot[]>(snapshots)
-  const { deduplicatedClusters: clusters } = useClusters()
-  const { issues: podIssues } = usePodIssues()
-  const { nodes: gpuNodes } = useGPUNodes()
-  const lastSnapshotRef = useRef<number>(0)
+function applyGPUCarryForward(
+  currentGpuNodes: MetricsSnapshot['gpuNodes'],
+): MetricsSnapshot['gpuNodes'] {
+  // Non-empty current: no carry-forward needed, reset counter.
+  if (currentGpuNodes.length > 0) {
+    consecutiveEmptyGPUCaptures = 0
+    return currentGpuNodes
+  }
 
-  // Keep volatile data in refs so the interval effect doesn't reset (#5781)
-  const clustersRef = useRef(clusters)
-  const podIssuesRef = useRef(podIssues)
-  const gpuNodesRef = useRef(gpuNodes)
-  clustersRef.current = clusters
-  podIssuesRef.current = podIssues
-  gpuNodesRef.current = gpuNodes
+  // Empty current. Look at the most recent persisted snapshot.
+  const lastSnapshot = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null
+  const lastHadGPUs = !!lastSnapshot && (lastSnapshot.gpuNodes || []).length > 0
+
+  // No previous GPU data to carry forward — this is a legitimate "no GPUs"
+  // state (either a non-GPU cluster or the zero has already been persisted).
+  if (!lastHadGPUs) {
+    consecutiveEmptyGPUCaptures = 0
+    return currentGpuNodes
+  }
+
+  // Previous snapshot had GPUs, current is empty — likely a transient flap.
+  // Carry forward the previous gpuNodes, but only for a bounded number of
+  // consecutive captures so truly-removed GPUs eventually reflect in history.
+  if (consecutiveEmptyGPUCaptures < MAX_GPU_CARRY_FORWARD) {
+    consecutiveEmptyGPUCaptures += 1
+    return lastSnapshot.gpuNodes
+  }
+
+  // Exceeded the carry-forward window — accept the empty state as truth.
+  consecutiveEmptyGPUCaptures = 0
+  return currentGpuNodes
+}
+
+/**
+ * Internal: subscribes a React state setter to the singleton `snapshots`
+ * array and to `HISTORY_CHANGED_EVENT` / `storage` cross-tab updates.
+ *
+ * Used by both `useMetricsHistory` (the driver that also captures snapshots)
+ * and `useMetricsHistoryReadOnly` (the passive reader that does not poll
+ * MCP or run a capture interval). Keeping the subscription code in one place
+ * ensures both variants stay in sync when the singleton is updated.
+ */
+function useSnapshotSubscription(): MetricsSnapshot[] {
+  // Initialize lazily from the current singleton so we pick up any captures
+  // that happened before this hook mounted (e.g., module-load from
+  // localStorage, or another hook instance already running). The subscribe
+  // effect below keeps us in sync after that.
+  const [history, setHistory] = useState<MetricsSnapshot[]>(() => [...snapshots])
 
   // Subscribe to shared state updates
   useEffect(() => {
@@ -121,7 +184,21 @@ export function useMetricsHistory() {
       setHistory([...newSnapshots])
     }
     subscribers.add(handleUpdate)
-    setHistory([...snapshots])
+    // Resync once right after subscribing: if the singleton received an
+    // update between the initial lazy `useState` snapshot and this effect
+    // running, we'd otherwise miss it until the next notify. Use a functional
+    // update that bails out (returns the previous reference) when the snapshot
+    // set hasn't actually changed, so React skips the rerender on every mount
+    // in the common case where nothing landed between init and subscribe.
+    setHistory(prev => {
+      if (
+        prev.length === snapshots.length &&
+        prev.every((s, i) => s === snapshots[i])
+      ) {
+        return prev
+      }
+      return [...snapshots]
+    })
 
     return () => {
       subscribers.delete(handleUpdate)
@@ -154,6 +231,34 @@ export function useMetricsHistory() {
     }
   }, [])
 
+  return history
+}
+
+/**
+ * Hook to manage metrics history for trend detection
+ * Automatically captures snapshots every 10 minutes (configurable)
+ *
+ * This is the "driver" variant: it polls MCP for clusters, pod issues, and
+ * GPU nodes and runs a capture `setInterval` per instance. Use this in ONE
+ * place per app (e.g., GPU Inventory History) — additional consumers should
+ * use `useMetricsHistoryReadOnly()` to avoid duplicate polling and stacked
+ * capture intervals.
+ */
+export function useMetricsHistory() {
+  const history = useSnapshotSubscription()
+  const { deduplicatedClusters: clusters } = useClusters()
+  const { issues: podIssues } = usePodIssues()
+  const { nodes: gpuNodes } = useGPUNodes()
+  const lastSnapshotRef = useRef<number>(0)
+
+  // Keep volatile data in refs so the interval effect doesn't reset (#5781)
+  const clustersRef = useRef(clusters)
+  const podIssuesRef = useRef(podIssues)
+  const gpuNodesRef = useRef(gpuNodes)
+  clustersRef.current = clusters
+  podIssuesRef.current = podIssues
+  gpuNodesRef.current = gpuNodes
+
   // Auto-capture snapshots at configured interval.
   // Reads volatile data from refs so the interval stays stable across MCP polls (#5781).
   useEffect(() => {
@@ -176,6 +281,13 @@ export function useMetricsHistory() {
         return
       }
 
+      const mappedGpuNodes = (currentGpuNodes || []).map(g => ({
+        name: g.name,
+        cluster: g.cluster,
+        gpuType: g.gpuType || '',
+        gpuAllocated: g.gpuAllocated,
+        gpuTotal: g.gpuCount }))
+
       const snapshot: MetricsSnapshot = {
         timestamp: new Date().toISOString(),
         clusters: currentClusters.map(c => ({
@@ -190,12 +302,9 @@ export function useMetricsHistory() {
           cluster: p.cluster || '',
           restarts: p.restarts || 0,
           status: p.status || '' })),
-        gpuNodes: (currentGpuNodes || []).map(g => ({
-          name: g.name,
-          cluster: g.cluster,
-          gpuType: g.gpuType || '',
-          gpuAllocated: g.gpuAllocated,
-          gpuTotal: g.gpuCount })) }
+        // Apply carry-forward to smooth transient empty-GPU fetch results
+        // (see applyGPUCarryForward docstring).
+        gpuNodes: applyGPUCarryForward(mappedGpuNodes) }
 
       addSnapshot(snapshot)
       lastSnapshotRef.current = now
@@ -221,6 +330,13 @@ export function useMetricsHistory() {
   const captureNow = () => {
     if (clusters.length === 0) return
 
+    const mappedGpuNodes = (gpuNodes || []).map(g => ({
+      name: g.name,
+      cluster: g.cluster,
+      gpuType: g.gpuType || '',
+      gpuAllocated: g.gpuAllocated,
+      gpuTotal: g.gpuCount }))
+
     const snapshot: MetricsSnapshot = {
       timestamp: new Date().toISOString(),
       clusters: clusters.map(c => ({
@@ -234,12 +350,7 @@ export function useMetricsHistory() {
         cluster: p.cluster || '',
         restarts: p.restarts || 0,
         status: p.status || '' })),
-      gpuNodes: (gpuNodes || []).map(g => ({
-        name: g.name,
-        cluster: g.cluster,
-        gpuType: g.gpuType || '',
-        gpuAllocated: g.gpuAllocated,
-        gpuTotal: g.gpuCount })) }
+      gpuNodes: applyGPUCarryForward(mappedGpuNodes) }
 
     addSnapshot(snapshot)
     lastSnapshotRef.current = Date.now()
@@ -248,6 +359,7 @@ export function useMetricsHistory() {
   // Clear history
   const clearHistory = () => {
     snapshots = []
+    consecutiveEmptyGPUCaptures = 0
     notifySubscribers()
     persistSnapshots()
   }
@@ -311,6 +423,27 @@ export function useMetricsHistory() {
     getClusterTrend,
     getPodRestartTrend,
     snapshotCount: history.length }
+}
+
+/**
+ * Read-only variant of `useMetricsHistory`.
+ *
+ * Subscribes to the singleton snapshots state (so it reflects updates from
+ * whichever component hosts the driver `useMetricsHistory()`), but:
+ *   - Does NOT call `useClusters`, `usePodIssues`, or `useGPUNodes` (no
+ *     duplicate MCP polling).
+ *   - Does NOT set up a capture `setInterval` (no stacked timers).
+ *
+ * Use this in secondary consumers (e.g., cards that want a last-known-good
+ * GPU-node snapshot as a fallback) so they can share history with the
+ * driver instance without doubling up on polling or captures.
+ *
+ * Returns `{ history }` only — callers that need `captureNow`, trend helpers,
+ * or `clearHistory` must use the driver hook `useMetricsHistory()` instead.
+ */
+export function useMetricsHistoryReadOnly(): { history: MetricsSnapshot[] } {
+  const history = useSnapshotSubscription()
+  return { history }
 }
 
 /**

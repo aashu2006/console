@@ -884,14 +884,19 @@ func (s *Server) setupRoutes() {
 	api.Get("/rbac/service-accounts", rbac.ListK8sServiceAccounts)
 	api.Get("/rbac/roles", rbac.ListK8sRoles)
 	api.Get("/rbac/bindings", rbac.ListK8sRoleBindings)
-	api.Get("/rbac/permissions", rbac.GetClusterPermissions)
 	// NOTE: POST /api/rbac/service-accounts and POST /api/rbac/bindings moved
 	// to kc-agent (#7993 Phase 1.5 PR A). The frontend now POSTs to
 	// ${LOCAL_AGENT_HTTP_URL}/serviceaccounts and
 	// ${LOCAL_AGENT_HTTP_URL}/rolebindings so the mutation runs under the
 	// user's kubeconfig instead of the backend pod's ServiceAccount.
-	api.Get("/permissions/summary", rbac.GetPermissionsSummary)
-	api.Post("/rbac/can-i", rbac.CheckCanI)
+	//
+	// NOTE: GET /api/rbac/permissions, GET /api/permissions/summary, and
+	// POST /api/rbac/can-i moved to kc-agent (#7993 Phase 6). The frontend
+	// now calls ${LOCAL_AGENT_HTTP_URL}/rbac/permissions,
+	// ${LOCAL_AGENT_HTTP_URL}/permissions/summary, and
+	// ${LOCAL_AGENT_HTTP_URL}/rbac/can-i so SelfSubjectAccessReviews run
+	// under the user's kubeconfig instead of the backend pod ServiceAccount
+	// when console is deployed in-cluster.
 
 	// Namespace read routes. GET /namespaces is viewer-or-above (see
 	// ListNamespaces's requireViewerOrAbove check) and
@@ -958,6 +963,10 @@ func (s *Server) setupRoutes() {
 	api.Get("/mcp/wasmcloud/hosts", mcpHandlers.GetWasmCloudHosts)
 	api.Get("/mcp/wasmcloud/actors", mcpHandlers.GetWasmCloudActors)
 	api.Get("/mcp/custom-resources", mcpHandlers.GetCustomResources)
+	// Drasi reverse proxy — forwards to drasi-server (mode 1+2) or drasi-platform
+	// (mode 3) so the `/drasi` dashboard speaks the same client code to either.
+	// See pkg/api/handlers/drasi_proxy.go for the protocol detection contract.
+	api.All("/drasi/proxy/*", mcpHandlers.ProxyDrasi)
 	api.Get("/mcp/replicasets", mcpHandlers.GetReplicaSets)
 	api.Get("/mcp/statefulsets", mcpHandlers.GetStatefulSets)
 	api.Get("/mcp/daemonsets", mcpHandlers.GetDaemonSets)
@@ -1201,24 +1210,19 @@ func (s *Server) setupRoutes() {
 	api.Get("/persistence/status", persistenceHandler.GetStatus)
 	api.Post("/persistence/sync", persistenceHandler.SyncNow)
 	api.Post("/persistence/test", persistenceHandler.TestConnection)
-	// ManagedWorkload endpoints
+	// ManagedWorkload endpoints — writes moved to kc-agent /console-cr/workloads
+	// (#7993 Phase 2.5). They run under the user's kubeconfig instead of the
+	// backend pod SA. List/Get remain until Phase 4.5.
 	api.Get("/persistence/workloads", persistenceHandler.ListManagedWorkloads)
 	api.Get("/persistence/workloads/:name", persistenceHandler.GetManagedWorkload)
-	api.Post("/persistence/workloads", persistenceHandler.CreateManagedWorkload)
-	api.Put("/persistence/workloads/:name", persistenceHandler.UpdateManagedWorkload)
-	api.Delete("/persistence/workloads/:name", persistenceHandler.DeleteManagedWorkload)
-	// ClusterGroup endpoints
+	// ClusterGroup endpoints — writes moved to kc-agent /console-cr/groups (#7993 Phase 2.5).
 	api.Get("/persistence/groups", persistenceHandler.ListClusterGroups)
 	api.Get("/persistence/groups/:name", persistenceHandler.GetClusterGroup)
-	api.Post("/persistence/groups", persistenceHandler.CreateClusterGroup)
-	api.Put("/persistence/groups/:name", persistenceHandler.UpdateClusterGroup)
-	api.Delete("/persistence/groups/:name", persistenceHandler.DeleteClusterGroup)
-	// WorkloadDeployment endpoints
+	// WorkloadDeployment endpoints — writes (including the status subresource)
+	// moved to kc-agent /console-cr/deployments and
+	// /console-cr/deployments/status (#7993 Phase 2.5).
 	api.Get("/persistence/deployments", persistenceHandler.ListWorkloadDeployments)
 	api.Get("/persistence/deployments/:name", persistenceHandler.GetWorkloadDeployment)
-	api.Post("/persistence/deployments", persistenceHandler.CreateWorkloadDeployment)
-	api.Put("/persistence/deployments/:name/status", persistenceHandler.UpdateWorkloadDeploymentStatus)
-	api.Delete("/persistence/deployments/:name", persistenceHandler.DeleteWorkloadDeployment)
 
 	// GitHub webhook (public endpoint, uses signature verification)
 	s.app.Post("/webhooks/github", feedback.HandleGitHubWebhook)
@@ -1229,12 +1233,12 @@ func (s *Server) setupRoutes() {
 		s.hub.HandleConnection(c)
 	}))
 
-	// WebSocket for pod exec terminal — uses first-message JWT auth (same pattern as /ws hub)
-	execHandlers := handlers.NewExecHandlers(s.k8sClient, s.config.JWTSecret, s.config.DevMode)
-	s.app.Use("/ws/exec", middleware.WebSocketUpgrade())
-	s.app.Get("/ws/exec", websocket.New(func(c *websocket.Conn) {
-		execHandlers.HandleExec(c)
-	}))
+	// Pod exec WebSocket moved to kc-agent (#7993 Phase 3d, closes #5406).
+	// kc-agent runs the SPDY exec stream under the user's kubeconfig so the
+	// target apiserver enforces RBAC natively — no SubjectAccessReview
+	// workaround required. The frontend now connects to kc-agent's
+	// /ws/exec route via LOCAL_AGENT_WS_URL. See pkg/agent/server_exec.go
+	// and web/src/hooks/useExecSession.ts for the replacement.
 
 	// Serve static files in production
 	if !s.config.DevMode {

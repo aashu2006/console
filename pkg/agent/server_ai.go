@@ -21,6 +21,16 @@ import (
 // to prevent resource exhaustion from bursty or malicious traffic (#7277).
 const maxWSGoroutines = 20
 
+// wsMaxMessageBytes caps the size of any single WebSocket frame the agent
+// will accept from a client. Without this, an authenticated client could
+// send arbitrarily large prompts that get forwarded to paid LLM APIs.
+const wsMaxMessageBytes = 1 << 20 // 1 MB
+
+// maxPromptChars caps the per-request prompt length forwarded to LLM
+// providers. Set well above interactive use but below the WebSocket frame
+// limit to keep cost and latency bounded.
+const maxPromptChars = 100_000
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Handle CORS preflight for Private Network Access (required by Chrome 104+)
 	if r.Method == http.MethodOptions {
@@ -48,6 +58,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(wsMaxMessageBytes)
 
 	wsc := &wsClient{}
 	s.clientsMux.Lock()
@@ -431,6 +442,12 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 
 	if req.Prompt == "" {
 		safeWrite(context.Background(), s.errorResponse(msg.ID, "empty_prompt", "Prompt cannot be empty"))
+		return
+	}
+
+	if len(req.Prompt) > maxPromptChars {
+		safeWrite(context.Background(), s.errorResponse(msg.ID, "prompt_too_large",
+			fmt.Sprintf("Prompt exceeds maximum length of %d characters", maxPromptChars)))
 		return
 	}
 
@@ -1322,9 +1339,35 @@ Command output:
 	})
 }
 
-// promptNeedsToolExecution checks if the prompt or history suggests command execution
+// promptNeedsToolExecution checks if the prompt or history suggests command execution.
+//
+// This is a cheap heuristic used to decide whether to route a chat message to a
+// tool-capable agent (claude-code, codex, gemini-cli) or a plain conversational
+// agent. A previous implementation relied on `strings.Contains` of a flat
+// keyword list, which misrouted declarative/interrogative prompts like
+// "How do I delete a namespace?" (contains "delete") and "yes, that is correct"
+// (retry-keyword "yes" matched via Contains). See #8074.
 func (s *Server) promptNeedsToolExecution(prompt string) bool {
 	prompt = strings.ToLower(prompt)
+	trimmed := strings.TrimSpace(prompt)
+
+	// Declarative/interrogative prefixes that indicate an explanatory question,
+	// not a tool-execution request. Return false regardless of later keywords
+	// so "How do I delete a namespace?" is not routed to a tool-capable agent
+	// just because it contains the word "delete". (#8074)
+	questionPrefixes := []string{
+		"how do", "how can", "how should", "how to",
+		"what is", "what are", "what does", "what's the",
+		"why ", "when ", "where ", "which ",
+		"explain ", "tell me ", "describe how", "describe what",
+		"can you explain", "could you explain",
+	}
+	for _, prefix := range questionPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return false
+		}
+	}
+
 	// Keywords that suggest command execution is needed
 	executionKeywords := []string{
 		"run ", "execute", "kubectl", "helm", "check ", "show me", "get ",
@@ -1338,10 +1381,28 @@ func (s *Server) promptNeedsToolExecution(prompt string) bool {
 			return true
 		}
 	}
-	// Also check for retry/continuation requests which imply tool execution
-	retryKeywords := []string{"try again", "retry", "do it", "run it", "execute it", "yes", "proceed", "go ahead", "please do"}
+
+	// Retry/continuation requests that imply tool execution. These must match
+	// as whole tokens rather than substrings so "yes" does not match
+	// "yesterday" and "do it" does not match "do itemize". We check exact-match
+	// on the trimmed prompt plus a space-bounded Contains check for phrases
+	// embedded in longer sentences ("try again please"). (#8074)
+	retryKeywords := []string{
+		"try again", "retry", "do it", "run it", "execute it",
+		"yes", "proceed", "go ahead", "please do",
+	}
+	paddedPrompt := " " + trimmed + " "
 	for _, keyword := range retryKeywords {
-		if strings.Contains(prompt, keyword) {
+		if trimmed == keyword {
+			return true
+		}
+		if strings.Contains(paddedPrompt, " "+keyword+" ") {
+			return true
+		}
+		if strings.Contains(paddedPrompt, " "+keyword+",") {
+			return true
+		}
+		if strings.Contains(paddedPrompt, " "+keyword+".") {
 			return true
 		}
 	}
@@ -1365,7 +1426,7 @@ func (s *Server) findToolCapableAgent() string {
 	// Priority order: agents that execute commands directly first,
 	// then agents that may only suggest commands.
 	preferredOrder := []string{"claude-code", "codex", "gemini-cli", "antigravity", "bob"}
-	suggestOnlyAgents := []string{"copilot-cli", "gh-copilot"}
+	suggestOnlyAgents := []string{"copilot-cli"}
 
 	allProviders := s.registry.List()
 
@@ -1547,6 +1608,19 @@ type KeyStatus struct {
 	Source      string `json:"source,omitempty"` // "env" or "config"
 	Valid       *bool  `json:"valid,omitempty"`  // nil = not tested, true/false = test result
 	Error       string `json:"error,omitempty"`
+	// BaseURL is the currently-resolved base URL for this provider (env var,
+	// then ~/.kc/config.yaml, then compiled default). Empty when the provider
+	// does not support a base URL override (vendor HTTP APIs).
+	BaseURL string `json:"baseURL,omitempty"`
+	// BaseURLEnvVar is the environment variable this provider honors for
+	// base URL overrides (e.g. "OLLAMA_URL", "GROQ_BASE_URL"). Empty when
+	// the provider has no base URL override. Surfaced to the UI so the
+	// Advanced section can show the env var name as an operator hint.
+	BaseURLEnvVar string `json:"baseURLEnvVar,omitempty"`
+	// BaseURLSource is "env" when the current BaseURL value came from the
+	// env var, "config" when it came from ~/.kc/config.yaml, or empty when
+	// the resolved value is the compiled-in default.
+	BaseURLSource string `json:"baseURLSource,omitempty"`
 }
 
 // KeysStatusResponse is the response for GET /settings/keys
@@ -1555,11 +1629,15 @@ type KeysStatusResponse struct {
 	ConfigPath string      `json:"configPath"`
 }
 
-// SetKeyRequest is the request body for POST /settings/keys
+// SetKeyRequest is the request body for POST /settings/keys.
+// Setting APIKey requires a valid key; setting BaseURL is independent
+// (operators can configure a base URL without an API key, which is the
+// common path for unauthenticated local LLM runners).
 type SetKeyRequest struct {
 	Provider string `json:"provider"`
-	APIKey   string `json:"apiKey"`
+	APIKey   string `json:"apiKey,omitempty"`
 	Model    string `json:"model,omitempty"`
+	BaseURL  string `json:"baseURL,omitempty"`
 }
 
 // handleSettingsKeys handles GET and POST for /settings/keys

@@ -418,6 +418,18 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/helm/uninstall", s.handleHelmUninstall)
 	mux.HandleFunc("/helm/upgrade", s.handleHelmUpgrade)
 
+	// ConsoleResource CR writes moved to kc-agent (#7993 Phase 2.5).
+	// ManagedWorkload / ClusterGroup / WorkloadDeployment creates, updates,
+	// and deletes now run under the user's kubeconfig. The backend still
+	// hosts the reconciler (console_persistence.go StartWatcher /
+	// reconcileDeployment) because that's system-internal — it reacts to
+	// CR state changes without a human in the loop and legitimately runs
+	// as the pod SA.
+	mux.HandleFunc("/console-cr/workloads", s.handleConsoleCRManagedWorkloads)
+	mux.HandleFunc("/console-cr/groups", s.handleConsoleCRClusterGroups)
+	mux.HandleFunc("/console-cr/deployments", s.handleConsoleCRWorkloadDeployments)
+	mux.HandleFunc("/console-cr/deployments/status", s.handleConsoleCRWorkloadDeploymentStatus)
+
 	// GitOps drift detection + kubectl sync moved to kc-agent (#7993 Phase 3b).
 	// These shell `kubectl diff` / `kubectl apply` under the user's kubeconfig.
 	// Backend handlers are still present until Phase 4 deletes them — routes
@@ -439,6 +451,15 @@ func (s *Server) Start() error {
 	// handlers are deleted in this same PR along with the frontend migration.
 	// Route in pkg/agent/server_gpu_health.go.
 	mux.HandleFunc("/gpu-health-cronjob", s.handleGPUHealthCronJob)
+
+	// RBAC / permissions introspection moved to kc-agent (#7993 Phase 6).
+	// SelfSubjectAccessReview must be issued under the caller's identity, not
+	// the backend pod ServiceAccount — otherwise in-cluster the answer
+	// reflects the pod SA's permissions instead of the user's. Routes in
+	// pkg/agent/server_rbac.go. Backend handlers are deleted in the same PR.
+	mux.HandleFunc("/rbac/can-i", s.handleCanIHTTP)
+	mux.HandleFunc("/rbac/permissions", s.handleClusterPermissionsHTTP)
+	mux.HandleFunc("/permissions/summary", s.handlePermissionsSummaryHTTP)
 
 	// Rename context endpoint
 	mux.HandleFunc("/rename-context", s.handleRenameContextHTTP)
@@ -531,6 +552,12 @@ func (s *Server) Start() error {
 
 	// WebSocket endpoint
 	mux.HandleFunc("/ws", s.handleWebSocket)
+	// Pod exec WebSocket moved to kc-agent (#7993 Phase 3d-A). Runs the
+	// SPDY exec stream under the user's kubeconfig so the target cluster's
+	// apiserver enforces RBAC natively — no SubjectAccessReview dance is
+	// needed, unlike pkg/api/handlers/exec.go which uses the pod SA and
+	// has to simulate the user identity. Handler in server_exec.go.
+	mux.HandleFunc("/ws/exec", s.handleExec)
 
 	// CORS preflight - uses isAllowedOrigin() instead of wildcard to restrict access
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

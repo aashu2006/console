@@ -101,6 +101,7 @@ export function ReservationFormModal({
   user,
   prefillDate,
   forceLive,
+  knownNamespacesByCluster,
   onSave,
   onActivate,
   onSaved,
@@ -114,6 +115,15 @@ export function ReservationFormModal({
   prefillDate?: string | null
   /** When true, skip demo mode fallback for namespace list */
   forceLive?: boolean
+  /**
+   * Map of cluster name → namespaces known to have existing reservations.
+   * Union'd with the `useNamespaces()` result as a fallback when the fetch
+   * tiers don't return them (e.g. user lacks cluster-wide list RBAC and the
+   * namespace has no running pods). System namespaces (default, kube-system,
+   * kube-*, openshift-*, etc.) are still filtered out of the dropdown
+   * regardless of what this prop contains.
+   */
+  knownNamespacesByCluster?: Record<string, string[]>
   onSave: (input: CreateGPUReservationInput | UpdateGPUReservationInput) => Promise<string | void>
   onActivate: (id: string) => Promise<void>
   onSaved: () => void
@@ -194,10 +204,18 @@ export function ReservationFormModal({
 
   const { namespaces: rawNamespaces } = useNamespaces(cluster || undefined, forceLive)
 
+  // Union the hook result with namespaces from existing reservations on
+  // this cluster. Memoized to avoid re-allocating on every keystroke.
+  const mergedRawNamespaces = useMemo(() => {
+    const knownForCluster = (cluster && knownNamespacesByCluster?.[cluster]) || []
+    if (knownForCluster.length === 0) return rawNamespaces
+    return Array.from(new Set<string>([...rawNamespaces, ...knownForCluster])).sort()
+  }, [rawNamespaces, cluster, knownNamespacesByCluster])
+
   // Filter out system namespaces from the dropdown
   const FILTERED_NS_PREFIXES = ['openshift-', 'kube-']
   const FILTERED_NS_EXACT = ['default', 'kube-system', 'kube-public', 'kube-node-lease']
-  const clusterNamespaces = rawNamespaces.filter(ns =>
+  const clusterNamespaces = mergedRawNamespaces.filter(ns =>
       !FILTERED_NS_PREFIXES.some(prefix => ns.startsWith(prefix)) &&
       !FILTERED_NS_EXACT.includes(ns)
     )

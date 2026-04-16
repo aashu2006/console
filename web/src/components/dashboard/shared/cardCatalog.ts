@@ -245,6 +245,7 @@ export const CARD_CATALOG = {
     { type: 'vault_secrets', title: 'HashiCorp Vault', description: 'Secrets management, dynamic credentials, and encryption-as-a-service', visualization: 'status' },
     { type: 'external_secrets', title: 'External Secrets', description: 'Sync secrets from external providers (AWS, Azure, GCP, Vault)', visualization: 'status' },
     { type: 'cert_manager', title: 'Cert-Manager', description: 'TLS certificate lifecycle management with automatic renewal', visualization: 'status' },
+    { type: 'keycloak_status', title: 'Keycloak', description: 'Keycloak realm health, active user sessions, and registered clients', visualization: 'status' },
     { type: 'namespace_rbac', title: 'Access Controls', description: 'RBAC policies and permission auditing per namespace', visualization: 'table' },
   ],
   'Workload Detection': [
@@ -336,6 +337,12 @@ export const CARD_CATALOG = {
   'Drasi': [
     { type: 'drasi_reactive_graph', title: 'Drasi Reactive Graph', description: 'Reactive data pipeline — sources, continuous queries, reactions, and live results with animated flow', visualization: 'status' },
   ],
+  'Maturity': [
+    { type: 'acmm_level', title: 'Current Level', description: "The repo's current level on the AI Codebase Maturity Model (L1–L5)", visualization: 'gauge' },
+    { type: 'acmm_balance', title: 'Human vs AI Balance', description: 'Weekly AI vs human contribution trend with a balance target slider anchored to ACMM levels', visualization: 'timeseries' },
+    { type: 'acmm_feedback_loops', title: 'Feedback Loop Inventory', description: 'Inventory of criteria from ACMM + Fullsend + Agentic Engineering Framework + Claude Reflect', visualization: 'status' },
+    { type: 'acmm_recommendations', title: 'Your Role + Next Steps', description: 'Current role and prioritized missing criteria for the next level', visualization: 'status' },
+  ],
 } as const
 
 // ---------------------------------------------------------------------------
@@ -385,6 +392,7 @@ export const CATEGORY_LOCALE_KEYS: Record<string, string> = {
   'Orchestration': 'orchestration',
   'Serverless': 'serverless',
   'Streaming & Messaging': 'streamingMessaging',
+  'Maturity': 'maturity',
 }
 
 // ---------------------------------------------------------------------------
@@ -517,10 +525,17 @@ export function generateCardSuggestions(query: string): CardSuggestion[] {
     ]
   }
 
+  if (lowerQuery.includes('keycloak') || lowerQuery.includes('sso') || lowerQuery.includes('realm') || lowerQuery.includes('identity') || lowerQuery.includes('iam') || lowerQuery.includes('oauth') || lowerQuery.includes('oidc') || lowerQuery.includes('authentication')) {
+    return [
+      { type: 'keycloak_status', title: 'Keycloak', description: 'Keycloak realm health, active user sessions, and registered clients', visualization: 'status', config: {} },
+    ]
+  }
+
   if (lowerQuery.includes('user') || lowerQuery.includes('service account') || lowerQuery.includes('access') || lowerQuery.includes('permission')) {
     return [
       { type: 'user_management', title: 'User Management', description: 'Console users and Kubernetes RBAC', visualization: 'table', config: {} },
       { type: 'namespace_rbac', title: 'Namespace RBAC', description: 'Roles, bindings, service accounts', visualization: 'table', config: {} },
+      { type: 'keycloak_status', title: 'Keycloak', description: 'SSO realm health, user sessions, and registered clients', visualization: 'status', config: {} },
     ]
   }
 

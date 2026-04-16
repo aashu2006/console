@@ -2,8 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 
 const {
-  mockIsAuthenticated,
-  mockIsDemoMode,
   mockAwardCoins,
   mockApiPost,
   mockEmitShown,
@@ -11,22 +9,12 @@ const {
   mockEmitDismissed,
   store,
 } = vi.hoisted(() => ({
-  mockIsAuthenticated: vi.fn(() => true),
-  mockIsDemoMode: vi.fn(() => false),
   mockAwardCoins: vi.fn(),
   mockApiPost: vi.fn().mockResolvedValue({ data: {} }),
   mockEmitShown: vi.fn(),
   mockEmitResponse: vi.fn(),
   mockEmitDismissed: vi.fn(),
   store: new Map<string, string>(),
-}))
-
-vi.mock('../../lib/auth', () => ({
-  useAuth: () => ({ isAuthenticated: mockIsAuthenticated() }),
-}))
-
-vi.mock('../../lib/demoMode', () => ({
-  isDemoMode: () => mockIsDemoMode(),
 }))
 
 vi.mock('../useRewards', () => ({
@@ -58,11 +46,11 @@ vi.mock('../../lib/utils/localStorage', () => ({
 import { useNPSSurvey } from '../useNPSSurvey'
 
 describe('useNPSSurvey', () => {
+  const fetchMock = vi.fn()
+
   beforeEach(() => {
     vi.useFakeTimers()
     store.clear()
-    mockIsAuthenticated.mockReturnValue(true)
-    mockIsDemoMode.mockReturnValue(false)
     mockAwardCoins.mockClear()
     mockApiPost.mockClear()
     mockEmitShown.mockClear()
@@ -70,37 +58,36 @@ describe('useNPSSurvey', () => {
     mockEmitDismissed.mockClear()
     // Default: enough sessions
     store.set('kc-session-count', '10')
+    // NPS POST now throws on non-ok; default to a successful 201
+    fetchMock.mockResolvedValue(new Response(null, { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
   })
 
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllGlobals()
+    fetchMock.mockReset()
   })
 
-  it('does not show for unauthenticated users', () => {
-    mockIsAuthenticated.mockReturnValue(false)
+  it('shows for demo/unauthenticated visitors (voluntary feedback has no auth gate)', () => {
     const { result } = renderHook(() => useNPSSurvey())
-    act(() => { vi.advanceTimersByTime(35_000) })
-    expect(result.current.isVisible).toBe(false)
-  })
-
-  it('does not show for demo-mode users', () => {
-    mockIsDemoMode.mockReturnValue(true)
-    const { result } = renderHook(() => useNPSSurvey())
-    act(() => { vi.advanceTimersByTime(35_000) })
-    expect(result.current.isVisible).toBe(false)
+    act(() => { vi.advanceTimersByTime(15_000) })
+    expect(result.current.isVisible).toBe(true)
+    expect(mockEmitShown).toHaveBeenCalledOnce()
   })
 
   it('does not show before MIN_SESSIONS_BEFORE_NPS sessions', () => {
-    store.set('kc-session-count', '3')
+    // MIN_SESSIONS_BEFORE_NPS is 2; 1 session is below threshold
+    store.set('kc-session-count', '1')
     const { result } = renderHook(() => useNPSSurvey())
-    act(() => { vi.advanceTimersByTime(35_000) })
+    act(() => { vi.advanceTimersByTime(15_000) })
     expect(result.current.isVisible).toBe(false)
   })
 
   it('shows after idle delay when eligible', () => {
     const { result } = renderHook(() => useNPSSurvey())
     expect(result.current.isVisible).toBe(false)
-    act(() => { vi.advanceTimersByTime(30_000) })
+    act(() => { vi.advanceTimersByTime(10_000) })
     expect(result.current.isVisible).toBe(true)
     expect(mockEmitShown).toHaveBeenCalledOnce()
   })
@@ -117,6 +104,34 @@ describe('useNPSSurvey', () => {
     expect(result.current.isVisible).toBe(false)
     expect(mockEmitResponse).toHaveBeenCalledWith(4, 'promoter', 14)
     expect(mockAwardCoins).toHaveBeenCalledWith('nps_survey')
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/nps',
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('submitResponse throws when NPS POST fails and skips GA4 emit', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('bad', { status: 500 }))
+    const { result } = renderHook(() => useNPSSurvey())
+    act(() => { vi.advanceTimersByTime(30_000) })
+
+    let caught: unknown = null
+    await act(async () => {
+      try {
+        await result.current.submitResponse(3)
+      } catch (err) {
+        caught = err
+      }
+    })
+
+    expect(caught).toBeInstanceOf(Error)
+    // Widget stays open so the user can retry
+    expect(result.current.isVisible).toBe(true)
+    // GA4 event must NOT fire when the backend rejected the response —
+    // keeps GA4 and the NPS Blobs store in sync
+    expect(mockEmitResponse).not.toHaveBeenCalled()
+    // Coins not awarded for a failed submission
+    expect(mockAwardCoins).not.toHaveBeenCalled()
   })
 
   it('creates GitHub issue for detractor scores', async () => {

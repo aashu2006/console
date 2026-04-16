@@ -103,3 +103,10 @@ export const STORAGE_KEY_INTOTO_CACHE = 'kc-intoto-cache'
 export const STORAGE_KEY_INTOTO_CACHE_TIME = 'kc-intoto-cache-time'
 export const STORAGE_KEY_NS_OVERVIEW_CLUSTER = 'kc-ns-overview-cluster'
 export const STORAGE_KEY_NS_OVERVIEW_NAMESPACE = 'kc-ns-overview-namespace'
+
+// Drasi reactive-graph card — user-managed list of Drasi server connections
+// and the currently-selected one. Replaces the build-time VITE_DRASI_SERVER_URL
+// / VITE_DRASI_PLATFORM_CLUSTER envs with a runtime picker modeled after the
+// AI/ML endpoint management pattern.
+export const STORAGE_KEY_DRASI_CONNECTIONS = 'ksc-drasi-connections'
+export const STORAGE_KEY_DRASI_ACTIVE_CONNECTION = 'ksc-drasi-active-connection'
