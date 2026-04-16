@@ -366,7 +366,7 @@ async function fetchSingleCluster(cluster: string): Promise<IntotoClusterStatus>
 
 export function useIntoto() {
   const { isDemoMode } = useDemoMode()
-  const { clusters: allClusters, isLoading: clustersLoading } = useClusters()
+  const { deduplicatedClusters, isLoading: clustersLoading } = useClusters()
 
   // Snapshot ref value to avoid reading ref during render
   const cachedData = useRef(loadFromCache())
@@ -391,7 +391,9 @@ export function useIntoto() {
   /** Guard to prevent concurrent refetch calls from flooding the request queue */
   const fetchInProgress = useRef(false)
 
-  const clusters = allClusters.filter(c => c.reachable === true).map(c => c.name)
+  const clusters = (deduplicatedClusters || [])
+    .filter(c => c.reachable === true)
+    .map(c => c.name)
 
   const refetch = useCallback(async (silent = false) => {
     if (clusters.length === 0) {

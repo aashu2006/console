@@ -217,11 +217,6 @@ Please proceed step by step.`,
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-1">
           <RefreshIndicator isRefreshing={isRefreshing} lastUpdated={lastRefresh} size="xs" />
-          {isDemoData && (
-            <StatusBadge color="purple" size="xs">
-              Demo
-            </StatusBadge>
-          )}
           <a
             href="https://in-toto.io/"
             target="_blank"
@@ -260,7 +255,7 @@ Please proceed step by step.`,
       )}
 
       {/* Inline progress ring while scanning/refreshing (only if not initial load) */}
-      {!isLoading && (isLoading || isRefreshing) && !installed && !isDemoData && (
+      {!isLoading && isRefreshing && !installed && !isDemoData && (
         <div className="flex items-center gap-2 mb-3 text-xs text-muted-foreground">
           {totalClusters > 0 ? (
             <ProgressRing progress={clustersChecked / totalClusters} size={14} strokeWidth={1.5} />

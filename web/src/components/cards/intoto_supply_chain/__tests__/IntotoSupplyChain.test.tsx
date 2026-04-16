@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from 'vitest'
+/**
+ * @vitest-environment jsdom
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import React from 'react'
 
@@ -140,7 +143,8 @@ describe('IntotoSupplyChain', () => {
     })
 
     render(<IntotoSupplyChain />)
-    expect(screen.getByText('Demo')).toBeTruthy()
+    // The Demo badge is now handled by CardWrapper, so it won't appear in this unit test
+    expect(screen.queryByText('Demo')).toBeNull()
   })
 
   it('renders live mode data', () => {
@@ -259,7 +263,7 @@ describe('IntotoSupplyChain', () => {
     })
 
     const { rerender } = render(<IntotoSupplyChain />)
-    expect(screen.getByText('Demo')).toBeTruthy()
+    expect(screen.queryByText('Demo')).toBeNull()
 
     vi.mocked(useIntoto).mockReturnValue({
       statuses: {},
