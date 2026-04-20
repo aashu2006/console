@@ -175,9 +175,6 @@ function parseService(item: CRItem): KnativeServingService {
     }
   }
 
-  // Respect configurationGeneration on spec if raw generation missing
-  const specTemplate = (spec.template ?? {}) as Record<string, unknown>
-  void specTemplate // consumed only through generation above
 
   return {
     name: item.name,
@@ -266,9 +263,9 @@ function parseBroker(item: CRItem): KnativeEventingBroker {
     }
   }
 
-  // Broker class from annotation or spec
-  const brokerClass = (annotations?.['eventing.knative.dev/broker.class'] as string) ??
-    (typeof spec.config === 'object' ? 'MTChannelBasedBroker' : 'MTChannelBasedBroker')
+  // Broker class from annotation, falling back to the default class
+  const brokerClass =
+    (annotations?.['eventing.knative.dev/broker.class'] as string) ?? 'MTChannelBasedBroker'
 
   // Dead-letter sink
   const delivery = (spec.delivery ?? {}) as Record<string, unknown>
@@ -434,6 +431,7 @@ export function useKnativeStatus(): UseKnativeStatusResult {
     (data.servingControllerPods?.total ?? 0) > 0 ||
     (data.eventingControllerPods?.total ?? 0) > 0 ||
     (data.services || []).length > 0 ||
+    (data.revisions || []).length > 0 ||
     (data.brokers || []).length > 0
 
   const { showSkeleton, showEmptyState } = useCardLoadingState({

@@ -132,8 +132,8 @@ function TrafficBar({ traffic }: { traffic: KnativeTrafficTarget[] }) {
       </div>
       {!isSingleTarget && (
         <div className="flex justify-between mt-0.5 text-xs text-muted-foreground tabular-nums">
-          {(traffic || []).map(t => (
-            <span key={t.revisionName || 'latest'}>
+          {(traffic || []).map((t, i) => (
+            <span key={`${t.revisionName ?? 'latest'}-${t.tag ?? 'untagged'}-${i}`}>
               {t.tag || t.revisionName?.split('-').pop() || '@latest'}: {t.percent}%
             </span>
           ))}
