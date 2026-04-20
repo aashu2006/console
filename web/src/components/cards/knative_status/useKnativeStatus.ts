@@ -136,7 +136,6 @@ async function fetchCR(group: string, version: string, resource: string): Promis
 
 function parseService(item: CRItem): KnativeServingService {
   const status = (item.status ?? {}) as Record<string, unknown>
-  const spec = (item.spec ?? {}) as Record<string, unknown>
 
   // URL
   const url = typeof status.url === 'string' ? status.url : ''
