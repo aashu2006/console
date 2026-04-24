@@ -275,12 +275,12 @@ export function HarborStatus() {
   if (showSkeleton) {
     return (
       <div className="flex flex-col h-full overflow-hidden">
-        <SkeletonStats count={4} columns={4} />
+        <SkeletonStats className="grid-cols-4" />
         <div className="flex items-center gap-2 px-1 mb-2">
           <div className="w-20 h-6 rounded bg-muted animate-pulse" />
           <div className="w-24 h-6 rounded bg-muted animate-pulse" />
         </div>
-        <SkeletonList rows={3} />
+        <SkeletonList items={3} className="flex-1" />
       </div>
     )
   }
@@ -341,7 +341,7 @@ export function HarborStatus() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden relative">
-      {isRefreshing && <RefreshIndicator />}
+      {isRefreshing && <RefreshIndicator isRefreshing={isRefreshing} />}
 
       <div className="flex items-center justify-between mb-4 shrink-0 px-1 gap-2">
         <div className="flex items-center gap-2">

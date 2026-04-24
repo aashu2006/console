@@ -9,7 +9,7 @@ import type { UnifiedCardConfig } from '../../lib/unified/types'
 export const harborStatusConfig: UnifiedCardConfig = {
   type: 'harbor_status',
   title: 'Harbor Registry',
-  category: 'provisioning',
+  category: 'storage',
   description: 'Harbor registry projects, repositories, and vulnerability scan results',
 
   // Appearance

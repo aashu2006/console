@@ -138,9 +138,6 @@ import { providerHealthConfig } from './provider-health'
 import { prowCiMonitorConfig } from './prow-ci-monitor'
 import { prowHistoryConfig } from './prow-history'
 import { prowJobsConfig } from './prow-jobs'
-import knativeStatusConfig from './knative-status'
-import kserveStatusConfig from './kserve-status'
-import fluidStatusConfig from './fluid-status'
 import harborStatusConfig from './harbor-status'
 import { prowStatusConfig } from './prow-status'
 import { pvStatusConfig } from './pv-status'
@@ -333,12 +330,6 @@ export const CARD_CONFIGS: CardConfigRegistry = {
   resource_quota_status: resourceQuotaStatusConfig,
   resource_trend: resourceTrendConfig,
   resource_usage: resourceUsageConfig,
-  // KServe model serving
-  kserve_status: kserveStatusConfig,
-  // Fluid dataset caching
-  fluid_status: fluidStatusConfig,
-  // CubeFS distributed file system
-  cubefs_status: cubefsStatusConfig,
   // Harbor registry
   harbor_status: harborStatusConfig,
   role_binding_status: roleBindingStatusConfig,

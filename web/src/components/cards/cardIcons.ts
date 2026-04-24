@@ -245,7 +245,6 @@ export const CARD_ICONS: Record<string, { icon: ComponentType<{ className?: stri
   karmada_status: { icon: Package, color: 'text-indigo-400' },
   kserve_status: { icon: BrainCircuit, color: 'text-purple-400' },
   fluid_status: { icon: Database, color: 'text-blue-400' },
-  cubefs_status: { icon: Database, color: 'text-green-400' },
   harbor_status: { icon: Package, color: 'text-blue-400' },
   kuberay_fleet: { icon: BrainCircuit, color: 'text-purple-400' },
   multi_tenancy_overview: { icon: Shield, color: 'text-cyan-400' },

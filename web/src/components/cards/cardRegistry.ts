@@ -765,10 +765,6 @@ const RAW_CARD_COMPONENTS: Record<string, CardComponent> = {
   multi_tenancy_overview: MultiTenancyOverview,
   tenant_isolation_setup: TenantIsolationSetup,
   tenant_topology: TenantTopology,
-  kserve_status: KServeStatus,
-  fluid_status: FluidStatus,
-  cubefs_status: CubefsStatus,
-  harbor_status: HarborStatus,
 
   // Multi-cluster insights cards
   cross_cluster_event_correlation: CrossClusterEventCorrelation,

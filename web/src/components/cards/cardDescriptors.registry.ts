@@ -111,7 +111,7 @@ const DESCRIPTORS: CardDescriptor[] = [
     id: 'harbor_status',
     title: 'Harbor Registry',
     description: 'Harbor container registry health, project status, and vulnerability scanning.',
-    category: 'Provisioning',
+    category: 'Storage',
     defaultWidth: 6,
     visualization: 'status',
     component: () => import('./harbor_status').then(m => ({ default: m.HarborStatus as ComponentType<CardComponentProps> })),
