@@ -8,6 +8,9 @@ import {
   AlertTriangle,
   Layers,
   Plus,
+} from 'lucide-react'
+import { MS_PER_DAY, MS_PER_HOUR } from '../../lib/constants/time'
+import {
   Server,
   Database,
   Gauge,
@@ -78,7 +81,7 @@ const DEMO_WORKLOADS: Workload[] = [
       { cluster: 'us-west-2', status: 'Running', replicas: 3, readyReplicas: 3, lastUpdated: new Date().toISOString() },
       { cluster: 'eu-central-1', status: 'Running', replicas: 3, readyReplicas: 3, lastUpdated: new Date().toISOString() },
     ],
-    createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 30 * MS_PER_DAY).toISOString() },
   {
     name: 'api-gateway',
     namespace: 'production',
@@ -93,7 +96,7 @@ const DEMO_WORKLOADS: Workload[] = [
       { cluster: 'us-east-1', status: 'Running', replicas: 3, readyReplicas: 3, lastUpdated: new Date().toISOString() },
       { cluster: 'us-west-2', status: 'Degraded', replicas: 2, readyReplicas: 0, lastUpdated: new Date().toISOString() },
     ],
-    createdAt: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 14 * MS_PER_DAY).toISOString() },
   {
     name: 'postgres-primary',
     namespace: 'databases',
@@ -107,7 +110,7 @@ const DEMO_WORKLOADS: Workload[] = [
     deployments: [
       { cluster: 'us-east-1', status: 'Running', replicas: 1, readyReplicas: 1, lastUpdated: new Date().toISOString() },
     ],
-    createdAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 60 * MS_PER_DAY).toISOString() },
   {
     name: 'fluentd',
     namespace: 'logging',
@@ -123,7 +126,7 @@ const DEMO_WORKLOADS: Workload[] = [
       { cluster: 'us-west-2', status: 'Running', replicas: 4, readyReplicas: 4, lastUpdated: new Date().toISOString() },
       { cluster: 'eu-central-1', status: 'Running', replicas: 3, readyReplicas: 3, lastUpdated: new Date().toISOString() },
     ],
-    createdAt: new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 45 * MS_PER_DAY).toISOString() },
   {
     name: 'ml-training',
     namespace: 'ml-workloads',
@@ -137,7 +140,7 @@ const DEMO_WORKLOADS: Workload[] = [
     deployments: [
       { cluster: 'gpu-cluster-1', status: 'Pending', replicas: 1, readyReplicas: 0, lastUpdated: new Date().toISOString() },
     ],
-    createdAt: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 1 * MS_PER_HOUR).toISOString() },
   {
     name: 'payment-service',
     namespace: 'payments',
@@ -151,7 +154,7 @@ const DEMO_WORKLOADS: Workload[] = [
     deployments: [
       { cluster: 'us-east-1', status: 'Failed', replicas: 2, readyReplicas: 0, lastUpdated: new Date().toISOString() },
     ],
-    createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 2 * MS_PER_DAY).toISOString() },
 ]
 
 const DEMO_STATS = {
@@ -220,7 +223,7 @@ async function scaleViaAgent(
   try {
     const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/scale`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       signal: ctrl.signal,
       body: JSON.stringify({ cluster: context, namespace, name, replicas }) })
     if (!res.ok) throw new Error(`Agent ${res.status}`)
@@ -414,7 +417,7 @@ function DraggableWorkloadItem({ workload, isSelected, onSelect, onScaled }: Dra
       {/* Expanded details */}
       {isSelected && !isDragging && (
         <div className="mt-3 pt-3 ml-10 border-t border-gray-200 dark:border-border space-y-2">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <span className="text-xs text-muted-foreground">Target Clusters</span>
             <div className="flex gap-1">
               {workload.targetClusters.map((c) => (
@@ -422,7 +425,7 @@ function DraggableWorkloadItem({ workload, isSelected, onSelect, onScaled }: Dra
               ))}
             </div>
           </div>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <span className="text-xs text-muted-foreground">{t('common.labels')}</span>
             <div className="flex gap-1 flex-wrap justify-end">
               {Object.entries(workload.labels).map(([k, v]) => (
@@ -460,7 +463,7 @@ function DraggableWorkloadItem({ workload, isSelected, onSelect, onScaled }: Dra
                   value={desiredReplicas}
                   onChange={(e) => setDesiredReplicas(Math.max(0, Math.min(100, parseInt(e.target.value) || 0)))}
                   disabled={isScaling}
-                  className="w-12 h-7 text-center text-xs rounded border border-border bg-secondary/30 focus:outline-none focus:ring-1 focus:ring-primary/50 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none disabled:opacity-50"
+                  className="w-12 h-7 text-center text-xs rounded border border-border bg-secondary/30 focus:outline-hidden focus:ring-1 focus:ring-primary/50 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none disabled:opacity-50"
                 />
                 <button
                   onClick={() => setDesiredReplicas((r) => Math.min(100, r + 1))}
@@ -548,16 +551,17 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
   const isDemo = demoMode
 
   // Fetch real workloads from cache (handles demo mode internally via useCache)
-  const { data: realWorkloads, isLoading: workloadsLoading, isFailed, consecutiveFailures, isDemoFallback, refetch: refetchWorkloads } = useCachedWorkloads()
+  const { data: realWorkloads, isLoading: workloadsLoading, isRefreshing: workloadsRefreshing, isFailed, consecutiveFailures, isDemoFallback, refetch: refetchWorkloads } = useCachedWorkloads()
 
   // Report state to CardWrapper for refresh animation
   const { showSkeleton } = useCardLoadingState({
     isLoading: clustersLoading || workloadsLoading,
+    isRefreshing: workloadsRefreshing,
     hasAnyData: isDemo ? DEMO_WORKLOADS.length > 0 : (realWorkloads?.length ?? 0) > 0,
     isFailed,
     consecutiveFailures,
     isDemoData: isDemoFallback || isDemo,
-    errorMessage: isFailed ? 'Failed to load workloads' : undefined })
+    errorMessage: isFailed ? t('common.failedToLoadWorkloads') : undefined })
   const [localClusterFilter, setLocalClusterFilterState] = useState<string[]>(() => {
     try {
       const stored = localStorage.getItem(CLUSTER_FILTER_STORAGE_KEY)
@@ -731,7 +735,7 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card p-3">
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
           <Skeleton variant="text" width={120} height={16} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -749,7 +753,7 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
   return (
     <div className="h-full flex flex-col">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-2 flex-shrink-0 px-3 pt-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 shrink-0 px-3 pt-3">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-muted-foreground">
             {stats.totalWorkloads} total &middot; {stats.uniqueWorkloads} unique
@@ -785,7 +789,7 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
           value={search}
           onChange={setSearch}
           placeholder="Search workloads..."
-          className="!mb-0 flex-1"
+          className="mb-0! flex-1"
         />
         <button
           onClick={() => setShowImportDialog(true)}

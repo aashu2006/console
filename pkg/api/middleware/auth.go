@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+
+	"github.com/kubestellar/console/pkg/api/audit"
 )
 
 const (
@@ -58,9 +61,9 @@ func ParseJWT(tokenString string, secret string) (*jwt.Token, error) {
 // TokenRevoker is the subset of store.Store needed for token revocation.
 // Defined here to avoid a circular import with the store package.
 type TokenRevoker interface {
-	RevokeToken(jti string, expiresAt time.Time) error
-	IsTokenRevoked(jti string) (bool, error)
-	CleanupExpiredTokens() (int64, error)
+	RevokeToken(ctx context.Context, jti string, expiresAt time.Time) error
+	IsTokenRevoked(ctx context.Context, jti string) (bool, error)
+	CleanupExpiredTokens(ctx context.Context) (int64, error)
 }
 
 // revokedTokenCache is an in-memory write-through cache backed by a persistent
@@ -92,21 +95,59 @@ type revokedTokenCache struct {
 	sync.RWMutex
 	tokens map[string]time.Time // jti -> expiresAt
 	store  TokenRevoker         // nil when running without persistence
+	// cleanupCancel cancels the background cleanupLoop goroutine on shutdown
+	// (#6578). Nil until InitTokenRevocation has been called.
+	cleanupCancel context.CancelFunc
 }
 
-var revokedTokens = &revokedTokenCache{
-	tokens: make(map[string]time.Time),
-}
+var (
+	revokedTokens = &revokedTokenCache{
+		tokens: make(map[string]time.Time),
+	}
+	// initOnce ensures InitTokenRevocation is idempotent (#6586). Calling it a
+	// second time would otherwise spawn additional cleanupLoop goroutines.
+	initOnce sync.Once
+)
 
 // InitTokenRevocation wires the persistent store into the revocation layer.
 // It loads all currently-revoked tokens from the database into the in-memory
-// cache and starts the background cleanup goroutine. Must be called once at
-// server startup, before any HTTP traffic is served.
+// cache and starts the background cleanup goroutine. Idempotent (#6586):
+// subsequent calls are no-ops and do not spawn additional goroutines.
+//
+// The goroutine can be stopped via ShutdownTokenRevocation (#6578).
 func InitTokenRevocation(store TokenRevoker) {
+	initOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		revokedTokens.Lock()
+		revokedTokens.store = store
+		revokedTokens.cleanupCancel = cancel
+		revokedTokens.Unlock()
+		go revokedTokens.cleanupLoop(ctx)
+	})
+}
+
+// ShutdownTokenRevocation stops the background cleanup goroutine started by
+// InitTokenRevocation (#6578). Safe to call multiple times. Intended for use
+// by server shutdown paths and tests that want to release the goroutine.
+func ShutdownTokenRevocation() {
 	revokedTokens.Lock()
-	revokedTokens.store = store
+	cancel := revokedTokens.cleanupCancel
+	revokedTokens.cleanupCancel = nil
 	revokedTokens.Unlock()
-	go revokedTokens.cleanupLoop()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// resetTokenRevocationForTest clears internal state so tests can re-initialize
+// the revocation layer. NOT for production use.
+func resetTokenRevocationForTest() {
+	ShutdownTokenRevocation()
+	revokedTokens.Lock()
+	revokedTokens.tokens = make(map[string]time.Time)
+	revokedTokens.store = nil
+	revokedTokens.Unlock()
+	initOnce = sync.Once{}
 }
 
 func (c *revokedTokenCache) Revoke(jti string, expiresAt time.Time) {
@@ -141,29 +182,42 @@ func (c *revokedTokenCache) Revoke(jti string, expiresAt time.Time) {
 
 	// Write-through to persistent store (best-effort; log on failure).
 	if store != nil {
-		if err := store.RevokeToken(jti, expiresAt); err != nil {
+		if err := store.RevokeToken(context.Background(), jti, expiresAt); err != nil {
 			slog.Error("[Auth] failed to persist token revocation", "jti", jti, "error", err)
 		}
 	}
 }
 
-func (c *revokedTokenCache) IsRevoked(jti string) bool {
+// errRevocationCheckFailed is returned by IsRevokedChecked when the persistent
+// store errors during a revocation lookup. Callers MUST treat this as fail-
+// closed: reject the request with 5xx/401 rather than admitting the JWT
+// (#6577). Previously the middleware logged the DB error and returned false,
+// meaning a transient DB outage could let a revoked token authenticate.
+var errRevocationCheckFailed = fmt.Errorf("revocation check failed")
+
+// IsRevokedChecked returns (revoked, err). On err != nil the caller MUST
+// fail closed. Used by JWTAuth and ValidateJWT to enforce #6577.
+func (c *revokedTokenCache) IsRevokedChecked(jti string) (bool, error) {
 	// Fast path: check in-memory cache first.
 	c.RLock()
 	_, ok := c.tokens[jti]
 	store := c.store
 	c.RUnlock()
 	if ok {
-		return true
+		return true, nil
 	}
 
 	// Slow path: check persistent store (covers tokens revoked by a previous
 	// server instance that haven't been loaded into this cache yet).
 	if store != nil {
-		revoked, err := store.IsTokenRevoked(jti)
+		revoked, err := store.IsTokenRevoked(context.Background(), jti)
 		if err != nil {
-			slog.Error("[Auth] failed to check token revocation", "jti", jti, "error", err)
-			return false
+			// #6577 — fail CLOSED on DB error. Returning (false, nil) here
+			// would allow a revoked token to authenticate whenever the
+			// revocation store is unavailable, silently disabling
+			// server-side logout.
+			slog.Error("[Auth] failed to check token revocation (failing closed)", "jti", jti, "error", err)
+			return false, errRevocationCheckFailed
 		}
 		if revoked {
 			// Backfill cache so subsequent checks are fast.
@@ -174,17 +228,38 @@ func (c *revokedTokenCache) IsRevoked(jti string) bool {
 				c.tokens[jti] = time.Time{}
 			}
 			c.Unlock()
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func (c *revokedTokenCache) cleanupLoop() {
+// IsRevoked is the legacy API that hides DB errors. Prefer IsRevokedChecked
+// so callers can fail closed (#6577). Kept for compatibility with any code
+// that cannot surface an error. Internally this now treats a DB failure as
+// "revoked" so a misbehaving store never silently accepts the token.
+func (c *revokedTokenCache) IsRevoked(jti string) bool {
+	revoked, err := c.IsRevokedChecked(jti)
+	if err != nil {
+		// Fail closed: pretend revoked so callers reject the token.
+		return true
+	}
+	return revoked
+}
+
+// cleanupLoop runs until the provided context is cancelled (#6578). Previously
+// the goroutine had no shutdown path and would leak on server restart in
+// tests or embedded usage.
+func (c *revokedTokenCache) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(revokedTokenCleanupInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		c.cleanup()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.cleanup()
+		}
 	}
 }
 
@@ -213,7 +288,7 @@ func (c *revokedTokenCache) cleanup() {
 
 	// Also prune expired rows from the persistent store.
 	if store != nil {
-		if n, err := store.CleanupExpiredTokens(); err != nil {
+		if n, err := store.CleanupExpiredTokens(context.Background()); err != nil {
 			slog.Error("[Auth] failed to cleanup expired tokens", "error", err)
 		} else if n > 0 {
 			slog.Info("[Auth] cleaned up expired revoked tokens", "count", n)
@@ -226,9 +301,35 @@ func RevokeToken(jti string, expiresAt time.Time) {
 	revokedTokens.Revoke(jti, expiresAt)
 }
 
-// IsTokenRevoked checks if a token has been revoked.
+// IsTokenRevoked checks if a token has been revoked. Errors are hidden and
+// treated as "revoked" for fail-closed semantics (#6577). Callers that need
+// to distinguish a DB error from a genuine revocation should use
+// IsTokenRevokedChecked.
 func IsTokenRevoked(jti string) bool {
 	return revokedTokens.IsRevoked(jti)
+}
+
+// IsTokenRevokedChecked returns (revoked, err). On err != nil the request
+// MUST be rejected (#6577).
+func IsTokenRevokedChecked(jti string) (bool, error) {
+	return revokedTokens.IsRevokedChecked(jti)
+}
+
+// queryTokenAllowedPaths is the explicit allow-list of request paths on which
+// the JWTAuth middleware will consume the `_token` query parameter as a
+// fallback authentication source (#6585). Historically the middleware
+// accepted `_token` on ANY path ending in `/stream`, which meant every
+// newly-added SSE endpoint silently inherited query-param auth even though
+// the fetch-based SSE client now delivers the JWT via the Authorization
+// header. Restrict to a narrow allow-list so unknown endpoints can never
+// accept query-param JWTs (which would be logged by proxies/load balancers).
+//
+// Add entries here ONLY after confirming the endpoint genuinely needs
+// EventSource compatibility (EventSource cannot set custom headers).
+var queryTokenAllowedPaths = map[string]struct{}{
+	// intentionally empty — no production endpoint currently requires
+	// query-param JWT auth. Preserved as a map so future additions are
+	// O(1) and consciously reviewed.
 }
 
 // jwtCookieName is the HttpOnly cookie that carries the JWT.
@@ -261,8 +362,10 @@ func JWTAuth(secret string) fiber.Handler {
 		// of a structurally valid header that fails to parse.
 		trimmedHeader := strings.TrimSpace(authHeader)
 		if trimmedHeader != "" {
-			if strings.HasPrefix(trimmedHeader, bearerScheme) {
-				candidate := strings.TrimSpace(strings.TrimPrefix(trimmedHeader, bearerScheme))
+			// RFC 7235 §2.1: auth-scheme comparison is case-insensitive.
+			// Accept "Bearer", "bearer", "BEARER", etc.
+			if len(trimmedHeader) > len(bearerScheme) && strings.EqualFold(trimmedHeader[:len(bearerScheme)], bearerScheme) {
+				candidate := strings.TrimSpace(trimmedHeader[len(bearerScheme):])
 				if candidate != "" {
 					tokenString = candidate
 				}
@@ -280,14 +383,18 @@ func JWTAuth(secret string) fiber.Handler {
 			tokenString = c.Cookies(jwtCookieName)
 		}
 
-		// Fallback 2: accept _token query param for SSE /stream endpoints
-		// (EventSource API does not support custom headers, so SSE endpoints
-		// may receive the JWT as a query parameter). Preferred clients use
-		// the fetch-based SSE client which sends the token via the
-		// Authorization header; this fallback exists for legacy EventSource
-		// callers. See #5979.
-		if tokenString == "" && c.Query("_token") != "" && strings.HasSuffix(c.Path(), "/stream") {
-			tokenString = c.Query("_token")
+		// Fallback 2: accept _token query param ONLY on the explicit allow-list
+		// of endpoints that genuinely need EventSource compatibility (#6585).
+		// Query-param tokens are visible to proxies, load balancers, and
+		// access logs, so we require endpoints to be opted in individually
+		// rather than inherit this fallback by path suffix.
+		if tokenString == "" && c.Query("_token") != "" {
+			if _, ok := queryTokenAllowedPaths[c.Path()]; ok {
+				tokenString = c.Query("_token")
+			} else {
+				slog.Warn("[Auth] rejected _token query param on non-allowlisted path",
+					"path", c.Path())
+			}
 		}
 
 		// SECURITY: Always strip the `_token` query parameter from the
@@ -323,6 +430,7 @@ func JWTAuth(secret string) fiber.Handler {
 
 		if tokenString == "" {
 			slog.Info("[Auth] missing authorization", "path", c.Path())
+			audit.Log(c, audit.ActionAuthFailed, "endpoint", c.Path(), "missing_authorization")
 			return fiber.NewError(fiber.StatusUnauthorized, "Missing authorization")
 		}
 
@@ -355,24 +463,39 @@ func JWTAuth(secret string) fiber.Handler {
 
 		if err != nil {
 			slog.Error("[Auth] token parse error", "path", c.Path(), "error", err)
+			audit.Log(c, audit.ActionAuthFailed, "endpoint", c.Path(), "token_parse_error")
 			return fiber.NewError(fiber.StatusUnauthorized, "Invalid token")
 		}
 
 		if !token.Valid {
 			slog.Info("[Auth] invalid token", "path", c.Path())
+			audit.Log(c, audit.ActionAuthFailed, "endpoint", c.Path(), "invalid_token")
 			return fiber.NewError(fiber.StatusUnauthorized, "Invalid token")
 		}
 
 		claims, ok := token.Claims.(*UserClaims)
 		if !ok {
 			slog.Info("[Auth] invalid token claims", "path", c.Path())
+			audit.Log(c, audit.ActionAuthFailed, "endpoint", c.Path(), "invalid_claims")
 			return fiber.NewError(fiber.StatusUnauthorized, "Invalid token claims")
 		}
 
-		// Check if token has been revoked (server-side logout)
-		if claims.ID != "" && IsTokenRevoked(claims.ID) {
-			slog.Info("[Auth] revoked token used", "path", c.Path())
-			return fiber.NewError(fiber.StatusUnauthorized, "Token has been revoked")
+		// Check if token has been revoked (server-side logout). On a DB
+		// error we fail closed (#6577) — returning 503 so the client can
+		// retry instead of allowing a possibly-revoked token through.
+		if claims.ID != "" {
+			revoked, revErr := IsTokenRevokedChecked(claims.ID)
+			if revErr != nil {
+				slog.Error("[Auth] revocation check failed, failing closed",
+					"path", c.Path(), "error", revErr)
+				return fiber.NewError(fiber.StatusServiceUnavailable,
+					"Authentication temporarily unavailable")
+			}
+			if revoked {
+				slog.Info("[Auth] revoked token used", "path", c.Path())
+				audit.Log(c, audit.ActionAuthFailed, "endpoint", c.Path(), "revoked_token")
+				return fiber.NewError(fiber.StatusUnauthorized, "Token has been revoked")
+			}
 		}
 
 		// Store user info in context
@@ -447,8 +570,16 @@ func ValidateJWT(tokenString, secret string) (*UserClaims, error) {
 
 	// Check if token has been revoked (server-side logout) — mirrors the
 	// check in JWTAuth middleware so WS/exec paths are equally protected.
-	if claims.ID != "" && IsTokenRevoked(claims.ID) {
-		return nil, ErrTokenRevoked
+	// On a DB error we fail closed (#6577): return an error so the caller
+	// rejects the connection instead of admitting a possibly-revoked token.
+	if claims.ID != "" {
+		revoked, revErr := IsTokenRevokedChecked(claims.ID)
+		if revErr != nil {
+			return nil, fmt.Errorf("revocation check failed: %w", revErr)
+		}
+		if revoked {
+			return nil, ErrTokenRevoked
+		}
 	}
 
 	return claims, nil

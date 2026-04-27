@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -45,13 +46,33 @@ func ensureKeyFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to generate key: %w", err)
 	}
 
-	// Atomic write: write to a temp file then rename to prevent races
-	// when multiple processes start simultaneously.
+	// Atomic write: write to a unique temp file then hard-link to prevent
+	// races when multiple processes start simultaneously (#7577).
 	encoded := hex.EncodeToString(key)
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(encoded), keyFileMode); err != nil {
-		return nil, fmt.Errorf("failed to write temp keyfile %s: %w", tmpPath, err)
+	tmpFile, tmpErr := os.CreateTemp(filepath.Dir(path), ".keyfile-*.tmp")
+	if tmpErr != nil {
+		return nil, fmt.Errorf("failed to create temp keyfile: %w", tmpErr)
 	}
+	tmpPath := tmpFile.Name()
+	if _, writeErr := tmpFile.Write([]byte(encoded)); writeErr != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to write temp keyfile %s: %w", tmpPath, writeErr)
+	}
+	if chmodErr := tmpFile.Chmod(keyFileMode); chmodErr != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to chmod temp keyfile %s: %w", tmpPath, chmodErr)
+	}
+	// #7752: fsync before close/link so the key data is durable on disk.
+	// Without this, a crash between write and link could leave a zero-length
+	// or corrupt key file that breaks all encrypted settings on next start.
+	if syncErr := tmpFile.Sync(); syncErr != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to fsync temp keyfile %s: %w", tmpPath, syncErr)
+	}
+	tmpFile.Close()
 
 	// Use os.Link + os.Remove for atomic creation (fails if target already exists on most filesystems).
 	// If another process already created the key file, use theirs instead of overwriting.

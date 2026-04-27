@@ -1,13 +1,18 @@
 import { createContext, use, useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react'
+import { MS_PER_SECOND } from './constants/time'
 import { checkOAuthConfigured, checkOAuthConfiguredWithRetry } from './api'
 import { dashboardSync } from './dashboards/dashboardSync'
 import { clearPermissionsCache } from '../hooks/usePermissions'
 import { disconnectPresence } from '../hooks/useActiveUsers'
 import { clearSSECache } from './sseClient'
 import { clearClusterCacheOnLogout } from '../hooks/mcp/shared'
-import { STORAGE_KEY_TOKEN, DEMO_TOKEN_VALUE, STORAGE_KEY_DEMO_MODE, STORAGE_KEY_ONBOARDED, STORAGE_KEY_USER_CACHE, FETCH_DEFAULT_TIMEOUT_MS } from './constants'
+import { STORAGE_KEY_TOKEN, DEMO_TOKEN_VALUE, STORAGE_KEY_DEMO_MODE, STORAGE_KEY_ONBOARDED, STORAGE_KEY_USER_CACHE, STORAGE_KEY_HAS_SESSION, FETCH_DEFAULT_TIMEOUT_MS } from './constants'
+/** localStorage key for the kc-agent shared secret (must match shared.ts) */
+const AGENT_TOKEN_STORAGE_KEY = 'kc-agent-token'
 import { emitLogin, emitLogout, setAnalyticsUserId, setAnalyticsUserProperties, emitConversionStep, emitDeveloperSession } from './analytics'
 import { setDemoMode as setGlobalDemoMode } from './demoMode'
+import { AuthRefreshResponseSchema, UserSchema } from './schemas'
+import { validateResponse } from './schemas/validate'
 
 interface User {
   id: string
@@ -45,8 +50,6 @@ const EXPIRY_WARNING_THRESHOLD_MS = 30 * 60_000
 const MAX_CACHED_USER_AGE_MS = 5 * 60 * 1_000
 /** #6067 — interval for background re-validation when the backend is unreachable. */
 const BACKEND_REVALIDATE_INTERVAL_MS = 30_000
-/** Milliseconds per second — JWT `exp` is in seconds. */
-const MS_PER_SECOND = 1_000
 
 /**
  * Decode the expiry timestamp from a JWT without verifying signature.
@@ -197,7 +200,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // well so that any past or future code path that parks a token there
     // can't leak into the next session (#6004).
     localStorage.removeItem(STORAGE_KEY_TOKEN)
+    localStorage.removeItem(AGENT_TOKEN_STORAGE_KEY)
     localStorage.removeItem(AUTH_USER_CACHE_KEY)
+    localStorage.removeItem(STORAGE_KEY_HAS_SESSION)
     try {
       sessionStorage.removeItem(STORAGE_KEY_TOKEN)
       sessionStorage.removeItem(AUTH_USER_CACHE_KEY)
@@ -271,6 +276,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       if (backendUp && oauthConfigured) {
+        // #6925 — Only attempt /auth/refresh if we have evidence of a prior
+        // session. The HttpOnly cookie is invisible to JS, so we check the
+        // kc-has-session localStorage hint set during the OAuth callback.
+        // Without this gate, fresh visitors see a spurious 401 in DevTools.
+        const hadPriorSession = !!localStorage.getItem(STORAGE_KEY_HAS_SESSION)
+        if (!hadPriorSession) {
+          // No prior session — go straight to login page, no network call
+          return
+        }
         // #6066 — If the user has a valid HttpOnly cookie from a previous
         // session, /auth/refresh will mint a new JWT. Try that before showing
         // the login page so a page reload can restore the session silently.
@@ -278,22 +292,76 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const refreshResponse = await fetch('/auth/refresh', {
             method: 'POST',
             credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              // #6588 — CSRF gate on /auth/refresh
+              'X-Requested-With': 'XMLHttpRequest',
+            },
             signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
           })
           if (refreshResponse.ok) {
-            const data = await refreshResponse.json().catch(() => null) as { token?: string } | null
-            if (data?.token && !isJWTExpired(data.token)) {
-              localStorage.setItem(STORAGE_KEY_TOKEN, data.token)
-              setTokenState(data.token)
-              // Re-enter refreshUser with the newly restored token so we can
-              // populate the user cache via /api/me.
-              await refreshUser(data.token)
-              return
+            // #6590 — /auth/refresh delivers the new JWT EXCLUSIVELY via the
+            // HttpOnly kc_auth cookie. The body carries only
+            // { refreshed: true, onboarded }. Since the cookie is HttpOnly,
+            // we cannot read the token from JS — but the JWTAuth middleware
+            // accepts the cookie on subsequent requests, so we can call
+            // /api/me directly via cookie credentials to populate the user.
+            const rawRefresh = await refreshResponse.json().catch(() => null)
+            const data = validateResponse(AuthRefreshResponseSchema, rawRefresh, '/auth/refresh')
+            if (data?.refreshed) {
+              try {
+                localStorage.setItem(STORAGE_KEY_HAS_SESSION, 'true')
+              } catch {
+                // localStorage quota — best-effort hint
+              }
+              // Fetch kc-agent token so agentFetch/WebSocket can authenticate
+              try {
+                const agentRes = await fetch('/api/agent/token', {
+                  credentials: 'same-origin',
+                  headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                  signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+                })
+                if (agentRes.ok) {
+                  const agentData = await agentRes.json()
+                  if (agentData.token) localStorage.setItem(AGENT_TOKEN_STORAGE_KEY, agentData.token)
+                }
+              } catch {
+                // Non-fatal — agent auth will fail but session is intact
+              }
+              const meResponse = await fetch('/api/me', {
+                credentials: 'include',
+                signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+              })
+              if (meResponse.ok) {
+                const rawUser = await meResponse.json().catch(() => null)
+                const userData = validateResponse(UserSchema, rawUser, '/api/me') as User | null
+                if (userData) {
+                  setUser(userData)
+                  cacheUser(userData)
+                  try {
+                    localStorage.setItem(AUTH_USER_CACHE_VALIDATED_KEY, String(Date.now()))
+                  } catch {
+                    // localStorage quota — best-effort
+                  }
+                  setAnalyticsUserId(userData.id)
+                  setAnalyticsUserProperties({ auth_mode: 'github-oauth' })
+                  return
+                }
+              }
             }
           }
+          // #6930 — A 401/403 from /auth/refresh is a definitive signal that
+          // the server session has expired. Clear the session hint so future
+          // page loads don't keep hitting /auth/refresh in a loop.
+          const HTTP_UNAUTHORIZED = 401
+          const HTTP_FORBIDDEN = 403
+          if (refreshResponse.status === HTTP_UNAUTHORIZED || refreshResponse.status === HTTP_FORBIDDEN) {
+            localStorage.removeItem(STORAGE_KEY_HAS_SESSION)
+          }
         } catch {
-          // Refresh failed — fall through to show login page
+          // Refresh failed (network error / timeout) — fall through to show
+          // login page. Do NOT clear kc-has-session here: the server may be
+          // temporarily unreachable and the session could still be valid.
         }
         // OAuth configured + no valid cookie — show login page
         return
@@ -351,8 +419,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const meResponse = await fetch('/api/me', {
         headers: { Authorization: `Bearer ${effectiveToken}` },
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
+      if (meResponse.status === 429) {
+        const cachedUser = getCachedUser()
+        if (cachedUser) {
+          console.warn('Backend rate-limited (429), using cached user data')
+          setUser(prev => {
+            if (prev && prev.id === cachedUser.id && prev.github_login === cachedUser.github_login) return prev
+            return cachedUser
+          })
+          setAnalyticsUserId(cachedUser.id)
+          return
+        }
+      }
       if (!meResponse.ok) throw new Error(`/api/me returned ${meResponse.status}`)
-      const userData = await meResponse.json().catch(() => null) as User | null
+      const rawMe = await meResponse.json().catch(() => null)
+      const userData = validateResponse(UserSchema, rawMe, '/api/me') as User | null
       if (!userData) throw new Error('Invalid JSON from /api/me')
       // #6149 — Avoid triggering an AuthProvider re-render cascade when the
       // background /api/me poll returns an identical user. Shallow-compare
@@ -374,6 +455,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return userData
       })
       cacheUser(userData)
+      // #6925 — Mark that an authenticated session exists so future page
+      // loads know it's worth attempting /auth/refresh from the HttpOnly cookie.
+      try {
+        localStorage.setItem(STORAGE_KEY_HAS_SESSION, 'true')
+      } catch {
+        // localStorage quota — session hint is best-effort
+      }
       // #6067 — record when the cache was last validated so we can bound
       // how long it's trusted if the backend later becomes unreachable.
       try {
@@ -414,6 +502,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       // Cache is stale or missing — drop to login (clear token so the
       // ProtectedRoute redirects and the user re-authenticates).
+      // #6930 — Do NOT clear STORAGE_KEY_HAS_SESSION here. An /api/me
+      // failure could be a transient network issue; clearing the hint
+      // would prevent silent session recovery on the next page load.
+      // The hint is cleared authoritatively when /auth/refresh returns
+      // 401/403 (definitive proof the server session is gone).
       console.error('Failed to fetch user (cache stale or missing), dropping to login:', error)
       localStorage.removeItem(STORAGE_KEY_TOKEN)
       localStorage.removeItem(AUTH_USER_CACHE_KEY)
@@ -502,17 +595,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const freshToken = localStorage.getItem(STORAGE_KEY_TOKEN)
         if (!freshToken || freshToken === DEMO_TOKEN_VALUE) return
         try {
+          // #8108 — Do NOT send Authorization to /auth/refresh. Backend
+          // RefreshToken revokes the JTI of the presented bearer before
+          // minting the replacement; sending `freshToken` would invalidate
+          // the token the rest of this page is still using. Cookie-only
+          // flow: rely on the HttpOnly kc_auth cookie + CSRF header.
           const response = await fetch('/auth/refresh', {
             method: 'POST',
+            credentials: 'same-origin',
             headers: {
               'Content-Type': 'application/json',
-              Authorization: `Bearer ${freshToken}` },
+              // #6588 — CSRF gate on /auth/refresh
+              'X-Requested-With': 'XMLHttpRequest' },
             signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
           if (response.ok) {
-            const data = await response.json().catch(() => null)
-            if (data?.token) {
-              localStorage.setItem(STORAGE_KEY_TOKEN, data.token)
-              setTokenState(data.token)
+            // #6590 — /auth/refresh delivers the new JWT exclusively via the
+            // HttpOnly kc_auth cookie. There is no token in the JSON body to
+            // copy into localStorage; the browser will use the refreshed
+            // cookie automatically on subsequent requests. Mark the session
+            // hint so future page loads know to attempt cookie restoration.
+            try {
+              localStorage.setItem(STORAGE_KEY_HAS_SESSION, 'true')
+            } catch {
+              // localStorage quota — best-effort hint
+            }
+          } else {
+            // #6930 — A definitive auth failure from the banner refresh
+            // should also clear the session hint to prevent stale loops.
+            const HTTP_UNAUTHORIZED = 401
+            const HTTP_FORBIDDEN = 403
+            if (response.status === HTTP_UNAUTHORIZED || response.status === HTTP_FORBIDDEN) {
+              localStorage.removeItem(STORAGE_KEY_HAS_SESSION)
             }
           }
         } catch {
@@ -543,7 +656,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         cacheUser(null)
         try {
           localStorage.removeItem(AUTH_USER_CACHE_VALIDATED_KEY)
-        } catch { /* ignore */ }
+        } catch (e) { console.warn('[auth] failed to clear cached user validation key:', e) }
         document.getElementById('session-expiry-warning')?.remove()
         // Only redirect if we're not already on the login page to avoid a loop
         if (!window.location.pathname.startsWith('/login')) {
@@ -598,7 +711,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     if (authInitRef.current) return
     authInitRef.current = true
-    console.log('[AUTH DEBUG] running refreshUser (first time)')
     refreshUser().finally(() => setIsLoading(false))
   }, [refreshUser])
 
@@ -606,10 +718,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // unauthenticated immediately, even before the background checkExpiry
   // interval fires. Demo tokens (non-JWT sentinel values) are always valid
   // as long as they're present.
+  // #6590 / #8087 — A cookie-only session has no JS-readable token but does
+  // have a populated `user` (refreshUser sets it after /api/me succeeds via
+  // the HttpOnly kc_auth cookie). Treat that combination as authenticated
+  // so the rest of the app stops gating UI behind a Bearer token that no
+  // longer needs to live in localStorage.
   const isAuthenticated = (() => {
-    if (!token) return false
+    // Demo sentinel wins unconditionally.
     if (token === DEMO_TOKEN_VALUE) return true
-    return !isJWTExpired(token)
+    // #8108 — The cookie-only session (user + kc-has-session) is authoritative
+    // and must be checked BEFORE falling back to the JS-readable token. Since
+    // /auth/refresh no longer populates localStorage (#6590), any pre-existing
+    // token will eventually cross its `exp` while the HttpOnly kc_auth cookie
+    // is still perfectly valid — previously that short-circuited to
+    // `false` here and logged the user out mid-session.
+    if (user) {
+      try {
+        if (localStorage.getItem(STORAGE_KEY_HAS_SESSION) === 'true') return true
+      } catch {
+        // localStorage unavailable — fall through to the token check
+      }
+    }
+    if (token) {
+      return !isJWTExpired(token)
+    }
+    return false
   })()
 
   // #6149 — Memoize the context value so the AuthProvider doesn't cascade

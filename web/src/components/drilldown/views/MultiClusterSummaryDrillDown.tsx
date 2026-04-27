@@ -3,9 +3,10 @@ import { Search, Server, Layers, Rocket, Box, Settings as SettingsIcon, AlertCir
 import { useClusterData } from '../../../hooks/useClusterData'
 import { useDrillDownActions } from '../../../hooks/useDrillDown'
 import type { DrillDownViewType } from '../../../hooks/useDrillDown'
-import { useCachedNodes } from '../../../hooks/useCachedData'
+import { useCachedAllNodes, useCachedPVCs } from '../../../hooks/useCachedData'
+import { useAlerts } from '../../../hooks/useAlerts'
 import { useTranslation } from 'react-i18next'
-import { formatRelativeTime } from '../../../lib/formatters'
+import { formatTimeAgo } from '../../../lib/formatters'
 
 interface MultiClusterSummaryDrillDownProps {
   data: Record<string, unknown>
@@ -80,7 +81,15 @@ function getViewConfig(viewType: DrillDownViewType) {
         bgColor: 'bg-red-500/20',
         dataKey: 'alerts',
         nameKey: 'name',
-        getStatus: (item: { severity?: string; state?: string }) => item.severity || item.state || 'unknown' }
+        // Issue 8844 — The alerts drill-down is opened with filter='firing' or
+        // filter='resolved' from the Alerts dashboard stat blocks. Those
+        // filters are compared against this getStatus() result, so it must
+        // return the alert's lifecycle status (firing | resolved), not its
+        // severity. Otherwise the preFilter drops every item and the
+        // drill-down list appears empty even though the stat block shows a
+        // non-zero count.
+        getStatus: (item: { status?: string; severity?: string; state?: string }) =>
+          item.status || item.severity || item.state || 'unknown' }
     case 'all-helm':
       return {
         icon: Ship,
@@ -157,10 +166,74 @@ function getStatusBadge(status: string) {
 
 export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSummaryDrillDownProps) {
   const { t } = useTranslation()
-  const { clusters, deduplicatedClusters, pods, deployments, events, helmReleases, operatorSubscriptions, securityIssues } = useClusterData()
-  const { nodes: rawCachedNodes, lastRefresh: nodesLastRefresh } = useCachedNodes()
+  const {
+    clusters,
+    deduplicatedClusters,
+    pods,
+    // Per-cluster errors emitted by the pods SSE stream (Issue 9353). Used
+    // below to render an RBAC- vs transient-failure-aware warning when
+    // the all-pods drill-down list is empty but the cluster summary
+    // reports a non-zero pod count.
+    podClusterErrors,
+    deployments,
+    events,
+    helmReleases,
+    operatorSubscriptions,
+    securityIssues,
+  } = useClusterData()
+  // Issue 8844 — The all-alerts drill-down must read from the same AlertsContext
+  // source that powers the Alerts dashboard stat blocks (firing / resolved
+  // counts). Sourcing alerts from pods (non-Running pods were used as a
+  // synthetic stand-in) diverged from the stat counts: the "Resolved" block
+  // could show e.g. 18 while the drill-down list was always empty because
+  // synthetic pod-alerts never carry status='resolved'. Using the real
+  // alerts list here keeps the count and the list in lock-step.
+  const { alerts: contextAlerts } = useAlerts()
+  // Use useCachedAllNodes (not useCachedNodes) for the cumulative,
+  // cross-cluster drill-down list so the UI never substitutes four
+  // hard-coded demo nodes for a real-but-empty live result (Issue 8840).
+  // useCachedNodes() without a cluster has demoWhenEmpty=true, which made
+  // the landing-dashboard Nodes stat block drill-down masquerade demo data
+  // as real. The per-cluster drill-down always passed a cluster name, so
+  // it bypassed that fallback — that's why it worked. useCachedAllNodes
+  // additionally iterates DeduplicatedClusters() to avoid double-counting
+  // nodes when multiple contexts point to the same API server.
+  const {
+    nodes: rawCachedNodes,
+    lastRefresh: nodesLastRefresh,
+    isLoading: nodesIsLoading,
+    isFailed: nodesIsFailed,
+    isDemoFallback: nodesIsDemoFallback,
+    // Per-cluster errors emitted by the cross-cluster nodes REST fan-out
+    // (Issue 9355). Used below to render an RBAC- vs transient-failure-aware
+    // warning when the all-nodes drill-down list is empty but the cluster
+    // summary reports a non-zero node count. Guarded against undefined to
+    // keep older test mocks and mid-upgrade hook shapes crash-safe (see
+    // MEMORY.md: "ALWAYS guard `.join()` and `for...of` against undefined").
+    clusterErrors: rawNodeClusterErrors,
+  } = useCachedAllNodes()
+  const nodeClusterErrors = rawNodeClusterErrors || []
+  const { pvcs: cachedPVCs } = useCachedPVCs()
   // Guard against undefined to prevent crashes when APIs return 404/500/empty
   const cachedNodes = rawCachedNodes || []
+  // For the all-nodes view: the overview stat block sums cluster.nodeCount,
+  // but the detail list is fetched from a separate endpoint that may return
+  // empty when the caller lacks list-nodes RBAC on some clusters (#8312).
+  // Track the expected count so we can explain the discrepancy instead of
+  // showing a blank "No items found".
+  const expectedNodeCountFromClusters = (clusters || []).reduce(
+    (sum, c) => sum + (c.nodeCount || 0),
+    0,
+  )
+  // The same pattern applies to all-pods: the overview stat sums
+  // cluster.podCount (from the cluster summary) while the detail list is
+  // fetched via useAllPods() which can return empty on RBAC / network
+  // failures, so the drill-down "Total" showed 0 while the parent stat
+  // block showed e.g. 28 (#8380).
+  const expectedPodCountFromClusters = (clusters || []).reduce(
+    (sum, c) => sum + (c.podCount || 0),
+    0,
+  )
   // Convert epoch ms to ISO string for the freshness indicator
   const nodesDataAge = (() => {
     if (!nodesLastRefresh) return null
@@ -172,7 +245,8 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
 
   const {
     drillToCluster, drillToNamespace, drillToDeployment, drillToPod,
-    drillToNode, drillToEvents, drillToHelm, drillToOperator
+    drillToNode, drillToEvents, drillToHelm, drillToOperator, drillToPVC,
+    drillToAlert
   } = useDrillDownActions()
 
   const filter = data.filter as string | undefined
@@ -214,40 +288,34 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
           type: 'ClusterIP',
           status: 'active' }))
       case 'all-nodes':
-        // Use real node data from the cached nodes hook
-        if (cachedNodes.length > 0) {
-          return cachedNodes.map(n => ({
-            name: n.name,
-            cluster: n.cluster || '',
-            status: n.status || 'Unknown',
-            roles: n.roles,
-            cpuCapacity: n.cpuCapacity,
-            memoryCapacity: n.memoryCapacity,
-            kubeletVersion: n.kubeletVersion,
-            internalIP: n.internalIP }))
-        }
-        // Fallback: approximate from cluster metadata when node data hasn't loaded
-        return clusters.flatMap(c => {
-          const count = c.nodeCount || 0
-          return Array.from({ length: count }, (_, i) => ({
-            name: `${c.name}-node-${i + 1}`,
-            cluster: c.name,
-            status: c.healthy ? 'Ready' : 'NotReady' }))
-        })
+        // Use real node data from the cached nodes hook (#7352)
+        // Never fabricate synthetic nodes — show empty state until real data loads
+        return cachedNodes.map(n => ({
+          name: n.name,
+          cluster: n.cluster || '',
+          status: n.status || 'Unknown',
+          roles: n.roles,
+          cpuCapacity: n.cpuCapacity,
+          memoryCapacity: n.memoryCapacity,
+          kubeletVersion: n.kubeletVersion,
+          internalIP: n.internalIP }))
       case 'all-events':
         return events.map(e => ({
           ...e,
           status: e.type || 'Normal' }))
       case 'all-alerts':
-        // Mock alerts from security issues and pod issues
-        return pods
-          .filter(p => p.status !== 'Running')
-          .map(p => ({
-            name: `Pod ${p.name} ${p.status}`,
-            namespace: p.namespace,
-            cluster: p.cluster || '',
-            severity: p.status === 'Failed' ? 'critical' : 'warning',
-            status: p.status }))
+        // Issue 8844 — Use real alerts from AlertsContext so the drill-down list
+        // matches the Alerts dashboard stat blocks (firing / resolved). The
+        // previous implementation synthesized "alerts" from non-Running
+        // pods, which never produced status='resolved' items and left the
+        // Resolved drill-down permanently empty regardless of the count.
+        return (contextAlerts || []).map(a => ({
+          ...a,
+          name: a.ruleName || a.message || a.id,
+          namespace: a.namespace,
+          cluster: a.cluster || '',
+          severity: a.severity,
+          status: a.status }))
       case 'all-helm':
         return helmReleases.map(h => ({
           ...h,
@@ -262,23 +330,20 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
           name: s.name,
           status: s.severity || 'warning' }))
       case 'all-gpu':
-        // GPU nodes - from clusters with GPU info
-        return clusters
-          .filter(c => c.nodeCount && c.nodeCount > 0)
-          .map(c => ({
-            name: `${c.name}-gpu-node`,
-            cluster: c.name,
-            gpuCount: 0, // Placeholder - actual GPU data would come from GPU nodes hook
-            status: 'available' }))
+        // GPU nodes — return empty until real data from GPU nodes hook is available (#7353)
+        // Previously fabricated placeholder entries with gpuCount: 0 that were misleading
+        return []
       case 'all-storage':
-        // Storage from clusters with storage info
-        return clusters
-          .filter(c => c.storageGB && c.storageGB > 0)
-          .map(c => ({
-            name: `pvc-${c.name}`,
-            cluster: c.name,
-            status: 'Bound',
-            storageGB: c.storageGB }))
+        // Use real PVC data from useCachedPVCs (#6813)
+        return (cachedPVCs || []).map(pvc => ({
+          name: pvc.name,
+          namespace: pvc.namespace,
+          cluster: pvc.cluster || '',
+          status: pvc.status || 'Unknown',
+          capacity: pvc.capacity,
+          storageClass: pvc.storageClass,
+          accessModes: pvc.accessModes,
+          volumeName: pvc.volumeName }))
       case 'all-jobs':
         // Jobs approximation from pods
         return pods
@@ -292,7 +357,7 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
       default:
         return []
     }
-  }, [viewType, clusters, deduplicatedClusters, pods, deployments, events, helmReleases, operatorSubscriptions, securityIssues, cachedNodes])
+  }, [viewType, clusters, deduplicatedClusters, pods, deployments, events, helmReleases, operatorSubscriptions, securityIssues, cachedNodes, cachedPVCs, contextAlerts])
 
   // Apply initial filter from data prop
   const preFilteredItems = (() => {
@@ -376,6 +441,9 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
       case 'all-events':
         drillToEvents(cluster, namespace, (item.involvedObject as string) || name)
         break
+      case 'all-alerts':
+        drillToAlert(cluster, namespace || undefined, name, item)
+        break
       case 'all-helm':
         drillToHelm(cluster, namespace, name, item)
         break
@@ -384,6 +452,9 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
         break
       case 'all-security':
         drillToPod(cluster, namespace, (item.pod as string) || name, item)
+        break
+      case 'all-storage':
+        drillToPVC(cluster, namespace, name, item)
         break
       default:
         // Generic fallback - try pod if nothing else matches
@@ -394,12 +465,30 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
   }
 
   // Summary stats
+  //
+  // When the detail list is empty for all-nodes / all-pods but the per-cluster
+  // summary says there are items, fall back to the summary count so the
+  // drill-down "Total" tile agrees with the parent stat block (#8380).
+  // The list below is still empty (and a warning is rendered separately),
+  // but the Total number matches what the user saw on the dashboard tile,
+  // which is the source-of-truth expectation.
   const stats = (() => {
-    const total = filteredItems.length
+    const listTotal = filteredItems.length
     const healthy = filteredItems.filter(item => {
       const status = config.getStatus(item as Record<string, unknown>)?.toLowerCase() || ''
       return ['running', 'healthy', 'ready', 'active', 'deployed', 'succeeded', 'available', 'normal'].includes(status)
     }).length
+
+    let total = listTotal
+    if (listTotal === 0 && !searchQuery && statusFilter === 'all' && clusterFilter === 'all') {
+      if (viewType === 'all-nodes' && expectedNodeCountFromClusters > 0) {
+        total = expectedNodeCountFromClusters
+      } else if (viewType === 'all-pods' && expectedPodCountFromClusters > 0) {
+        total = expectedPodCountFromClusters
+      }
+    }
+    // If we fell back to the summary count, we can't classify healthy vs
+    // issues (we don't have per-item statuses), so treat them as unknown.
     const issues = total - healthy
 
     return { total, healthy, issues }
@@ -408,11 +497,18 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
   return (
     <div className="space-y-6">
       {/* Freshness indicator for cached data */}
-      {nodesDataAge && (
-        <div className="flex justify-end">
-          <span className="text-2xs text-muted-foreground" title={new Date(nodesLastRefresh!).toLocaleString()}>
-            Updated {formatRelativeTime(nodesDataAge)}
-          </span>
+      {viewType === 'all-nodes' && (nodesDataAge || nodesIsDemoFallback) && (
+        <div className="flex items-center justify-end gap-2">
+          {nodesIsDemoFallback && !nodesIsLoading && (
+            <span className="text-2xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">
+              Demo
+            </span>
+          )}
+          {nodesDataAge && (
+            <span className="text-2xs text-muted-foreground" title={new Date(nodesLastRefresh!).toLocaleString()}>
+              Updated {formatTimeAgo(nodesDataAge)}
+            </span>
+          )}
         </div>
       )}
 
@@ -451,7 +547,7 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
             placeholder={t('common.search')}
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 bg-card/50 border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+            className="w-full pl-10 pr-4 py-2 bg-card/50 border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
           />
         </div>
 
@@ -461,7 +557,7 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
           <select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
-            className="bg-card/50 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+            className="bg-card/50 border border-border rounded-lg px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
           >
             {uniqueStatuses.map(status => (
               <option key={status} value={status}>
@@ -478,7 +574,7 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
             <select
               value={clusterFilter}
               onChange={e => setClusterFilter(e.target.value)}
-              className="bg-card/50 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="bg-card/50 border border-border rounded-lg px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             >
               {uniqueClusters.map(cluster => (
                 <option key={cluster} value={cluster}>
@@ -493,9 +589,139 @@ export function MultiClusterSummaryDrillDown({ data, viewType }: MultiClusterSum
       {/* Items List */}
       <div className="space-y-2">
         {filteredItems.length === 0 ? (
-          <div className="text-center py-8 text-muted-foreground">
-            No items found
-          </div>
+          viewType === 'all-nodes' && nodesIsLoading ? (
+            <div className="text-center py-8 text-muted-foreground text-sm">
+              Loading node details…
+            </div>
+          ) : viewType === 'all-nodes' &&
+            cachedNodes.length === 0 &&
+            expectedNodeCountFromClusters > 0 ? (
+            <div className="glass rounded-lg p-6 text-sm space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-5 h-5 text-yellow-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-medium">
+                    Cluster summary reports {expectedNodeCountFromClusters} node
+                    {expectedNodeCountFromClusters === 1 ? '' : 's'}, but the
+                    detailed list is empty.
+                  </div>
+                  {/*
+                    Per-cluster error breakdown (Issue 9355). When the
+                    `useCachedAllNodes` fan-out captures per-cluster
+                    `/api/mcp/nodes` failures we show a typed list so the
+                    user can see which clusters were denied by RBAC (auth)
+                    vs. which failed transiently (timeout / network /
+                    unknown). Without this block the warning conflated
+                    every failure mode into a single message.
+                  */}
+                  {nodeClusterErrors.length > 0 ? (
+                    <>
+                      <div className="text-muted-foreground mt-1">
+                        The nodes endpoint returned an error for
+                        {' '}
+                        {nodeClusterErrors.length}
+                        {' '}
+                        cluster{nodeClusterErrors.length === 1 ? '' : 's'}:
+                      </div>
+                      <ul className="mt-2 space-y-1 text-muted-foreground">
+                        {nodeClusterErrors.map(err => {
+                          const isAuth = err.errorType === 'auth'
+                          const isTimeout = err.errorType === 'timeout'
+                          const kindLabel = isAuth
+                            ? 'RBAC denied (list-nodes)'
+                            : isTimeout
+                              ? 'Transient timeout'
+                              : `Endpoint failure (${err.errorType})`
+                          return (
+                            <li key={`${err.cluster}-${err.errorType}`} className="flex items-start gap-2">
+                              <Server className="w-3 h-3 mt-0.5 shrink-0" />
+                              <span>
+                                <span className="font-mono">{err.cluster.split('/').pop()}</span>
+                                {' — '}
+                                <span className={isAuth ? 'text-red-400' : 'text-yellow-400'}>
+                                  {kindLabel}
+                                </span>
+                              </span>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    </>
+                  ) : (
+                    <div className="text-muted-foreground mt-1">
+                      {nodesIsFailed
+                        ? 'The node list endpoint is currently unreachable.'
+                        : 'This usually means the current user lacks list-nodes RBAC on one or more clusters, so the detail view can\'t enumerate nodes even though the per-cluster summary includes their count.'}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : viewType === 'all-pods' &&
+            expectedPodCountFromClusters > 0 ? (
+            <div className="glass rounded-lg p-6 text-sm space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-5 h-5 text-yellow-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-medium">
+                    Cluster summary reports {expectedPodCountFromClusters} pod
+                    {expectedPodCountFromClusters === 1 ? '' : 's'}, but the
+                    detailed list is empty.
+                  </div>
+                  {/*
+                    Per-cluster error breakdown (Issue 9353). When the backend
+                    emits `cluster_error` SSE events we show a typed list
+                    so the user can see which clusters were denied by
+                    RBAC (auth) vs. which failed transiently (timeout /
+                    network / unknown). Without this block the warning
+                    conflated every failure mode into a single message.
+                  */}
+                  {podClusterErrors.length > 0 ? (
+                    <>
+                      <div className="text-muted-foreground mt-1">
+                        The pods endpoint returned an error for
+                        {' '}
+                        {podClusterErrors.length}
+                        {' '}
+                        cluster{podClusterErrors.length === 1 ? '' : 's'}:
+                      </div>
+                      <ul className="mt-2 space-y-1 text-muted-foreground">
+                        {podClusterErrors.map(err => {
+                          const isAuth = err.errorType === 'auth'
+                          const isTimeout = err.errorType === 'timeout'
+                          const kindLabel = isAuth
+                            ? 'RBAC denied (list-pods)'
+                            : isTimeout
+                              ? 'Transient timeout'
+                              : `Endpoint failure (${err.errorType})`
+                          return (
+                            <li key={`${err.cluster}-${err.errorType}`} className="flex items-start gap-2">
+                              <Server className="w-3 h-3 mt-0.5 shrink-0" />
+                              <span>
+                                <span className="font-mono">{err.cluster.split('/').pop()}</span>
+                                {' — '}
+                                <span className={isAuth ? 'text-red-400' : 'text-yellow-400'}>
+                                  {kindLabel}
+                                </span>
+                              </span>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    </>
+                  ) : (
+                    <div className="text-muted-foreground mt-1">
+                      This usually means the current user lacks list-pods RBAC on one or more clusters, or the pods endpoint is temporarily unreachable — the per-cluster summary includes the count but the detail view can&apos;t enumerate individual pods.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-center py-8 text-muted-foreground">
+              No items found
+            </div>
+          )
         ) : (
           filteredItems.slice(0, 100).map((item, idx) => {
             const name = (item as Record<string, unknown>)[config.nameKey] as string || (item as Record<string, unknown>).name as string || 'Unknown'

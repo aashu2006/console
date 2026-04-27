@@ -1,15 +1,22 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { api } from '../lib/api'
-import { STORAGE_KEY_TOKEN } from '../lib/constants'
+import { api, RateLimitError } from '../lib/api'
+import { STORAGE_KEY_TOKEN, STORAGE_KEY_HAS_SESSION, DEMO_TOKEN_VALUE } from '../lib/constants'
 import { MIN_PERCEIVED_DELAY_MS } from '../lib/constants/network'
+import { MS_PER_DAY, MS_PER_HOUR } from '../lib/constants/time'
 
 /** Cache TTL: 30 seconds — polling interval for status updates */
 const CACHE_TTL_MS = 30_000
 
-// Check if user is in demo mode — no token or explicit demo-token
+// #8291 — Post-#6590, a legitimate OAuth session can live ENTIRELY in the
+// HttpOnly kc_auth cookie with nothing in localStorage['token']. The previous
+// token-only check mislabeled those users as demo and served them the
+// hardcoded sample queue. The `kc-has-session` flag is set by /auth/refresh
+// once the backend confirms a cookie-backed session, so it's the authoritative
+// signal that a real user is logged in even with an empty localStorage token.
 function isDemoUser(): boolean {
+  if (localStorage.getItem(STORAGE_KEY_HAS_SESSION) === 'true') return false
   const token = localStorage.getItem(STORAGE_KEY_TOKEN)
-  return !token || token === 'demo-token'
+  return !token || token === DEMO_TOKEN_VALUE
 }
 
 // Types
@@ -143,7 +150,7 @@ const DEMO_FEATURE_REQUESTS: FeatureRequest[] = [
     status: 'fix_ready',
     pr_number: 87,
     pr_url: 'https://github.com/kubestellar/console/pull/87',
-    created_at: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString() },
+    created_at: new Date(Date.now() - 3 * MS_PER_DAY).toISOString() },
   {
     id: 'demo-2',
     user_id: 'demo-user',
@@ -153,7 +160,7 @@ const DEMO_FEATURE_REQUESTS: FeatureRequest[] = [
     github_issue_number: 56,
     github_issue_url: 'https://github.com/kubestellar/console/issues/56',
     status: 'feasibility_study',
-    created_at: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString() },
+    created_at: new Date(Date.now() - 1 * MS_PER_DAY).toISOString() },
   {
     id: 'demo-3',
     user_id: 'demo-user',
@@ -165,7 +172,7 @@ const DEMO_FEATURE_REQUESTS: FeatureRequest[] = [
     status: 'fix_complete',
     pr_number: 72,
     pr_url: 'https://github.com/kubestellar/console/pull/72',
-    created_at: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() },
+    created_at: new Date(Date.now() - 7 * MS_PER_DAY).toISOString() },
 ]
 
 const INITIAL_DEMO_NOTIFICATIONS: Notification[] = [
@@ -177,7 +184,7 @@ const INITIAL_DEMO_NOTIFICATIONS: Notification[] = [
     title: 'PR Ready: Add dark mode toggle',
     message: 'A pull request has been created for your feature request.',
     read: false,
-    created_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    created_at: new Date(Date.now() - 2 * MS_PER_HOUR).toISOString(),
     action_url: 'https://github.com/kubestellar/console/pull/87' },
   {
     id: 'demo-notif-2',
@@ -187,7 +194,7 @@ const INITIAL_DEMO_NOTIFICATIONS: Notification[] = [
     title: 'Merged: Export dashboard as PDF',
     message: 'Your feature request has been implemented and merged.',
     read: true,
-    created_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
+    created_at: new Date(Date.now() - 5 * MS_PER_DAY).toISOString(),
     action_url: 'https://github.com/kubestellar/console/pull/72' },
 ]
 
@@ -235,37 +242,80 @@ function sortRequests(requests: FeatureRequest[], currentGitHubLogin: string): F
   return [...userRequests, ...otherRequests]
 }
 
+/**
+ * PR #6518 item G — Options for useFeatureRequests.
+ *
+ * `countOnly`: when true, the hook passes `?count_only=true` to
+ * `/api/feedback/queue`. The backend responds with a minimal payload of
+ * {id, status} pairs per issue — no titles, bodies, PR URLs, etc. The
+ * FeatureRequestButton navbar badge only needs the closed-ID set to filter
+ * notifications, so it can avoid fetching the full queue on every page load.
+ * Consumers that render queue items (FeatureRequestModal, etc.) must omit
+ * this flag so they receive the full response.
+ */
+export interface UseFeatureRequestsOptions {
+  countOnly?: boolean
+}
+
+/**
+ * PR #6573 item B — Lean shape returned by the `?count_only=true` endpoint.
+ * Only `id` and `status` are present; every other field on FeatureRequest is
+ * guaranteed empty on the wire, so we use a dedicated type instead of
+ * shoehorning the full FeatureRequest type onto a partial payload.
+ */
+export interface FeatureRequestSummary {
+  id: string
+  status: RequestStatus
+}
+
 // Feature Requests Hook
-export function useFeatureRequests(currentUserId?: string) {
+export function useFeatureRequests(currentUserId?: string, options?: UseFeatureRequestsOptions) {
   const [requests, setRequests] = useState<FeatureRequest[]>([])
+  // PR #6573 item B — countOnly responses get their own lean-typed state
+  // slot instead of being cast into FeatureRequest[]. The wire payload only
+  // carries {id, status}, so every other field would be undefined on the
+  // full type — a footgun for any consumer that wandered in expecting
+  // title/description/etc. to be populated.
+  const [summaries, setSummaries] = useState<FeatureRequestSummary[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const isDemoMode = isDemoUser()
+  const countOnly = options?.countOnly === true
 
   const loadRequests = useCallback(async () => {
     // In demo mode, use mock data
     if (isDemoUser()) {
-      const sorted = currentUserId ? sortRequests(DEMO_FEATURE_REQUESTS, currentUserId) : DEMO_FEATURE_REQUESTS
-      setRequests(sorted)
+      if (countOnly) {
+        setSummaries(DEMO_FEATURE_REQUESTS.map(r => ({ id: r.id, status: r.status })))
+      } else {
+        const sorted = currentUserId ? sortRequests(DEMO_FEATURE_REQUESTS, currentUserId) : DEMO_FEATURE_REQUESTS
+        setRequests(sorted)
+      }
       setIsLoading(false)
       return
     }
     try {
       setIsLoading(true)
-      // Fetch from queue endpoint to get all issues
-      const { data } = await api.get<FeatureRequest[]>('/api/feedback/queue')
-      const safeData = Array.isArray(data) ? data : []
-      const sorted = currentUserId ? sortRequests(safeData, currentUserId) : safeData
-      setRequests(sorted)
+      if (countOnly) {
+        // PR #6573 item B — lean endpoint returns {id, status} only. Type
+        // it that way instead of pretending to hydrate a FeatureRequest[].
+        const { data } = await api.get<FeatureRequestSummary[]>('/api/feedback/queue?count_only=true')
+        setSummaries(Array.isArray(data) ? data : [])
+      } else {
+        const { data } = await api.get<FeatureRequest[]>('/api/feedback/queue')
+        const safeData = Array.isArray(data) ? data : []
+        const sorted = currentUserId ? sortRequests(safeData, currentUserId) : safeData
+        setRequests(sorted)
+      }
       setError(null)
     } catch {
       // Silently fail - backend may be unavailable in demo mode
     } finally {
       setIsLoading(false)
     }
-  }, [currentUserId])
+  }, [currentUserId, countOnly])
 
   useEffect(() => {
     loadRequests()
@@ -299,9 +349,22 @@ export function useFeatureRequests(currentUserId?: string) {
   const createRequest = async (input: CreateFeatureRequestInput, options?: { timeout?: number }) => {
     try {
       setIsSubmitting(true)
-      const { data } = await api.post<FeatureRequest>('/api/feedback/requests', input, options)
+      // Attach the per-user client credential so the backend can route
+      // through the attribution proxy. The header name is intentionally
+      // non-descriptive (do not rename to anything auth-suggestive).
+      const { getClientCtx } = await import('../lib/clientCtx')
+      const ctx = getClientCtx()
+      const mergedOpts = ctx
+        ? { ...(options ?? {}), headers: { ...(options as { headers?: Record<string, string> })?.headers, 'X-KC-Client-Auth': ctx } }
+        : options
+      const { data } = await api.post<FeatureRequest>('/api/feedback/requests', input, mergedOpts)
       setRequests(prev => [data, ...prev])
       return data
+    } catch (err) {
+      if (err instanceof RateLimitError) {
+        throw new Error('Too many requests — please wait a moment and try again.')
+      }
+      throw err
     } finally {
       setIsSubmitting(false)
     }
@@ -333,6 +396,10 @@ export function useFeatureRequests(currentUserId?: string) {
 
   return {
     requests,
+    // PR #6573 item B — populated only when `countOnly` option is set.
+    // Consumers that passed countOnly should read `summaries`; consumers
+    // that need the full queue should read `requests`.
+    summaries,
     isLoading,
     isRefreshing,
     error,

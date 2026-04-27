@@ -1,8 +1,8 @@
 import { useMemo } from 'react'
-import { CheckCircle, AlertTriangle, Clock, ChevronRight } from 'lucide-react'
+import { CheckCircle, AlertTriangle, Clock } from 'lucide-react'
 import type { PVC } from '../../hooks/useMCP'
 import { useCachedPVCs } from '../../hooks/useCachedData'
-import { useDrillDownActions } from '../../hooks/useDrillDown'
+import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { useCardLoadingState } from './CardDataContext'
 import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
@@ -72,9 +72,16 @@ function getStatusColor(status: string) {
 
 function PVCStatusInternal() {
   const { t } = useTranslation(['common', 'cards'])
-  const { pvcs, isLoading, isRefreshing, error, consecutiveFailures, isFailed, isDemoFallback, lastRefresh } = useCachedPVCs()
-  const { drillToPVC } = useDrillDownActions()
+  const { pvcs: allPVCs, isLoading, isRefreshing, error, consecutiveFailures, isFailed, isDemoFallback, lastRefresh } = useCachedPVCs()
+  const { selectedClusters, isAllClustersSelected } = useGlobalFilters()
   const { isDemoMode: demoMode } = useDemoMode()
+
+  // Apply global cluster filters so PVC counts match the StorageOverview card (#7457).
+  // Previously this card ignored global filters, causing count discrepancies.
+  const pvcs = useMemo(() => {
+    if (isAllClustersSelected) return allPVCs
+    return allPVCs.filter(p => p.cluster && selectedClusters.includes(p.cluster))
+  }, [allPVCs, selectedClusters, isAllClustersSelected])
 
   // Report card data state (lastRefresh flows to CardWrapper header "Updated Xm ago")
   const hasData = pvcs.length > 0
@@ -153,11 +160,15 @@ function PVCStatusInternal() {
       )
     }
 
+    const bound = result.filter(p => p.status === 'Bound').length
+    const pending = result.filter(p => p.status === 'Pending').length
     return {
       total: result.length,
-      bound: result.filter(p => p.status === 'Bound').length,
-      pending: result.filter(p => p.status === 'Pending').length,
-      failed: result.filter(p => !['Bound', 'Pending'].includes(p.status)).length,
+      bound,
+      pending,
+      // Count all PVCs that are neither Bound nor Pending as failed (#7464).
+      // Previously only 'Lost' was counted, missing 'Failed' and other error states.
+      failed: result.length - bound - pending,
     }
   }, [pvcs, localClusterFilter, search])
 
@@ -181,7 +192,7 @@ function PVCStatusInternal() {
   return (
     <div className="h-full flex flex-col">
       {/* Controls */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-muted-foreground">{totalItems} PVCs</span>
           <RefreshIndicator
@@ -227,7 +238,7 @@ function PVCStatusInternal() {
       />
 
       {/* Stats row */}
-      <div className="grid grid-cols-4 gap-2 mb-4">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-4">
         <div className="p-2 rounded-lg bg-secondary/50 text-center">
           <div className="text-lg font-bold text-foreground">{stats.total}</div>
           <div className="text-xs text-muted-foreground">{t('common.total')}</div>
@@ -256,19 +267,14 @@ function PVCStatusInternal() {
           displayPVCs.map(pvc => (
             <div
               key={`${pvc.cluster}-${pvc.namespace}-${pvc.name}`}
-              onClick={() => drillToPVC(pvc.cluster || '', pvc.namespace || '', pvc.name, {
-                status: pvc.status,
-                capacity: pvc.capacity,
-                storageClass: pvc.storageClass,
-                age: pvc.age,
-              })}
-              className="flex items-center justify-between p-2 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group"
+              className="flex flex-wrap items-center justify-between gap-y-2 p-2 rounded-lg bg-secondary/30 transition-colors"
+              title="PVC drilldown not available"
             >
               <div className="flex items-center gap-2 min-w-0">
                 {getStatusIcon(pvc.status)}
                 {pvc.cluster && <ClusterBadge cluster={pvc.cluster} size="sm" />}
                 <div className="min-w-0">
-                  <div className="text-sm text-foreground truncate group-hover:text-purple-400">{pvc.name}</div>
+                  <div className="text-sm text-foreground truncate">{pvc.name}</div>
                   <div className="text-xs text-muted-foreground truncate">
                     {pvc.namespace}
                   </div>
@@ -288,7 +294,6 @@ function PVCStatusInternal() {
                     issues={[{ name: `PVC ${pvc.status}`, message: `PersistentVolumeClaim is in ${pvc.status} state${pvc.storageClass ? ` (storageClass: ${pvc.storageClass})` : ''}` }]}
                   />
                 )}
-                <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
               </div>
             </div>
           ))

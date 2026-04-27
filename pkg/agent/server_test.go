@@ -170,8 +170,9 @@ func TestServer_HandleRenameContextHTTP(t *testing.T) {
 	// Important: We need to coordinate concurrent access if tests run in parallel.
 	// We are not using t.Parallel(), so it's safeish, but defer restore is critical.
 
-	defer func() { execCommand = exec.Command }()
+	defer func() { execCommand = exec.Command; execCommandContext = exec.CommandContext }()
 	execCommand = fakeExecCommand
+	execCommandContext = fakeExecCommandContext
 
 	// Setup proxy
 	proxy := &KubectlProxy{
@@ -219,8 +220,9 @@ func TestServer_HandleRenameContextHTTP(t *testing.T) {
 
 func TestServer_ResourceHandlers(t *testing.T) {
 	// Setup generic mock proxy
-	defer func() { execCommand = exec.Command }()
+	defer func() { execCommand = exec.Command; execCommandContext = exec.CommandContext }()
 	execCommand = fakeExecCommand
+	execCommandContext = fakeExecCommandContext
 
 	config := &api.Config{
 		CurrentContext: "ctx-1",
@@ -429,6 +431,10 @@ func TestServer_SettingsHandlers(t *testing.T) {
 		SkipKeyValidation: true,
 	}
 
+	// Register a mock "openai" provider so the validation gate accepts it.
+	// Ignore "already registered" errors from concurrent tests.
+	_ = GetRegistry().Register(&ServerMockProvider{name: "openai"})
+
 	// 2. Test handleSetKey
 	reqBody := `{"provider":"openai", "apiKey":"test-key", "model":"gpt-4"}`
 	req := httptest.NewRequest("POST", "/settings/keys", strings.NewReader(reqBody))
@@ -458,10 +464,19 @@ func TestServer_SettingsHandlers(t *testing.T) {
 		t.Fatalf("Failed to decode keys status: %v", err)
 	}
 
-	// API-key providers are intentionally hidden (only CLI-based agents shown),
-	// so the keys endpoint returns an empty list even when keys are configured.
-	if len(resp.Keys) != 0 {
-		t.Errorf("Expected empty keys list (API-key providers hidden), got %d entries", len(resp.Keys))
+	// handleGetKeysStatus now reports the nine chat-only HTTP providers registered
+	// in InitializeProviders (3 OpenAI-compatible gateways + 6 local LLM runners)
+	// so the Settings modal can render a per-provider base URL override field
+	// (#8248, #8254, #8256). CLI-based tool-capable agents remain hidden — they
+	// manage their own credentials. The list must be non-empty and all entries
+	// must carry a Provider name.
+	if len(resp.Keys) == 0 {
+		t.Error("Expected keys list to include chat-only HTTP providers, got 0 entries")
+	}
+	for _, k := range resp.Keys {
+		if k.Provider == "" {
+			t.Errorf("Key status entry missing Provider: %+v", k)
+		}
 	}
 }
 
@@ -1149,6 +1164,120 @@ func TestServer_HandleRestartBackend_WrongMethod(t *testing.T) {
 	}
 }
 
+// TestResolveBackendPort exercises the three resolution branches documented
+// in resolveBackendPort: explicit env var, watchdog PID file present, and
+// neither (legacy default). Regression guard for #7945.
+func TestResolveBackendPort(t *testing.T) {
+	// Save and restore the global stat hook so parallel tests don't clash.
+	origStat := watchdogPidFileStat
+	defer func() { watchdogPidFileStat = origStat }()
+
+	// Default: no env var, PID file stat returns ENOENT -> legacy 8080.
+	t.Run("legacy default", func(t *testing.T) {
+		t.Setenv(backendPortEnvVar, "")
+		watchdogPidFileStat = func(string) (os.FileInfo, error) {
+			return nil, os.ErrNotExist
+		}
+		if got := resolveBackendPort(); got != backendPortLegacyDefault {
+			t.Errorf("legacy default: got %d, want %d", got, backendPortLegacyDefault)
+		}
+	})
+
+	// Watchdog PID file present, no env var -> watchdog-mode port 8081.
+	t.Run("watchdog pid file present", func(t *testing.T) {
+		t.Setenv(backendPortEnvVar, "")
+		watchdogPidFileStat = func(string) (os.FileInfo, error) {
+			return fakeFileInfo{}, nil
+		}
+		if got := resolveBackendPort(); got != backendPortWatchdogMode {
+			t.Errorf("watchdog: got %d, want %d", got, backendPortWatchdogMode)
+		}
+	})
+
+	// Explicit env var wins over PID file.
+	t.Run("env var overrides", func(t *testing.T) {
+		const customPort = 9090 // arbitrary valid port for the test
+		t.Setenv(backendPortEnvVar, fmt.Sprintf("%d", customPort))
+		watchdogPidFileStat = func(string) (os.FileInfo, error) {
+			return fakeFileInfo{}, nil // even with watchdog, env wins
+		}
+		if got := resolveBackendPort(); got != customPort {
+			t.Errorf("env override: got %d, want %d", got, customPort)
+		}
+	})
+
+	// Garbage env var falls through to the next tier.
+	t.Run("garbage env var falls through", func(t *testing.T) {
+		t.Setenv(backendPortEnvVar, "not-a-number")
+		watchdogPidFileStat = func(string) (os.FileInfo, error) {
+			return nil, os.ErrNotExist
+		}
+		if got := resolveBackendPort(); got != backendPortLegacyDefault {
+			t.Errorf("garbage env: got %d, want %d", got, backendPortLegacyDefault)
+		}
+	})
+}
+
+// TestBackendHealthURL confirms the /health URL is assembled from the resolved
+// port, not a stale constant (#7945).
+func TestBackendHealthURL(t *testing.T) {
+	origStat := watchdogPidFileStat
+	defer func() { watchdogPidFileStat = origStat }()
+
+	const customPort = 9091 // arbitrary valid port for the test
+	t.Setenv(backendPortEnvVar, fmt.Sprintf("%d", customPort))
+	watchdogPidFileStat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+
+	want := fmt.Sprintf("http://127.0.0.1:%d/health", customPort)
+	if got := backendHealthURL(); got != want {
+		t.Errorf("backendHealthURL: got %q, want %q", got, want)
+	}
+}
+
+// TestEnvWithBackendPort verifies that BACKEND_PORT is always set exactly once
+// in the returned env slice — no duplicate entries even when the parent
+// environment already had one (#7945 guards against Env-slice drift).
+func TestEnvWithBackendPort(t *testing.T) {
+	origStat := watchdogPidFileStat
+	defer func() { watchdogPidFileStat = origStat }()
+
+	const stalePort = 9092  // pretend this was inherited from the parent env
+	const parentPort = 9093 // what the child should actually see
+	t.Setenv(backendPortEnvVar, fmt.Sprintf("%d", parentPort))
+	_ = stalePort // referenced via env
+	watchdogPidFileStat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+
+	env := envWithBackendPort()
+	count := 0
+	var lastValue string
+	prefix := backendPortEnvVar + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			count++
+			lastValue = kv
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 BACKEND_PORT entry, got %d (env=%v)", count, env)
+	}
+	wantKV := fmt.Sprintf("%s=%d", backendPortEnvVar, parentPort)
+	if lastValue != wantKV {
+		t.Errorf("expected %q, got %q", wantKV, lastValue)
+	}
+}
+
+// fakeFileInfo is a minimal os.FileInfo stub for the resolveBackendPort tests.
+// Only the existence of the file is checked (via the error returned by stat),
+// so these methods can return zero values.
+type fakeFileInfo struct{}
+
+func (fakeFileInfo) Name() string       { return "" }
+func (fakeFileInfo) Size() int64        { return 0 }
+func (fakeFileInfo) Mode() os.FileMode  { return 0 }
+func (fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (fakeFileInfo) IsDir() bool        { return false }
+func (fakeFileInfo) Sys() interface{}   { return nil }
+
 func TestServer_HandleRenameContextHTTP_Unauthorized(t *testing.T) {
 	server := &Server{
 		kubectl:        &KubectlProxy{config: &api.Config{}},
@@ -1184,8 +1313,9 @@ func TestServer_HandleRenameContextHTTP_WrongMethod(t *testing.T) {
 }
 
 func TestServer_HandleRenameContextHTTP_MissingNames(t *testing.T) {
-	defer func() { execCommand = exec.Command }()
+	defer func() { execCommand = exec.Command; execCommandContext = exec.CommandContext }()
 	execCommand = fakeExecCommand
+	execCommandContext = fakeExecCommandContext
 
 	server := &Server{
 		kubectl: &KubectlProxy{
@@ -2195,6 +2325,36 @@ func TestServer_HandleLocalClusters_OPTIONS(t *testing.T) {
 	}
 }
 
+// TestHandleLocalClusters_CORSAdvertisesDELETE pins the fix for #9155: the
+// OPTIONS preflight on /local-clusters must advertise DELETE in
+// Access-Control-Allow-Methods so the browser permits the cluster-delete
+// fetch from the SPA origin. Before the audit (#8201) this handler fell
+// through to the default "GET, OPTIONS", which Chrome rejected for the
+// DELETE preflight; this test prevents that regression from coming back.
+func TestHandleLocalClusters_CORSAdvertisesDELETE(t *testing.T) {
+	server := &Server{
+		allowedOrigins: []string{"http://localhost:8080"},
+	}
+
+	req := httptest.NewRequest("OPTIONS", "/local-clusters?tool=kind&name=testing", nil)
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Access-Control-Request-Method", "DELETE")
+	w := httptest.NewRecorder()
+
+	server.handleLocalClusters(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected 200 for OPTIONS preflight, got %d", w.Code)
+	}
+
+	methods := w.Header().Get("Access-Control-Allow-Methods")
+	for _, want := range []string{"GET", "POST", "DELETE", "OPTIONS"} {
+		if !strings.Contains(methods, want) {
+			t.Errorf("expected Access-Control-Allow-Methods to include %q (Fixes #9155), got %q", want, methods)
+		}
+	}
+}
+
 func TestErrorPayload(t *testing.T) {
 	// Test creating an error payload directly
 	payload := protocol.ErrorPayload{
@@ -2353,8 +2513,27 @@ func TestServer_PromptNeedsToolExecution(t *testing.T) {
 		{"I understand now", false},
 		{"good job", false},
 		{"", false},
-		// Note: "explain deployments" and "how does helm work?" would return true
-		// because they contain "deploy" and "helm" substrings
+
+		// Question-prefix prompts must short-circuit to false even if they
+		// contain execution keywords as substrings. Regression for #8074
+		// where "How do I delete a namespace?" was routed to a tool-capable
+		// agent because it contained "delete".
+		{"How do I delete a namespace?", false},
+		{"how can I scale a deployment?", false},
+		{"what is the difference between delete and force-delete?", false},
+		{"why is my pod stuck?", false},
+		{"explain how rollout restart works", false},
+		{"tell me about kubectl get pods", false},
+
+		// Imperative commands must still route to tool execution.
+		{"delete namespace foo", true},
+		{"kubectl get pods", true},
+
+		// Exact retry keyword "yes" still routes, but "yesterday" must not.
+		// Regression for #8074 where retryKeywords used Contains, so any
+		// sentence with "yes" as a substring (e.g. "yesterday") matched.
+		{"yesterday the pod crashed", false},
+		{"yes, please do", true},
 	}
 
 	for _, tt := range tests {

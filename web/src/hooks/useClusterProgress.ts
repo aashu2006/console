@@ -1,8 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
-import { LOCAL_AGENT_WS_URL } from '../lib/constants/network'
-
-/** WebSocket reconnect delay after connection drops */
-const WS_RECONNECT_DELAY_MS = 10_000
+import { LOCAL_AGENT_WS_URL, MAX_WS_RECONNECT_ATTEMPTS, getWsBackoffDelay } from '../lib/constants/network'
+import { appendWsAuthToken } from '../lib/utils/wsAuth'
 
 /** Auto-dismiss delay after a successful operation */
 export const CLUSTER_PROGRESS_AUTO_DISMISS_MS = 8_000
@@ -30,14 +28,21 @@ export interface ClusterProgress {
 export function useClusterProgress() {
   const [progress, setProgress] = useState<ClusterProgress | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  /** Track reconnect timer in a ref so cleanup can clear timers scheduled by onclose (#7785) */
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** Track current reconnect attempt number */
+  const reconnectAttemptsRef = useRef(0)
 
   useEffect(() => {
-    let reconnectTimer: ReturnType<typeof setTimeout>
+    let unmounted = false
 
-    function connect() {
+    function connect(attemptNumber = 0) {
+      if (unmounted) return
+
       try {
-        const ws = new WebSocket(LOCAL_AGENT_WS_URL)
+        const ws = new WebSocket(appendWsAuthToken(LOCAL_AGENT_WS_URL))
         wsRef.current = ws
+        reconnectAttemptsRef.current = attemptNumber
 
         ws.onmessage = (event) => {
           try {
@@ -50,24 +55,64 @@ export function useClusterProgress() {
           }
         }
 
+        ws.onopen = () => {
+          // Reset reconnect attempts on successful connection
+          reconnectAttemptsRef.current = 0
+        }
+
         ws.onclose = () => {
           wsRef.current = null
-          reconnectTimer = setTimeout(connect, WS_RECONNECT_DELAY_MS)
+          if (unmounted) return
+
+          // Check if we've exceeded max reconnect attempts
+          if (reconnectAttemptsRef.current >= MAX_WS_RECONNECT_ATTEMPTS) {
+            console.warn('[ClusterProgress] Max reconnect attempts exceeded, giving up')
+            return
+          }
+
+          const delay = getWsBackoffDelay(reconnectAttemptsRef.current)
+          console.debug(`[ClusterProgress] Connection lost, reconnecting in ${Math.round(delay)}ms (attempt ${reconnectAttemptsRef.current + 1}/${MAX_WS_RECONNECT_ATTEMPTS})`)
+
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null
+            if (!unmounted) {
+              connect(reconnectAttemptsRef.current + 1)
+            }
+          }, delay)
         }
 
         ws.onerror = () => {
           ws.close()
         }
       } catch {
-        // Agent not available, retry later
-        reconnectTimer = setTimeout(connect, WS_RECONNECT_DELAY_MS)
+        // Agent not available, retry later with exponential backoff
+        if (unmounted) return
+
+        if (reconnectAttemptsRef.current >= MAX_WS_RECONNECT_ATTEMPTS) {
+          console.warn('[ClusterProgress] Max reconnect attempts exceeded, giving up')
+          return
+        }
+
+        const delay = getWsBackoffDelay(reconnectAttemptsRef.current)
+        console.debug(`[ClusterProgress] Agent unavailable, retrying in ${Math.round(delay)}ms (attempt ${reconnectAttemptsRef.current + 1}/${MAX_WS_RECONNECT_ATTEMPTS})`)
+
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null
+          if (!unmounted) {
+            connect(reconnectAttemptsRef.current + 1)
+          }
+        }, delay)
       }
     }
 
     connect()
 
     return () => {
-      clearTimeout(reconnectTimer)
+      unmounted = true
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null

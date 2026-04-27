@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Play, RotateCcw, Pause, Trophy, Target, Heart, Crosshair } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { useCardExpanded } from './CardWrapper'
 import { useReportCardDataState } from './CardDataContext'
 import { emitGameStarted, emitGameEnded } from '../../lib/analytics'
 import { useGameKeys } from '../../hooks/useGameKeys'
+import { safeGet, safeSet } from '../../lib/safeLocalStorage'
 
 // Canvas dimensions
 const CANVAS_WIDTH = 480
@@ -27,6 +29,10 @@ const ROTATE_SPEED = 0.04
 const WALL_COLORS = ['#8b0000', '#006400', '#00008b', '#8b8b00']
 const CEILING_COLOR = '#1a1a2e'
 const FLOOR_COLOR = '#2d2d2d'
+const CROSSHAIR_COLOR = '#00ff00'
+const FLASH_SHOOT_COLOR = [255, 200, 50]
+const FLASH_DAMAGE_COLOR = [255, 0, 0]
+const ENEMY_EYE_RGB = [255, 50, 50]
 
 // Map: 1-4 = walls of different colors, 0 = empty
 const MAP_DATA = [
@@ -87,7 +93,14 @@ function spawnEnemies(level: number): Enemy[] {
   return enemies
 }
 
+// High-score key — safeGet/safeSet tolerate private-mode localStorage throws.
+const KUBE_DOOM_HIGHSCORE_KEY = 'kubeDoomHighScore'
+
+// Visual warning threshold for the ammo HUD readout.
+const LOW_AMMO_THRESHOLD = 5
+
 export function KubeDoom() {
+  const { t } = useTranslation('cards')
   useReportCardDataState({ hasData: true, isFailed: false, consecutiveFailures: 0, isDemoData: false })
   const { isExpanded } = useCardExpanded()
   const gameContainerRef = useRef<HTMLDivElement>(null)
@@ -99,7 +112,7 @@ export function KubeDoom() {
   const [level, setLevel] = useState(1)
   const [kills, setKills] = useState(0)
   const [highScore, setHighScore] = useState(() => {
-    const saved = localStorage.getItem('kubeDoomHighScore')
+    const saved = safeGet(KUBE_DOOM_HIGHSCORE_KEY)
     return saved ? parseInt(saved, 10) : 0
   })
 
@@ -261,7 +274,7 @@ export function KubeDoom() {
             setScore(s => {
               if (s > highScore) {
                 setHighScore(s)
-                localStorage.setItem('kubeDoomHighScore', s.toString())
+                safeSet(KUBE_DOOM_HIGHSCORE_KEY, s.toString())
               }
               emitGameEnded('kube_doom', 'loss', s)
               return s
@@ -389,7 +402,7 @@ export function KubeDoom() {
 
       // Eyes (red glow)
       const eyeR = Math.max(2, spriteWidth * 0.08)
-      ctx.fillStyle = `rgb(${Math.floor(255 * shade)},${Math.floor(50 * shade)},${Math.floor(50 * shade)})`
+      ctx.fillStyle = `rgb(${Math.floor(ENEMY_EYE_RGB[0] * shade)},${Math.floor(ENEMY_EYE_RGB[1] * shade)},${Math.floor(ENEMY_EYE_RGB[2] * shade)})`
       ctx.beginPath()
       ctx.arc(screenX - spriteWidth * 0.12, screenY + spriteHeight * 0.15, eyeR, 0, Math.PI * 2)
       ctx.arc(screenX + spriteWidth * 0.12, screenY + spriteHeight * 0.15, eyeR, 0, Math.PI * 2)
@@ -415,18 +428,18 @@ export function KubeDoom() {
 
     // Shoot flash
     if (shootFlashRef.current > 0) {
-      ctx.fillStyle = `rgba(255, 200, 50, ${shootFlashRef.current / 8 * 0.3})`
+      ctx.fillStyle = `rgba(${FLASH_SHOOT_COLOR[0]}, ${FLASH_SHOOT_COLOR[1]}, ${FLASH_SHOOT_COLOR[2]}, ${shootFlashRef.current / 8 * 0.3})`
       ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
     }
 
     // Damage flash
     if (damageFlashRef.current > 0) {
-      ctx.fillStyle = `rgba(255, 0, 0, ${damageFlashRef.current / 8 * 0.4})`
+      ctx.fillStyle = `rgba(${FLASH_DAMAGE_COLOR[0]}, ${FLASH_DAMAGE_COLOR[1]}, ${FLASH_DAMAGE_COLOR[2]}, ${damageFlashRef.current / 8 * 0.4})`
       ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
     }
 
     // Crosshair
-    ctx.strokeStyle = '#00ff00'
+    ctx.strokeStyle = CROSSHAIR_COLOR
     ctx.lineWidth = 2
     const cx = CANVAS_WIDTH / 2
     const cy = CANVAS_HEIGHT / 2
@@ -555,7 +568,7 @@ export function KubeDoom() {
     <div ref={gameContainerRef} className="h-full flex flex-col">
       <div className={`flex flex-col items-center gap-3 ${isExpanded ? 'flex-1 min-h-0' : ''}`}>
         {/* Stats bar */}
-        <div className="flex items-center justify-between w-full max-w-[480px] text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 w-full max-w-[480px] text-sm">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-1">
               <Target className="w-4 h-4 text-cyan-400" />
@@ -575,8 +588,8 @@ export function KubeDoom() {
               <span className={health <= 25 ? 'text-red-400 font-bold' : ''}>{health}%</span>
             </div>
             <div className="flex items-center gap-1 text-xs">
-              <span className={ammo <= 5 ? 'text-red-400' : 'text-muted-foreground'}>
-                {ammo} ammo
+              <span className={ammo <= LOW_AMMO_THRESHOLD ? 'text-red-400' : 'text-muted-foreground'}>
+                {t('kubeDoom.ammoCount', { count: ammo })}
               </span>
             </div>
             <div className="flex items-center gap-1">
@@ -600,28 +613,28 @@ export function KubeDoom() {
           {/* Overlays */}
           {gameState === 'idle' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 rounded">
-              <h3 className="text-3xl font-bold text-red-500 mb-1 tracking-wider" style={{ fontFamily: 'monospace' }}>KUBE DOOM</h3>
-              <p className="text-xs text-muted-foreground mb-1">Eliminate rogue Kubernetes resources</p>
-              <p className="text-xs text-muted-foreground mb-4">WASD/Arrows to move, Q/E strafe, Space to shoot</p>
+              <h3 className="text-3xl font-bold text-red-500 mb-1 tracking-wider" style={{ fontFamily: 'monospace' }}>{t('kubeDoom.title')}</h3>
+              <p className="text-xs text-muted-foreground mb-1">{t('kubeDoom.tagline')}</p>
+              <p className="text-xs text-muted-foreground mb-4">{t('kubeDoom.controls')}</p>
               <button
                 onClick={startGame}
                 className="flex items-center gap-2 px-4 py-2 bg-red-700 hover:bg-red-800 rounded text-white"
               >
                 <Play className="w-4 h-4" />
-                Start Game
+                {t('kubeDoom.startGame')}
               </button>
             </div>
           )}
 
           {gameState === 'paused' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded">
-              <h3 className="text-xl font-bold text-white mb-4">Paused</h3>
+              <h3 className="text-xl font-bold text-white mb-4">{t('kubeDoom.paused')}</h3>
               <button
                 onClick={togglePause}
                 className="flex items-center gap-2 px-4 py-2 bg-red-700 hover:bg-red-800 rounded text-white"
               >
                 <Play className="w-4 h-4" />
-                Resume
+                {t('kubeDoom.resume')}
               </button>
             </div>
           )}
@@ -629,34 +642,34 @@ export function KubeDoom() {
           {gameState === 'levelcomplete' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded">
               <Crosshair className="w-12 h-12 text-green-400 mb-2" />
-              <h3 className="text-2xl font-bold text-green-400 mb-2">Level {level - 1} Clear!</h3>
-              <p className="text-sm text-muted-foreground mb-1">All rogue resources eliminated</p>
-              <p className="text-lg text-white mb-4">Score: {score}</p>
+              <h3 className="text-2xl font-bold text-green-400 mb-2">{t('kubeDoom.levelClear', { level: level - 1 })}</h3>
+              <p className="text-sm text-muted-foreground mb-1">{t('kubeDoom.allEliminated')}</p>
+              <p className="text-lg text-white mb-4">{t('kubeDoom.scoreLabel', { score })}</p>
               <button
                 onClick={nextLevel}
                 className="flex items-center gap-2 px-4 py-2 bg-red-700 hover:bg-red-800 rounded text-white"
               >
                 <Play className="w-4 h-4" />
-                Level {level}
+                {t('kubeDoom.nextLevel', { level })}
               </button>
             </div>
           )}
 
           {gameState === 'gameover' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 rounded">
-              <h3 className="text-2xl font-bold text-red-400 mb-2">TERMINATED</h3>
-              <p className="text-sm text-muted-foreground mb-1">The rogue resources got you</p>
-              <p className="text-lg text-white mb-1">Score: {score}</p>
-              <p className="text-sm text-muted-foreground mb-1">Level {level} | {kills} eliminated</p>
+              <h3 className="text-2xl font-bold text-red-400 mb-2">{t('kubeDoom.terminated')}</h3>
+              <p className="text-sm text-muted-foreground mb-1">{t('kubeDoom.gotYou')}</p>
+              <p className="text-lg text-white mb-1">{t('kubeDoom.scoreLabel', { score })}</p>
+              <p className="text-sm text-muted-foreground mb-1">{t('kubeDoom.levelAndKills', { level, kills })}</p>
               {score === highScore && score > 0 && (
-                <p className="text-sm text-yellow-400 mb-4">New High Score!</p>
+                <p className="text-sm text-yellow-400 mb-4">{t('kubeDoom.newHighScore')}</p>
               )}
               <button
                 onClick={startGame}
                 className="flex items-center gap-2 px-4 py-2 bg-red-700 hover:bg-red-800 rounded text-white"
               >
                 <RotateCcw className="w-4 h-4" />
-                Play Again
+                {t('kubeDoom.playAgain')}
               </button>
             </div>
           )}
@@ -670,7 +683,7 @@ export function KubeDoom() {
               className="flex items-center gap-1 px-3 py-1 bg-secondary hover:bg-secondary/80 rounded text-sm"
             >
               <Pause className="w-4 h-4" />
-              Pause
+              {t('kubeDoom.pauseAction')}
             </button>
           </div>
         )}

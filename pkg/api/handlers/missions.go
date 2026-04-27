@@ -16,6 +16,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/settings"
 )
 
@@ -65,6 +66,20 @@ const (
 	// missionsCacheMaxEntries is the maximum number of entries in the response cache.
 	// Each entry stores a directory listing or file body.
 	missionsCacheMaxEntries = 256
+
+	// missionsValidateMaxBytes is a tighter payload cap for ValidateMission.
+	// Mission JSON documents are small structured metadata — legitimate payloads
+	// are well under 1 MiB. Accepting the full missionsMaxBodyBytes (10 MiB) for
+	// json.Unmarshal invites deeply-nested payloads that stress the decoder.
+	// Reject oversize validate requests early with 413 (#6820).
+	missionsValidateMaxBytes = 1 * 1024 * 1024 // 1 MiB
+
+	// slackMaxTextBytes is the maximum allowed size for the Text field in a
+	// SlackShareRequest. Slack messages are typically short; 10 KB is more
+	// than enough for any legitimate use. Without this cap a caller could
+	// POST up to missionsMaxBodyBytes (10 MiB) of text that gets forwarded
+	// to Slack, buffering the full payload in-process (#6817).
+	slackMaxTextBytes = 10 * 1024 // 10 KB
 
 	// missionsCacheMaxBytes bounds the TOTAL byte size of all cache entries,
 	// not just the entry count. Without this bound an attacker could fill
@@ -153,14 +168,20 @@ type missionsCacheEntry struct {
 // The cache key is the full request URL. Entries are evicted (oldest-first) when
 // either the entry count exceeds missionsCacheMaxEntries or the total byte size
 // exceeds missionsCacheMaxBytes (#6417).
+// #6841 — insertOrder tracks keys in insertion order for O(1) oldest-key lookup
+// during eviction, replacing the previous O(n) map scan.
 type missionsResponseCache struct {
-	mu         sync.RWMutex
-	entries    map[string]*missionsCacheEntry
-	totalBytes int
+	mu          sync.RWMutex
+	entries     map[string]*missionsCacheEntry
+	insertOrder []string
+	totalBytes  int
 }
 
 // get returns a cached entry if it exists and is within the given TTL.
 // Returns nil if no entry exists or the entry is expired.
+//
+// #6822 — Returns a shallow copy of the entry so callers cannot mutate
+// the shared cache data after the read lock is released.
 func (c *missionsResponseCache) get(key string, ttl time.Duration) *missionsCacheEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -171,11 +192,14 @@ func (c *missionsResponseCache) get(key string, ttl time.Duration) *missionsCach
 	if time.Since(entry.fetchedAt) > ttl {
 		return nil
 	}
-	return entry
+	cp := *entry
+	return &cp
 }
 
 // getStale returns a cached entry even if expired, as long as it is within staleTTL.
 // Used to serve stale data when GitHub rate-limits us — better than an error.
+//
+// #6822 — Returns a shallow copy (same rationale as get).
 func (c *missionsResponseCache) getStale(key string, staleTTL time.Duration) *missionsCacheEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -186,28 +210,34 @@ func (c *missionsResponseCache) getStale(key string, staleTTL time.Duration) *mi
 	if time.Since(entry.fetchedAt) > staleTTL {
 		return nil
 	}
-	return entry
+	cp := *entry
+	return &cp
 }
 
-// evictOldestLocked removes the single oldest entry from the cache. The caller
-// MUST hold c.mu in write mode. Returns true if an entry was evicted.
+// evictOldestLocked removes the single oldest entry from the cache.
+// Returns true if an entry was evicted.
+//
+// REQUIRES: c.mu held in WRITE mode by the caller (#6821).
+//
+// Currently called only from set(), which acquires c.mu.Lock() before
+// invoking this method. Any new call-site MUST hold the write lock —
+// this function reads and modifies c.entries, c.insertOrder, and
+// c.totalBytes without further synchronisation.
+//
+// #6841 — Uses the insertOrder slice for O(1) oldest-key lookup instead of
+// scanning the entire map on every eviction.
 func (c *missionsResponseCache) evictOldestLocked() bool {
-	var oldestKey string
-	var oldestTime time.Time
-	for k, v := range c.entries {
-		if oldestKey == "" || v.fetchedAt.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = v.fetchedAt
+	for len(c.insertOrder) > 0 {
+		oldestKey := c.insertOrder[0]
+		c.insertOrder = c.insertOrder[1:]
+		if prev, ok := c.entries[oldestKey]; ok {
+			c.totalBytes -= len(prev.body)
+			delete(c.entries, oldestKey)
+			return true
 		}
+		// Key was already deleted (e.g. overwritten by set); skip to next.
 	}
-	if oldestKey == "" {
-		return false
-	}
-	if prev, ok := c.entries[oldestKey]; ok {
-		c.totalBytes -= len(prev.body)
-	}
-	delete(c.entries, oldestKey)
-	return true
+	return false
 }
 
 // set stores a response in the cache, evicting older entries until both the
@@ -223,17 +253,28 @@ func (c *missionsResponseCache) set(key string, entry *missionsCacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// If the key already exists, account for its old size before replacing.
+	// Note: we do NOT remove from insertOrder here; evictOldestLocked skips
+	// stale entries that are no longer in the map.
 	if prev, ok := c.entries[key]; ok {
 		c.totalBytes -= len(prev.body)
 		delete(c.entries, key)
 	}
 	// Evict oldest entries until both caps will be satisfied after insertion.
+	// #7132 — Guard against infinite loops: if len(entries)==0 but totalBytes
+	// somehow remains above the threshold (e.g. all 0-byte payloads), break
+	// immediately instead of spinning on an empty map.
 	for len(c.entries) >= missionsCacheMaxEntries || c.totalBytes+entrySize > missionsCacheMaxBytes {
+		if len(c.entries) == 0 {
+			// Nothing left to evict — reset totalBytes as a safety net.
+			c.totalBytes = 0
+			break
+		}
 		if !c.evictOldestLocked() {
 			break
 		}
 	}
 	c.entries[key] = entry
+	c.insertOrder = append(c.insertOrder, key)
 	c.totalBytes += entrySize
 }
 
@@ -373,6 +414,8 @@ func (h *MissionsHandler) RegisterRoutes(g fiber.Router) {
 func (h *MissionsHandler) RegisterPublicRoutes(g fiber.Router) {
 	g.Get("/browse", h.BrowseConsoleKB)
 	g.Get("/file", h.GetMissionFile)
+	g.Get("/scores", h.GetKBScores)
+	g.Get("/scores/:project/:id", h.GetMissionScore)
 }
 
 // githubGet makes a GET request to the GitHub API, falling back to unauthenticated if token is expired.
@@ -401,6 +444,9 @@ func (h *MissionsHandler) githubGet(url string, clientToken string) (*http.Respo
 	// retry without auth — the target repo is public
 	if hasToken && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) {
 		slog.Info("[missions] GitHub token returned error, retrying without auth", "status", resp.StatusCode, "url", url)
+		// #6823 — Drain the body before closing so the underlying TCP
+		// connection is returned to the pool for reuse (HTTP/1.1 keep-alive).
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck // best-effort drain
 		resp.Body.Close()
 		retryReq, err := http.NewRequest("GET", url, nil)
 		if err != nil {
@@ -420,6 +466,83 @@ func (h *MissionsHandler) githubGet(url string, clientToken string) (*http.Respo
 	return resp, nil
 }
 
+// cacheStatus indicates whether a fetchWithCache result came from a fresh cache
+// hit, a network fetch (cache miss), or a stale entry served during upstream errors.
+type cacheStatus string
+
+const (
+	cacheStatusHit   cacheStatus = "HIT"
+	cacheStatusMiss  cacheStatus = "MISS"
+	cacheStatusStale cacheStatus = "STALE"
+)
+
+// fetchWithCache encapsulates the common fetch-with-cache pattern used by GitHub wrappers.
+// It checks fresh cache, calls githubGet, drains/limits the body, and falls back to stale cache on upstream/rate-limit errors.
+// It does NOT store the final response in fresh cache (callers must do this to support transforming before caching).
+type githubFetchResult struct {
+	Body        []byte
+	StatusCode  int
+	ContentType string
+	CacheStatus cacheStatus
+}
+
+func (h *MissionsHandler) fetchWithCache(c *fiber.Ctx, cacheKey, url, logContext string, logArgs ...any) (*githubFetchResult, error) {
+	if cached := h.cache.get(cacheKey, missionsCacheTTL); cached != nil {
+		slog.Info("[missions] cache HIT "+logContext, logArgs...)
+		return &githubFetchResult{
+			Body:        cached.body,
+			StatusCode:  cached.statusCode,
+			ContentType: cached.contentType,
+			CacheStatus: cacheStatusHit,
+		}, nil
+	}
+
+	resp, err := h.githubGet(url, c.Get("X-GitHub-Token"))
+	if err != nil {
+		if stale := h.cache.getStale(cacheKey, missionsCacheStaleTTL); stale != nil {
+			slog.Error("[missions] upstream error, serving stale cache "+logContext, append(logArgs, "error", err)...)
+			return &githubFetchResult{
+				Body:        stale.body,
+				StatusCode:  stale.statusCode,
+				ContentType: stale.contentType,
+				CacheStatus: cacheStatusStale,
+			}, nil
+		}
+		var statusCode = http.StatusBadGateway
+		if resp != nil && resp.StatusCode > 0 {
+			statusCode = resp.StatusCode
+		}
+		return &githubFetchResult{StatusCode: statusCode}, fmt.Errorf("upstream request failed")
+	}
+	defer resp.Body.Close()
+
+	limitedBody := io.LimitReader(resp.Body, missionsMaxBodyBytes)
+	body, ioErr := io.ReadAll(limitedBody)
+	if ioErr != nil {
+		slog.Error("[missions] failed to read response body "+logContext, append(logArgs, "error", ioErr)...)
+		return &githubFetchResult{StatusCode: http.StatusInternalServerError}, fmt.Errorf("failed to read response body")
+	}
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		if stale := h.cache.getStale(cacheKey, missionsCacheStaleTTL); stale != nil {
+			slog.Info("[missions] rate-limited, serving stale cache "+logContext, append(logArgs, "status", resp.StatusCode)...)
+			return &githubFetchResult{
+				Body:        stale.body,
+				StatusCode:  stale.statusCode,
+				ContentType: stale.contentType,
+				CacheStatus: cacheStatusStale,
+			}, nil
+		}
+		return &githubFetchResult{StatusCode: resp.StatusCode}, fmt.Errorf("GitHub API rate limit exceeded — no cached data available")
+	}
+
+	return &githubFetchResult{
+		Body:        body,
+		StatusCode:  resp.StatusCode,
+		CacheStatus: cacheStatusMiss,
+	}, nil
+}
+
 // ---------- Browse knowledge base ----------
 
 // BrowseConsoleKB lists directory contents from the kubestellar/console-kb repo.
@@ -435,64 +558,60 @@ func (h *MissionsHandler) BrowseConsoleKB(c *fiber.Ctx) error {
 	}
 
 	cacheKey := "browse:" + path
-
-	// Check fresh cache first
-	if cached := h.cache.get(cacheKey, missionsCacheTTL); cached != nil {
-		slog.Info("[missions] cache HIT (browse)", "path", path)
-		c.Set("Content-Type", cached.contentType)
-		c.Set("X-Cache", "HIT")
-		return c.Status(cached.statusCode).Send(cached.body)
-	}
-
 	url := fmt.Sprintf("%s/repos/kubestellar/console-kb/contents/%s?ref=master", h.githubAPIURL, path)
 
-	resp, err := h.githubGet(url, c.Get("X-GitHub-Token"))
+	res, err := h.fetchWithCache(c, cacheKey, url, "(browse)", "path", path)
 	if err != nil {
-		// Upstream failed — try stale cache
-		if stale := h.cache.getStale(cacheKey, missionsCacheStaleTTL); stale != nil {
-			slog.Error("[missions] upstream error, serving stale cache (browse)", "path", path, "error", err)
-			c.Set("Content-Type", stale.contentType)
-			c.Set("X-Cache", "STALE")
-			return c.Status(stale.statusCode).Send(stale.body)
+		if res.StatusCode == http.StatusForbidden || res.StatusCode == http.StatusTooManyRequests {
+			return c.Status(res.StatusCode).JSON(fiber.Map{
+				"error":  err.Error(),
+				"status": res.StatusCode,
+				"code":   "rate_limited",
+			})
 		}
-		return c.Status(502).JSON(fiber.Map{"error": "upstream request failed"})
-	}
-	defer resp.Body.Close()
-
-	limitedBody := io.LimitReader(resp.Body, missionsMaxBodyBytes)
-	body, err := io.ReadAll(limitedBody)
-	if err != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read response body"})
+		return c.Status(res.StatusCode).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Rate-limited — serve stale cache if available
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-		if stale := h.cache.getStale(cacheKey, missionsCacheStaleTTL); stale != nil {
-			slog.Info("[missions] rate-limited, serving stale cache (browse)", "status", resp.StatusCode, "path", path)
-			c.Set("Content-Type", stale.contentType)
-			c.Set("X-Cache", "STALE")
-			return c.Status(stale.statusCode).Send(stale.body)
-		}
-		return c.Status(resp.StatusCode).JSON(fiber.Map{
-			"error":  "GitHub API rate limit exceeded — no cached data available",
-			"status": resp.StatusCode,
-			"code":   "rate_limited",
-		})
+	if res.CacheStatus != cacheStatusMiss {
+		c.Set("Content-Type", res.ContentType)
+		c.Set("X-Cache", string(res.CacheStatus))
+		return c.Status(res.StatusCode).Send(res.Body)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if res.StatusCode != http.StatusOK {
 		code := "github_error"
-		if resp.StatusCode == http.StatusUnauthorized {
+		if res.StatusCode == http.StatusUnauthorized {
 			code = "token_invalid"
 		}
-		return c.Status(resp.StatusCode).JSON(fiber.Map{"error": "GitHub API error", "status": resp.StatusCode, "code": code})
+		return c.Status(res.StatusCode).JSON(fiber.Map{"error": "GitHub API error", "status": res.StatusCode, "code": code})
 	}
 
-	// GitHub returns type:"dir", frontend expects type:"directory" — transform
+	body := res.Body
+
+	// GitHub returns type:"dir", frontend expects type:"directory" — transform.
+	// #6818 — If the path points to a file (not a directory), GitHub returns a
+	// JSON object instead of an array. json.Unmarshal into a slice will fail.
+	// Previously the handler forwarded the raw GitHub body, which has a
+	// different shape ({name, path, type:"file", content, ...}) than the
+	// normalized [{name, path, type, size}] the frontend expects — causing
+	// BrowseMissions to crash when it tries to .map() over an object. Return
+	// a structured 400 error instead, and skip the cache so subsequent
+	// requests with the corrected path aren't penalized.
+	// #7134 — GitHub returns a JSON object for single files and a JSON array
+	// for directories. Previously the handler returned a 400 error when the
+	// response was an object, crashing frontend iterators. Now we attempt to
+	// unmarshal as an array first; if that fails, try a single object and wrap
+	// it in an array so the frontend always receives a consistent shape.
 	var ghEntries []map[string]interface{}
 	if err := json.Unmarshal(body, &ghEntries); err != nil {
-		c.Set("Content-Type", "application/json")
-		return c.Send(body)
+		var single map[string]interface{}
+		if singleErr := json.Unmarshal(body, &single); singleErr != nil {
+			return c.Status(400).JSON(fiber.Map{
+				"error": "path is a file, not a directory",
+				"code":  "not_a_directory",
+			})
+		}
+		ghEntries = []map[string]interface{}{single}
 	}
 
 	// Files and directories to hide from the browser UI — infrastructure
@@ -573,70 +692,45 @@ func (h *MissionsHandler) GetMissionFile(c *fiber.Ctx) error {
 	}
 
 	cacheKey := "file:" + ref + ":" + path
-
-	// Check fresh cache first
-	if cached := h.cache.get(cacheKey, missionsCacheTTL); cached != nil {
-		slog.Info("[missions] cache HIT (file)", "ref", ref, "path", path)
-		c.Set("Content-Type", cached.contentType)
-		c.Set("X-Cache", "HIT")
-		return c.Status(cached.statusCode).Send(cached.body)
-	}
-
 	url := fmt.Sprintf("%s/kubestellar/console-kb/%s/%s", h.githubRawURL, ref, path)
 
-	resp, err := h.githubGet(url, c.Get("X-GitHub-Token"))
+	res, err := h.fetchWithCache(c, cacheKey, url, "(file)", "ref", ref, "path", path)
 	if err != nil {
-		// Upstream failed — try stale cache
-		if stale := h.cache.getStale(cacheKey, missionsCacheStaleTTL); stale != nil {
-			slog.Error("[missions] upstream error, serving stale cache (file)", "ref", ref, "path", path, "error", err)
-			c.Set("Content-Type", stale.contentType)
-			c.Set("X-Cache", "STALE")
-			return c.Status(stale.statusCode).Send(stale.body)
+		if res.StatusCode == http.StatusForbidden || res.StatusCode == http.StatusTooManyRequests {
+			return c.Status(res.StatusCode).JSON(fiber.Map{
+				"error":  err.Error(),
+				"status": res.StatusCode,
+				"code":   "rate_limited",
+			})
 		}
-		return c.Status(502).JSON(fiber.Map{"error": "upstream request failed"})
-	}
-	defer resp.Body.Close()
-
-	limitedBody := io.LimitReader(resp.Body, missionsMaxBodyBytes)
-	body, err := io.ReadAll(limitedBody)
-	if err != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read response body"})
+		return c.Status(res.StatusCode).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Rate-limited — serve stale cache if available
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-		if stale := h.cache.getStale(cacheKey, missionsCacheStaleTTL); stale != nil {
-			slog.Info("[missions] rate-limited, serving stale cache (file)", "status", resp.StatusCode, "ref", ref, "path", path)
-			c.Set("Content-Type", stale.contentType)
-			c.Set("X-Cache", "STALE")
-			return c.Status(stale.statusCode).Send(stale.body)
-		}
-		return c.Status(resp.StatusCode).JSON(fiber.Map{
-			"error":  "GitHub API rate limit exceeded — no cached data available",
-			"status": resp.StatusCode,
-			"code":   "rate_limited",
-		})
+	if res.CacheStatus != cacheStatusMiss {
+		c.Set("Content-Type", res.ContentType)
+		c.Set("X-Cache", string(res.CacheStatus))
+		return c.Status(res.StatusCode).Send(res.Body)
 	}
 
-	if resp.StatusCode == http.StatusNotFound {
+	if res.StatusCode == http.StatusNotFound {
 		return c.Status(404).JSON(fiber.Map{"error": "file not found"})
 	}
-	if resp.StatusCode != http.StatusOK {
-		return c.Status(resp.StatusCode).JSON(fiber.Map{"error": "GitHub raw content error"})
+	if res.StatusCode != http.StatusOK {
+		return c.Status(res.StatusCode).JSON(fiber.Map{"error": "GitHub raw content error"})
 	}
 
 	// Cache the successful response
 	h.cache.set(cacheKey, &missionsCacheEntry{
-		body:        body,
+		body:        res.Body,
 		contentType: "text/plain",
 		statusCode:  http.StatusOK,
 		fetchedAt:   time.Now(),
 	})
-	slog.Info("[missions] cache MISS, stored (file)", "ref", ref, "path", path, "bytes", len(body))
+	slog.Info("[missions] cache MISS, stored (file)", "ref", ref, "path", path, "bytes", len(res.Body))
 
 	c.Set("Content-Type", "text/plain")
 	c.Set("X-Cache", "MISS")
-	return c.Send(body)
+	return c.Status(res.StatusCode).Send(res.Body)
 }
 
 // ---------- Validate a mission ----------
@@ -660,7 +754,9 @@ func (h *MissionsHandler) ValidateMission(c *fiber.Ctx) error {
 	if len(body) == 0 {
 		return c.Status(400).JSON(fiber.Map{"valid": false, "errors": []string{"empty body"}})
 	}
-	if len(body) > missionsMaxBodyBytes {
+	// Use the tighter missionsValidateMaxBytes instead of the general
+	// missionsMaxBodyBytes — mission JSON metadata is always small (#6820).
+	if len(body) > missionsValidateMaxBytes {
 		return c.Status(413).JSON(fiber.Map{"valid": false, "errors": []string{"payload too large"}})
 	}
 
@@ -684,6 +780,146 @@ func (h *MissionsHandler) ValidateMission(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"valid": false, "errors": errs})
 	}
 	return c.JSON(fiber.Map{"valid": true})
+}
+
+// ---------- Score Exposure ----------
+
+type indexJsonFormat struct {
+	Version  int `json:"version"`
+	Count    int `json:"count"`
+	Missions []struct {
+		Path               string      `json:"path"`
+		Title              string      `json:"title"`
+		Description        string      `json:"description"`
+		QualityScore       *int        `json:"qualityScore"`
+		QualityPass        *bool       `json:"qualityPass"`
+		QualityIssues      []string    `json:"qualityIssues"`
+		QualitySuggestions []string    `json:"qualitySuggestions"`
+		QualityBreakdown   interface{} `json:"qualityBreakdown"`
+		CncfProjects       []string    `json:"cncfProjects"`
+	} `json:"missions"`
+}
+
+func (h *MissionsHandler) fetchMissionIndex(c *fiber.Ctx) (*indexJsonFormat, error) {
+	cacheKey := "index:master:fixes/index.json"
+	url := fmt.Sprintf("%s/kubestellar/console-kb/master/fixes/index.json", h.githubRawURL)
+
+	res, err := h.fetchWithCache(c, cacheKey, url, "(index json)")
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch index: %v", err)
+	}
+
+	var body = res.Body
+	if res.CacheStatus == cacheStatusMiss {
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("GitHub raw content error")
+		}
+
+		h.cache.set(cacheKey, &missionsCacheEntry{
+			body:        res.Body,
+			contentType: "application/json",
+			statusCode:  http.StatusOK,
+			fetchedAt:   time.Now(),
+		})
+		slog.Info("[missions] cache MISS, stored (index json)", "bytes", len(res.Body))
+	}
+
+	var index indexJsonFormat
+	if err := json.Unmarshal(body, &index); err != nil {
+		slog.Error("[missions] failed to parse index json", "error", err)
+		return nil, fmt.Errorf("failed to parse index")
+	}
+	return &index, nil
+}
+
+// GetKBScores fetches scores across projects
+// GET /api/missions/scores
+func (h *MissionsHandler) GetKBScores(c *fiber.Ctx) error {
+	if isDemoMode(c) {
+		return c.JSON(fiber.Map{"count": 1, "scores": []fiber.Map{
+			{
+				"path":         "fixes/demo/demo-123.json",
+				"title":        "Demo Mission",
+				"project":      "demo",
+				"qualityScore": 85,
+				"qualityPass":  true,
+			},
+		}})
+	}
+	index, err := h.fetchMissionIndex(c)
+	if err != nil {
+		return c.Status(502).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Filter just the scoring related fields
+	results := make([]fiber.Map, 0)
+	for _, m := range index.Missions {
+		if m.QualityScore != nil {
+			project := "unknown"
+			if len(m.CncfProjects) > 0 {
+				project = m.CncfProjects[0]
+			}
+			results = append(results, fiber.Map{
+				"path":         m.Path,
+				"title":        m.Title,
+				"project":      project,
+				"qualityScore": m.QualityScore,
+				"qualityPass":  m.QualityPass,
+			})
+		}
+	}
+
+	return c.JSON(fiber.Map{"count": len(results), "scores": results})
+}
+
+// GetMissionScore fetches score breakdown for a specific entry
+// GET /api/missions/scores/:project/:id
+func (h *MissionsHandler) GetMissionScore(c *fiber.Ctx) error {
+	if isDemoMode(c) {
+		return c.JSON(fiber.Map{
+			"path":               "fixes/demo/demo-123.json",
+			"project":            "demo",
+			"title":              "Demo Mission",
+			"qualityScore":       85,
+			"qualityBreakdown":   map[string]interface{}{"structure": 90, "completeness": 80},
+			"qualityIssues":      []string{},
+			"qualitySuggestions": []string{"Improve context"},
+		})
+	}
+
+	project := c.Params("project")
+	id := c.Params("id")
+
+	index, err := h.fetchMissionIndex(c)
+	if err != nil {
+		return c.Status(502).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	for _, m := range index.Missions {
+		mProject := "unknown"
+		if len(m.CncfProjects) > 0 {
+			mProject = m.CncfProjects[0]
+		}
+		// Match by project and filename. Accept both "foo" and "foo.json" from
+		// callers so URL construction on the frontend is flexible.
+		mBase := path.Base(m.Path)
+		if mProject == project && (strings.TrimSuffix(mBase, ".json") == strings.TrimSuffix(id, ".json")) {
+			if m.QualityScore == nil {
+				return c.Status(404).JSON(fiber.Map{"error": "Mission found but has no score associated"})
+			}
+			return c.JSON(fiber.Map{
+				"path":               m.Path,
+				"project":            mProject,
+				"title":              m.Title,
+				"qualityScore":       m.QualityScore,
+				"qualityBreakdown":   m.QualityBreakdown,
+				"qualityIssues":      m.QualityIssues,
+				"qualitySuggestions": m.QualitySuggestions,
+			})
+		}
+	}
+
+	return c.Status(404).JSON(fiber.Map{"error": "KB mission not found"})
 }
 
 // ---------- Share to Slack ----------
@@ -768,6 +1004,12 @@ func (h *MissionsHandler) ShareToSlack(c *fiber.Ctx) error {
 	if req.Text == "" {
 		return c.Status(400).JSON(fiber.Map{"error": "text is required"})
 	}
+	// #6817 — Cap outbound Slack message size. Without this, a caller can
+	// POST a multi-MB text body that gets serialized into the Slack webhook
+	// payload and buffered in-process.
+	if len(req.Text) > slackMaxTextBytes {
+		return c.Status(400).JSON(fiber.Map{"error": fmt.Sprintf("text exceeds maximum size (%d bytes)", slackMaxTextBytes)})
+	}
 
 	payload, err := json.Marshal(map[string]string{"text": req.Text})
 	if err != nil {
@@ -786,6 +1028,10 @@ func (h *MissionsHandler) ShareToSlack(c *fiber.Ctx) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// #6817 — Drain the response body before returning so the underlying
+		// TCP connection can be reused by the transport pool. defer Close()
+		// alone does not guarantee the body is fully consumed.
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return c.Status(502).JSON(fiber.Map{"error": fmt.Sprintf("slack returned status %d", resp.StatusCode)})
 	}
 	return c.JSON(fiber.Map{"success": true})
@@ -870,6 +1116,7 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	}
 	forkReq.Header.Set("Authorization", "Bearer "+token)
 	forkReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	forkReq.Header.Set("Content-Type", "application/json") // #7133 — required by GitHub API
 	forkResp, err := h.httpClient.Do(forkReq)
 	if err != nil {
 		return c.Status(502).JSON(fiber.Map{"error": "failed to fork repo"})
@@ -877,6 +1124,8 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	defer forkResp.Body.Close()
 
 	if forkResp.StatusCode < 200 || forkResp.StatusCode >= 300 {
+		// #7137 — Drain response body so the TCP connection returns to the pool.
+		io.Copy(io.Discard, forkResp.Body) //nolint:errcheck // best-effort drain
 		return c.Status(502).JSON(fiber.Map{"error": fmt.Sprintf("GitHub fork failed with status %d", forkResp.StatusCode)})
 	}
 	var forkData map[string]interface{}
@@ -884,8 +1133,8 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 		return c.Status(502).JSON(fiber.Map{"error": "failed to decode fork response"})
 	}
 	forkFullName, _ := forkData["full_name"].(string)
-	if forkFullName == "" {
-		return c.Status(502).JSON(fiber.Map{"error": "fork response missing full_name"})
+	if forkFullName == "" || !strings.Contains(forkFullName, "/") {
+		return c.Status(502).JSON(fiber.Map{"error": "fork response missing or malformed full_name"})
 	}
 
 	// Detect the target repo's default branch (e.g. "main", "master", or custom).
@@ -898,6 +1147,36 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 		}
 	} else if db, ok := forkData["default_branch"].(string); ok && db != "" {
 		defaultBranch = db
+	}
+
+	// #7135 — Always query the upstream repo for its default branch. The fork
+	// response's parent.default_branch or default_branch fields may disagree
+	// with the actual upstream value (e.g. a fork created before a rename from
+	// "master" to "main"). Querying the upstream is the only reliable source.
+	// Previously this only fired when defaultBranch == "main", missing repos
+	// that use "master", "trunk", or other non-default names (#6795).
+	{
+		upstreamURL := fmt.Sprintf("%s/repos/%s", h.githubAPIURL, req.Repo)
+		upstreamReq, err := http.NewRequest("GET", upstreamURL, nil)
+		if err == nil {
+			upstreamReq.Header.Set("Authorization", "Bearer "+token)
+			upstreamReq.Header.Set("Accept", "application/vnd.github.v3+json")
+			upstreamResp, err := h.httpClient.Do(upstreamReq)
+			if err == nil {
+				defer upstreamResp.Body.Close()
+				if upstreamResp.StatusCode == http.StatusOK {
+					var repoData map[string]interface{}
+					if json.NewDecoder(upstreamResp.Body).Decode(&repoData) == nil {
+						if db, ok := repoData["default_branch"].(string); ok && db != "" {
+							defaultBranch = db
+						}
+					}
+				} else {
+					// #7137 — Drain on non-200 so TCP connection is reused.
+					io.Copy(io.Discard, upstreamResp.Body) //nolint:errcheck
+				}
+			}
+		}
 	}
 
 	// Step 2: Get HEAD SHA from fork's default branch, then create new branch ref.
@@ -934,11 +1213,21 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 			}
 		}
 
-		// If this is not the last attempt, wait before retrying
+		// If this is not the last attempt, wait before retrying.
+		// Use select with context cancellation so the retry is
+		// abortable when the client disconnects (#6819).
 		if attempt < forkHeadSHAMaxRetries-1 {
 			slog.Info("[missions] fork HEAD SHA not yet available, retrying",
 				"attempt", attempt+1, "maxRetries", forkHeadSHAMaxRetries, "status", mainRefResp.StatusCode, "backoff", backoff)
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+				// backoff elapsed, continue to next attempt
+			case <-c.UserContext().Done():
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "request cancelled while waiting for fork to initialize",
+					"code":  "request_cancelled",
+				})
+			}
 			backoff = time.Duration(float64(backoff) * forkHeadSHABackoffMultiplier)
 		}
 	}
@@ -970,13 +1259,18 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	}
 	refReq.Header.Set("Authorization", "Bearer "+token)
 	refReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	refReq.Header.Set("Content-Type", "application/json") // #7133 — required by GitHub API
 	branchResp, err := h.httpClient.Do(refReq)
 	if err != nil {
 		return c.Status(502).JSON(fiber.Map{"error": "failed to create branch ref"})
 	}
 	defer branchResp.Body.Close()
 	if branchResp.StatusCode < 200 || branchResp.StatusCode >= 300 {
-		// 422 (Unprocessable Entity) means the branch already exists, which is acceptable
+		// 422 (Unprocessable Entity) means the branch already exists, which is acceptable.
+		// #6835 — Eagerly drain the response body so the underlying HTTP/1.1
+		// connection is returned to the pool immediately instead of waiting for
+		// the deferred Close at function return (which may be 3+ HTTP calls later).
+		io.Copy(io.Discard, branchResp.Body) //nolint:errcheck // best-effort drain
 		if branchResp.StatusCode != http.StatusUnprocessableEntity {
 			return c.Status(502).JSON(fiber.Map{"error": fmt.Sprintf("GitHub branch creation failed with status %d", branchResp.StatusCode)})
 		}
@@ -998,6 +1292,7 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	}
 	fileReq.Header.Set("Authorization", "Bearer "+token)
 	fileReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	fileReq.Header.Set("Content-Type", "application/json") // #6842 — required by GitHub Contents API
 	fileResp, err := h.httpClient.Do(fileReq)
 	if err != nil {
 		return c.Status(502).JSON(fiber.Map{"error": "failed to commit file"})
@@ -1006,6 +1301,8 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 
 	// Validate commit response status (#2384) and content (#2381)
 	if fileResp.StatusCode < 200 || fileResp.StatusCode >= 300 {
+		// #7137 — Drain response body so the TCP connection returns to the pool.
+		io.Copy(io.Discard, fileResp.Body) //nolint:errcheck // best-effort drain
 		return c.Status(502).JSON(fiber.Map{"error": fmt.Sprintf("GitHub commit failed with status %d", fileResp.StatusCode)})
 	}
 	var commitData map[string]interface{}
@@ -1023,7 +1320,7 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	prURL := fmt.Sprintf("%s/repos/%s/pulls", h.githubAPIURL, req.Repo)
 	prPayload, err := json.Marshal(map[string]interface{}{
 		"title": req.Message,
-		"head":  strings.Split(forkFullName, "/")[0] + ":" + req.Branch,
+		"head":  strings.SplitN(forkFullName, "/", 2)[0] + ":" + req.Branch, // #7138 — SplitN guards against missing "/"
 		"base":  defaultBranch,
 		"body":  "Mission shared via KubeStellar Console",
 	})
@@ -1036,6 +1333,7 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	}
 	prReq.Header.Set("Authorization", "Bearer "+token)
 	prReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	prReq.Header.Set("Content-Type", "application/json") // #7133 — required by GitHub API
 	prResp, err := h.httpClient.Do(prReq)
 	if err != nil {
 		return c.Status(502).JSON(fiber.Map{"error": "failed to create PR"})
@@ -1044,6 +1342,8 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 
 	// Validate PR creation response (#2384)
 	if prResp.StatusCode < 200 || prResp.StatusCode >= 300 {
+		// #7137 — Drain response body so the TCP connection returns to the pool.
+		io.Copy(io.Discard, prResp.Body) //nolint:errcheck // best-effort drain
 		return c.Status(502).JSON(fiber.Map{"error": fmt.Sprintf("GitHub PR creation failed with status %d", prResp.StatusCode)})
 	}
 	var prData map[string]interface{}
@@ -1054,6 +1354,10 @@ func (h *MissionsHandler) ShareToGitHub(c *fiber.Ctx) error {
 	if prHTMLURL == "" {
 		return c.Status(502).JSON(fiber.Map{"error": "GitHub PR response missing html_url"})
 	}
+
+	// #9890: persist audit entry after successful external PR creation.
+	audit.Log(c, audit.ActionShareMissionGitHub, "mission", req.FilePath,
+		fmt.Sprintf("repo=%s branch=%s fork=%s pr=%s", req.Repo, req.Branch, forkFullName, prHTMLURL))
 
 	return c.JSON(fiber.Map{
 		"success": true,

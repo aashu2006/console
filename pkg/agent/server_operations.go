@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -23,7 +24,7 @@ func (s *Server) handleSettingsKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -56,7 +57,7 @@ func (s *Server) handleSettingsKeyByProvider(w http.ResponseWriter, r *http.Requ
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -121,7 +122,7 @@ func (s *Server) handleSettingsAll(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -187,7 +188,7 @@ func (s *Server) handleSettingsExport(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -231,7 +232,7 @@ func (s *Server) handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "PUT, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -270,22 +271,57 @@ func (s *Server) handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Settings imported"})
 }
 
-// handleGetKeysStatus returns the status of all API keys (without exposing the actual keys)
+// handleGetKeysStatus returns the status of all API keys (without exposing the actual keys).
+//
+// The list covers the nine chat-only HTTP providers registered in
+// InitializeProviders (pkg/agent/registry.go): three OpenAI-compatible
+// gateway providers (Groq, OpenRouter, Open WebUI) and six local LLM
+// runners (Ollama, llama.cpp, LocalAI, vLLM, LM Studio, Red Hat AI
+// Inference Server). CLI-based tool-capable agents (claude-code, bob,
+// codex, gemini-cli, antigravity, goose, copilot-cli) are deliberately
+// omitted — they manage their own credentials and do not need an API
+// key in ~/.kc/config.yaml.
+//
+// Each entry includes the current BaseURL + BaseURLEnvVar so the
+// frontend Settings modal can offer a per-provider base URL override
+// field without needing to hardcode the mapping.
 func (s *Server) handleGetKeysStatus(w http.ResponseWriter, r *http.Request) {
 	cm := GetConfigManager()
 
-	// Build provider list dynamically from registry
-	// Include all providers that accept API keys (exclude pure CLI providers like bob, claude-code)
 	type providerDef struct {
 		name        string
 		displayName string
+		// validationRequired is true for providers that have a working
+		// validation endpoint (Groq, OpenRouter). Local LLM runners
+		// typically have no authentication, so attempting to validate
+		// their placeholder sentinel key against a real endpoint is
+		// pointless — we report Configured=true whenever a URL is set.
+		validationRequired bool
+		// isLocalLLM marks URL-driven providers (Ollama, llama.cpp, etc.)
+		// whose "configured" status is derived from URL presence rather
+		// than API key presence. This also drives the BaseURL resolution
+		// to include compiled-in defaults so the UI shows the current
+		// effective endpoint (#8259).
+		isLocalLLM bool
+		// defaultURL is the compiled-in loopback URL (e.g. Ollama on
+		// 127.0.0.1:11434). Empty for providers with no default.
+		defaultURL string
 	}
 
-	// Only show CLI-based agents — API-key-driven agents are hidden because
-	// they cannot execute commands to diagnose/repair clusters.
-	// This list is intentionally empty; the keys endpoint remains functional
-	// for any future API providers but currently returns no keys.
-	providers := []providerDef{}
+	providers := []providerDef{
+		// OpenAI-compatible gateways with real API keys
+		{name: "groq", displayName: "Groq", validationRequired: true},
+		{name: "openrouter", displayName: "OpenRouter", validationRequired: true},
+		{name: "open-webui", displayName: "Open WebUI", validationRequired: false},
+		// Local LLM runners — URL-driven, no API key by default.
+		// isLocalLLM=true changes Configured semantics: URL-present counts.
+		{name: ProviderKeyOllama, displayName: "Ollama (Local)", isLocalLLM: true, defaultURL: defaultOllamaURL},
+		{name: ProviderKeyLlamaCpp, displayName: "llama.cpp (Local)", isLocalLLM: true},
+		{name: ProviderKeyLocalAI, displayName: "LocalAI (Local)", isLocalLLM: true},
+		{name: ProviderKeyVLLM, displayName: "vLLM (Local)", isLocalLLM: true},
+		{name: ProviderKeyLMStudio, displayName: "LM Studio (Local)", isLocalLLM: true, defaultURL: defaultLMStudioURL},
+		{name: ProviderKeyRHAIIS, displayName: "Red Hat AI Inference Server", isLocalLLM: true},
+	}
 
 	keys := make([]KeyStatus, 0, len(providers))
 	for _, p := range providers {
@@ -295,6 +331,31 @@ func (s *Server) handleGetKeysStatus(w http.ResponseWriter, r *http.Request) {
 			Configured:  cm.HasAPIKey(p.name),
 		}
 
+		// Base URL metadata — surfaces the fully-resolved value (env →
+		// config → compiled default) and the env var name so the UI can
+		// render an Advanced expandable section.
+		status.BaseURL = cm.GetBaseURL(p.name)
+		status.BaseURLEnvVar = getBaseURLEnvKeyForProvider(p.name)
+		if status.BaseURLEnvVar != "" && os.Getenv(status.BaseURLEnvVar) != "" {
+			status.BaseURLSource = "env"
+		} else if status.BaseURL != "" {
+			status.BaseURLSource = "config"
+		}
+		// For local LLM runners, fall through to the compiled-in default
+		// so the UI always shows the effective endpoint (#8259). Leave
+		// BaseURLSource empty here — per KeyStatus docs, empty signals
+		// "the resolved value is the compiled-in default" (the UI treats
+		// empty as "default" without needing a separate enum value).
+		if p.isLocalLLM && status.BaseURL == "" && p.defaultURL != "" {
+			status.BaseURL = p.defaultURL
+		}
+		// Local LLM runners are "configured" when a URL is reachable —
+		// either via env/config override or compiled-in default. Having
+		// only a sentinel placeholder API key is not enough (#8259).
+		if p.isLocalLLM {
+			status.Configured = status.BaseURL != ""
+		}
+
 		if status.Configured {
 			if cm.IsFromEnv(p.name) {
 				status.Source = "env"
@@ -302,30 +363,48 @@ func (s *Server) handleGetKeysStatus(w http.ResponseWriter, r *http.Request) {
 				status.Source = "config"
 			}
 
-			// Test if the key is valid
-			valid, err := s.validateAPIKey(p.name)
-			status.Valid = &valid
-			// Cache the validity for IsAvailable() checks
-			cm.SetKeyValidity(p.name, valid)
-			if err != nil {
-				slog.Error("API key validation error", "provider", p.name, "error", err)
-				status.Error = "validation failed"
+			if p.validationRequired {
+				// Test if the key is valid — validateAPIKey honors the
+				// base URL override via the per-provider resolver, so
+				// pointing a Groq config at a local Ollama validates
+				// against the local endpoint.
+				valid, err := s.validateAPIKey(p.name)
+				status.Valid = &valid
+				cm.SetKeyValidity(p.name, valid)
+				if err != nil {
+					slog.Error("API key validation error", "provider", p.name, "error", err)
+					status.Error = "validation failed"
+				}
 			}
 		}
 
 		keys = append(keys, status)
 	}
 
+	// Include the live provider registry so the frontend settings UI can
+	// filter its display to only show providers that are actually
+	// registered in the backend, eliminating the hardcoded mismatch (#9488).
+	listRegistry := s.registry
+	if listRegistry == nil {
+		listRegistry = GetRegistry()
+	}
+	registeredProviders := listRegistry.List()
+
 	json.NewEncoder(w).Encode(KeysStatusResponse{
-		Keys:       keys,
-		ConfigPath: cm.GetConfigPath(),
+		Keys:                keys,
+		ConfigPath:          cm.GetConfigPath(),
+		RegisteredProviders: registeredProviders,
 	})
 }
 
-// handleSetKey saves a new API key
+// handleSetKey saves an API key, a model preference, a base URL override,
+// or any combination of the three for a provider. Setting BaseURL alone
+// (no APIKey) is the common path for unauthenticated local LLM runners —
+// operators point Ollama at a LAN server by saving `OLLAMA_URL` via this
+// endpoint rather than editing a shell profile.
 func (s *Server) handleSetKey(w http.ResponseWriter, r *http.Request) {
 	var req SetKeyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "invalid_json", Message: "Invalid JSON body"})
 		return
@@ -337,35 +416,85 @@ func (s *Server) handleSetKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.APIKey == "" {
+	// Reject unknown provider names so typos don't create orphaned config
+	// entries (#10060). Prefer the server's injected registry so tests
+	// validate against the active provider set for this server instance.
+	registry := s.registry
+	if registry == nil {
+		registry = GetRegistry()
+	}
+	if _, err := registry.Get(req.Provider); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "missing_key", Message: "API key required"})
+		json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "unknown_provider", Message: fmt.Sprintf("Provider %q is not registered", req.Provider)})
 		return
 	}
 
-	// Validate the key before saving
-	valid, validationErr := s.validateAPIKeyValue(req.Provider, req.APIKey)
-	if !valid {
+	// At least one actionable field must be present — a request with none
+	// is a programming bug we should reject rather than silently store
+	// nothing. ClearBaseURL counts as actionable (it reverts the URL to
+	// the compiled-in default).
+	if req.APIKey == "" && req.BaseURL == "" && req.Model == "" && !req.ClearBaseURL {
 		w.WriteHeader(http.StatusBadRequest)
-		if validationErr != nil {
-			slog.Error("API key validation error", "error", validationErr)
-		}
-		json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "invalid_key", Message: "Invalid API key"})
+		json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "missing_field", Message: "At least one of apiKey, baseURL, model, or clearBaseURL is required"})
 		return
 	}
 
 	cm := GetConfigManager()
 
-	// Save the key
-	if err := cm.SetAPIKey(req.Provider, req.APIKey); err != nil {
-		slog.Error("save API key error", "error", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "save_failed", Message: "failed to save API key"})
-		return
+	// Base URL can be saved independently and does not need validation —
+	// operators point at local runners that the reachability/validation
+	// check cannot test meaningfully (the sentinel "local-llm-no-auth" key
+	// is not a real credential). Save first so that subsequent API-key
+	// validation below uses the updated endpoint.
+	if req.BaseURL != "" {
+		if err := validateBaseURL(req.BaseURL); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "invalid_base_url", Message: err.Error()})
+			return
+		}
+		if err := cm.SetBaseURL(req.Provider, req.BaseURL); err != nil {
+			slog.Error("save base URL error", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "save_failed", Message: "failed to save base URL"})
+			return
+		}
+		// Invalidate cached validity for this provider — the endpoint
+		// changed, so any previously-cached "key valid" result is stale.
+		cm.InvalidateKeyValidity(req.Provider)
+	} else if req.ClearBaseURL {
+		// Explicit clear: remove the persisted base URL override so the
+		// provider reverts to its compiled-in default URL (#8259).
+		if err := cm.RemoveBaseURL(req.Provider); err != nil {
+			slog.Error("clear base URL error", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "save_failed", Message: "failed to clear base URL"})
+			return
+		}
+		cm.InvalidateKeyValidity(req.Provider)
 	}
 
-	// Cache validity (we validated before saving)
-	cm.SetKeyValidity(req.Provider, true)
+	if req.APIKey != "" {
+		// Validate the key before saving. Validation uses the provider's
+		// now-current base URL, so pointing Groq at a local Ollama works.
+		valid, validationErr := s.validateAPIKeyValue(req.Provider, req.APIKey)
+		if !valid {
+			w.WriteHeader(http.StatusBadRequest)
+			if validationErr != nil {
+				slog.Error("API key validation error", "error", validationErr)
+			}
+			json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "invalid_key", Message: "Invalid API key"})
+			return
+		}
+
+		if err := cm.SetAPIKey(req.Provider, req.APIKey); err != nil {
+			slog.Error("save API key error", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(protocol.ErrorPayload{Code: "save_failed", Message: "failed to save API key"})
+			return
+		}
+
+		cm.SetKeyValidity(req.Provider, true)
+	}
 
 	// Save model if provided
 	if req.Model != "" {
@@ -377,12 +506,29 @@ func (s *Server) handleSetKey(w http.ResponseWriter, r *http.Request) {
 	// Refresh provider availability
 	s.refreshProviderAvailability()
 
-	slog.Info("API key configured", "provider", req.Provider)
+	slog.Info("provider configured", "provider", req.Provider, "hasKey", req.APIKey != "", "hasBaseURL", req.BaseURL != "", "hasModel", req.Model != "")
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":  true,
 		"provider": req.Provider,
-		"valid":    true,
 	})
+}
+
+// validateBaseURL performs a syntactic check on a base URL before it is
+// saved. This is not a reachability test — local runners may not be
+// running at the time the operator configures them. The goal is only to
+// reject obvious typos (missing scheme, whitespace, non-http(s) scheme).
+func validateBaseURL(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fmt.Errorf("base URL is empty")
+	}
+	if strings.ContainsAny(s, " \t\n\r") {
+		return fmt.Errorf("base URL must not contain whitespace")
+	}
+	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+		return fmt.Errorf("base URL must start with http:// or https://")
+	}
+	return nil
 }
 
 // validateAPIKey tests if the configured key for a provider works
@@ -400,7 +546,7 @@ func (s *Server) validateAPIKeyValue(provider, apiKey string) (bool, error) {
 	if s.SkipKeyValidation {
 		return true, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), perKeyValidationTimeout)
 	defer cancel()
 
 	switch provider {
@@ -410,6 +556,10 @@ func (s *Server) validateAPIKeyValue(provider, apiKey string) (bool, error) {
 		return validateOpenAIKey(ctx, apiKey)
 	case "gemini", "google":
 		return validateGeminiKey(ctx, apiKey)
+	case "openrouter":
+		return validateOpenRouterKey(ctx, apiKey)
+	case "groq":
+		return validateGroqKey(ctx, apiKey)
 	default:
 		// For IDE/app providers (cursor, windsurf, cline, etc.)
 		// we accept the key without validation since we don't have
@@ -429,35 +579,61 @@ func (s *Server) refreshProviderAvailability() {
 	GetConfigManager().Load()
 }
 
-// ValidateAllKeys validates all configured API keys and caches results
-// This should be called on server startup to detect invalid keys early
+// perKeyValidationTimeout is the timeout for each individual API key validation request.
+const perKeyValidationTimeout = 15 * time.Second
+
+// maxConcurrentValidations limits how many provider keys are validated simultaneously
+// to avoid hammering all providers at once.
+const maxConcurrentValidations = 5
+
+// ValidateAllKeys validates all configured API keys and caches results.
+// Validations run in parallel (bounded by maxConcurrentValidations) to avoid
+// sequential delays on startup when many providers are configured.
 func (s *Server) ValidateAllKeys() {
 	cm := GetConfigManager()
-	providers := []string{"claude", "openai", "gemini", "cursor", "vscode", "windsurf", "cline", "jetbrains", "zed", "continue", "raycast", "open-webui"}
+	providers := []string{"claude", "openai", "gemini", "openrouter", "groq", "cursor", "vscode", "windsurf", "cline", "jetbrains", "zed", "continue", "raycast", "open-webui"}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxConcurrentValidations)
 
 	for _, provider := range providers {
-		if cm.HasAPIKey(provider) {
-			// Check if we already know the validity
-			if valid := cm.IsKeyValid(provider); valid != nil {
-				continue // Already validated
-			}
-			// Validate the key
-			slog.Info("validating API key", "provider", provider)
-			valid, err := s.validateAPIKey(provider)
+		if !cm.HasAPIKey(provider) {
+			continue
+		}
+		// Check if we already know the validity
+		if valid := cm.IsKeyValid(provider); valid != nil {
+			continue // Already validated
+		}
+
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			sem <- struct{}{}        // acquire semaphore slot
+			defer func() { <-sem }() // release semaphore slot
+
+			slog.Info("validating API key", "provider", p)
+			valid, err := s.validateAPIKey(p)
+
+			mu.Lock()
+			defer mu.Unlock()
+
 			if err != nil {
 				// Network or other error - don't cache, will try again later
-				slog.Error("API key validation error (will retry)", "provider", provider, "error", err)
+				slog.Error("API key validation error (will retry)", "provider", p, "error", err)
 			} else {
 				// Cache the validity result
-				cm.SetKeyValidity(provider, valid)
+				cm.SetKeyValidity(p, valid)
 				if valid {
-					slog.Info("API key is valid", "provider", provider)
+					slog.Info("API key is valid", "provider", p)
 				} else {
-					slog.Warn("API key is INVALID", "provider", provider)
+					slog.Warn("API key is INVALID", "provider", p)
 				}
 			}
-		}
+		}(provider)
 	}
+
+	wg.Wait()
 }
 
 // validateClaudeKey tests an Anthropic API key
@@ -509,7 +685,87 @@ func validateOpenAIKey(ctx context.Context, apiKey string) (bool, error) {
 		return true, nil
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		return false, fmt.Errorf("invalid API key")
+		// Invalid key — return (false, nil) so ValidateAllKeys caches the
+		// result and doesn't re-fire a live /v1/models request on every
+		// kc-agent startup (#7923). Matches validateClaudeKey behavior.
+		return false, nil
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		body = []byte("(failed to read response body)")
+	}
+	return false, fmt.Errorf("API error: %s", string(body))
+}
+
+// openRouterDefaultValidationURL is the public OpenRouter models listing
+// endpoint. It returns 200 for any valid API key and 401 otherwise, so it's a
+// cheap way to check credentials without spending tokens on a chat completion.
+// When OPENROUTER_BASE_URL is set, the validation request is redirected to
+// that base URL's /models endpoint so operators with a self-hosted or corporate
+// OpenRouter proxy validate against their own endpoint, not the public one.
+const openRouterDefaultValidationURL = "https://openrouter.ai/api/v1/models"
+
+// openRouterValidationURL resolves the validation URL at call time so a
+// runtime OPENROUTER_BASE_URL override is honored.
+func openRouterValidationURL() string {
+	if base := os.Getenv("OPENROUTER_BASE_URL"); base != "" {
+		return strings.TrimRight(base, "/") + "/models"
+	}
+	return openRouterDefaultValidationURL
+}
+
+// validateOpenRouterKey tests an OpenRouter API key by hitting the models
+// listing endpoint. Mirrors validateOpenAIKey semantics: a 200 means valid,
+// 401 means invalid (cached as (false, nil) so we don't re-fire on every
+// startup — see #7923).
+func validateOpenRouterKey(ctx context.Context, apiKey string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", openRouterValidationURL(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return true, nil
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return false, nil
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		body = []byte("(failed to read response body)")
+	}
+	return false, fmt.Errorf("API error: %s", string(body))
+}
+
+// validateGroqKey tests a Groq API key by hitting the OpenAI-compatible
+// models listing endpoint. Mirrors validateOpenAIKey semantics: a 200 means
+// valid, 401 means invalid (cached as (false, nil) so we don't re-fire on
+// every startup — see #7923).
+func validateGroqKey(ctx context.Context, apiKey string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", groqValidationURL(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return true, nil
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return false, nil
 	}
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
@@ -537,7 +793,10 @@ func validateGeminiKey(ctx context.Context, apiKey string) (bool, error) {
 		return true, nil
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return false, fmt.Errorf("invalid API key")
+		// Invalid key — return (false, nil) so ValidateAllKeys caches the
+		// result instead of re-firing a live ListModels request on every
+		// kc-agent startup (#7923). Matches validateClaudeKey behavior.
+		return false, nil
 	}
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
@@ -581,7 +840,7 @@ func (s *Server) handleProvidersHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -609,7 +868,7 @@ func (s *Server) handleProvidersHealth(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Info("[ProviderHealth] recovered from panic checking provider", "provider", providerID, "panic", r)
+					slog.Error("[ProviderHealth] recovered from panic checking provider", "provider", providerID, "panic", r)
 				}
 			}()
 			status := checkStatuspageHealth(client, url)
@@ -626,7 +885,7 @@ func (s *Server) handleProvidersHealth(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Info("[ProviderHealth] recovered from panic pinging provider", "provider", providerID, "panic", r)
+					slog.Error("[ProviderHealth] recovered from panic pinging provider", "provider", providerID, "panic", r)
 				}
 			}()
 			status := checkPingHealth(client, url)
@@ -651,7 +910,10 @@ func checkStatuspageHealth(client *http.Client, apiURL string) string {
 	if err != nil {
 		return "unknown"
 	}
-	defer resp.Body.Close()
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return "unknown"
@@ -702,7 +964,7 @@ func (s *Server) handlePredictionsAI(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -739,7 +1001,7 @@ func (s *Server) handlePredictionsAnalyze(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -766,7 +1028,7 @@ func (s *Server) handlePredictionsAnalyze(w http.ResponseWriter, r *http.Request
 	// SECURITY: reject malformed JSON instead of silently using zero-value (#4156).
 	var req AIAnalysisRequest
 	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(&req); err != nil && err != io.EOF {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
@@ -807,7 +1069,7 @@ func (s *Server) handlePredictionsFeedback(w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -826,7 +1088,7 @@ func (s *Server) handlePredictionsFeedback(w http.ResponseWriter, r *http.Reques
 	}
 
 	var req PredictionFeedbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -853,7 +1115,7 @@ func (s *Server) handlePredictionsStats(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -890,7 +1152,7 @@ func (s *Server) handleMetricsHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -900,6 +1162,12 @@ func (s *Server) handleMetricsHistory(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// SECURITY: require auth before returning sensitive metrics (#7223).
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -922,7 +1190,7 @@ func (s *Server) handleDeviceAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -960,7 +1228,7 @@ func (s *Server) handleDeviceAlertsClear(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -983,7 +1251,7 @@ func (s *Server) handleDeviceAlertsClear(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		AlertID string `json:"alertId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -1009,7 +1277,7 @@ func (s *Server) handleDeviceInventory(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1019,6 +1287,12 @@ func (s *Server) handleDeviceInventory(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// SECURITY: require auth before returning device inventory (#7228).
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -1072,12 +1346,12 @@ func (s *Server) sendNativeNotification(alerts []DeviceAlert) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Info("[DeviceTracker] recovered from panic in notification", "panic", r)
+				slog.Error("[DeviceTracker] recovered from panic in notification", "panic", r)
 			}
 		}()
 
 		if tnPath, err := exec.LookPath("terminal-notifier"); err == nil {
-			cmd := exec.Command(tnPath,
+			cmd := execCommand(tnPath,
 				"-title", "KubeStellar Console",
 				"-subtitle", title,
 				"-message", message,
@@ -1092,10 +1366,18 @@ func (s *Server) sendNativeNotification(alerts []DeviceAlert) {
 			}
 		}
 
-		// Fallback: osascript (no click-to-open support on macOS)
+		// Fallback: osascript (no click-to-open support on macOS).
+		// Sanitize inputs to prevent AppleScript injection via crafted
+		// Kubernetes labels (#7238). Backslash and double-quote are the
+		// only characters that can escape an AppleScript string literal.
+		sanitize := func(s string) string {
+			s = strings.ReplaceAll(s, `\`, `\\`)
+			s = strings.ReplaceAll(s, `"`, `\"`)
+			return s
+		}
 		script := fmt.Sprintf(`display notification "%s" with title "%s" sound name "Glass"`,
-			message, title)
-		cmd := exec.Command("osascript", "-e", script)
+			sanitize(message), sanitize(title))
+		cmd := execCommand("osascript", "-e", script)
 		if err := cmd.Run(); err != nil {
 			slog.Error("[DeviceTracker] failed to send notification", "error", err)
 		}
@@ -1187,7 +1469,8 @@ func (s *Server) handleLocalClusterTools(w http.ResponseWriter, r *http.Request)
 
 // handleLocalClusters handles local cluster operations (list, create, delete)
 func (s *Server) handleLocalClusters(w http.ResponseWriter, r *http.Request) {
-	s.setCORSHeaders(w, r)
+	// #8201: GET list, POST create, DELETE remove — preflight must advertise all.
+	s.setCORSHeaders(w, r, http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1223,11 +1506,18 @@ func (s *Server) handleLocalClusters(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// SECURITY: Validate cluster name against DNS-1123 to prevent command
+		// injection via crafted names that flow into exec.Command args (#7171).
+		if err := validateDNS1123Label("cluster name", req.Name); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
 		// Create cluster in background and return immediately
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Info("[LocalClusters] recovered from panic creating cluster", "cluster", req.Name, "panic", r)
+					slog.Error("[LocalClusters] recovered from panic creating cluster", "cluster", req.Name, "panic", r)
 				}
 			}()
 			if err := s.localClusters.CreateCluster(req.Tool, req.Name); err != nil {
@@ -1280,11 +1570,17 @@ func (s *Server) handleLocalClusters(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// SECURITY: Validate cluster name against DNS-1123 (#7171).
+		if err := validateDNS1123Label("cluster name", name); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
 		// Delete cluster in background
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Info("[LocalClusters] recovered from panic deleting cluster", "cluster", name, "panic", r)
+					slog.Error("[LocalClusters] recovered from panic deleting cluster", "cluster", name, "panic", r)
 				}
 			}()
 			if err := s.localClusters.DeleteCluster(tool, name); err != nil {
@@ -1335,7 +1631,8 @@ func (s *Server) handleLocalClusters(w http.ResponseWriter, r *http.Request) {
 
 // handleLocalClusterLifecycle handles start/stop/restart for local clusters
 func (s *Server) handleLocalClusterLifecycle(w http.ResponseWriter, r *http.Request) {
-	s.setCORSHeaders(w, r)
+	// POST-only lifecycle action — preflight must advertise POST (#8201).
+	s.setCORSHeaders(w, r, http.MethodPost, http.MethodOptions)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1366,6 +1663,11 @@ func (s *Server) handleLocalClusterLifecycle(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "tool, name, and action are required", http.StatusBadRequest)
 		return
 	}
+	// SECURITY: Validate cluster name against DNS-1123 (#7171).
+	if err := validateDNS1123Label("cluster name", req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if req.Action != "start" && req.Action != "stop" && req.Action != "restart" {
 		http.Error(w, "action must be start, stop, or restart", http.StatusBadRequest)
 		return
@@ -1374,7 +1676,7 @@ func (s *Server) handleLocalClusterLifecycle(w http.ResponseWriter, r *http.Requ
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Info("[LocalClusters] recovered from panic during lifecycle action", "action", req.Action, "cluster", req.Name, "panic", r)
+				slog.Error("[LocalClusters] recovered from panic during lifecycle action", "action", req.Action, "cluster", req.Name, "panic", r)
 			}
 		}()
 
@@ -1450,7 +1752,8 @@ func (s *Server) handleVClusterList(w http.ResponseWriter, r *http.Request) {
 
 // handleVClusterCreate creates a new vCluster
 func (s *Server) handleVClusterCreate(w http.ResponseWriter, r *http.Request) {
-	s.setCORSHeaders(w, r)
+	// POST-only vCluster create — preflight must advertise POST (#8201).
+	s.setCORSHeaders(w, r, http.MethodPost, http.MethodOptions)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1481,11 +1784,21 @@ func (s *Server) handleVClusterCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SECURITY: Validate name and namespace against DNS-1123 (#7171).
+	if err := validateDNS1123Label("vcluster name", req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateDNS1123Label("namespace", req.Namespace); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Create vCluster in background and return immediately
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Info("[vCluster] recovered from panic creating vcluster", "name", req.Name, "panic", r)
+				slog.Error("[vCluster] recovered from panic creating vcluster", "name", req.Name, "panic", r)
 			}
 		}()
 		if err := s.localClusters.CreateVCluster(req.Name, req.Namespace); err != nil {
@@ -1519,7 +1832,8 @@ func (s *Server) handleVClusterCreate(w http.ResponseWriter, r *http.Request) {
 
 // handleVClusterConnect connects to an existing vCluster
 func (s *Server) handleVClusterConnect(w http.ResponseWriter, r *http.Request) {
-	s.setCORSHeaders(w, r)
+	// POST-only vCluster connect — preflight must advertise POST (#8201).
+	s.setCORSHeaders(w, r, http.MethodPost, http.MethodOptions)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1547,6 +1861,15 @@ func (s *Server) handleVClusterConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" || req.Namespace == "" {
 		http.Error(w, "name and namespace are required", http.StatusBadRequest)
+		return
+	}
+	// SECURITY: Validate name and namespace against DNS-1123 (#7171).
+	if err := validateDNS1123Label("vcluster name", req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateDNS1123Label("namespace", req.Namespace); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -1567,7 +1890,8 @@ func (s *Server) handleVClusterConnect(w http.ResponseWriter, r *http.Request) {
 
 // handleVClusterDisconnect disconnects from a vCluster
 func (s *Server) handleVClusterDisconnect(w http.ResponseWriter, r *http.Request) {
-	s.setCORSHeaders(w, r)
+	// POST-only vCluster disconnect — preflight must advertise POST (#8201).
+	s.setCORSHeaders(w, r, http.MethodPost, http.MethodOptions)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1595,6 +1919,15 @@ func (s *Server) handleVClusterDisconnect(w http.ResponseWriter, r *http.Request
 	}
 	if req.Name == "" || req.Namespace == "" {
 		http.Error(w, "name and namespace are required", http.StatusBadRequest)
+		return
+	}
+	// SECURITY: Validate name and namespace against DNS-1123 (#7171).
+	if err := validateDNS1123Label("vcluster name", req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateDNS1123Label("namespace", req.Namespace); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -1615,7 +1948,8 @@ func (s *Server) handleVClusterDisconnect(w http.ResponseWriter, r *http.Request
 
 // handleVClusterDelete deletes a vCluster
 func (s *Server) handleVClusterDelete(w http.ResponseWriter, r *http.Request) {
-	s.setCORSHeaders(w, r)
+	// POST-only vCluster delete — preflight must advertise POST (#8201).
+	s.setCORSHeaders(w, r, http.MethodPost, http.MethodOptions)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1645,12 +1979,21 @@ func (s *Server) handleVClusterDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name and namespace are required", http.StatusBadRequest)
 		return
 	}
+	// SECURITY: Validate name and namespace against DNS-1123 (#7171).
+	if err := validateDNS1123Label("vcluster name", req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateDNS1123Label("namespace", req.Namespace); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// Delete vCluster in background and return immediately
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Info("[vCluster] recovered from panic deleting vcluster", "name", req.Name, "panic", r)
+				slog.Error("[vCluster] recovered from panic deleting vcluster", "name", req.Name, "panic", r)
 			}
 		}()
 		if err := s.localClusters.DeleteVCluster(req.Name, req.Namespace); err != nil {
@@ -1690,7 +2033,7 @@ func (s *Server) handleInsightsEnrich(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1700,6 +2043,12 @@ func (s *Server) handleInsightsEnrich(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// SECURITY: require auth before triggering AI enrichment (#7231).
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -1739,7 +2088,7 @@ func (s *Server) handleInsightsAI(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
@@ -1749,6 +2098,12 @@ func (s *Server) handleInsightsAI(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// SECURITY: require auth before returning cached AI enrichments (#7233).
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 

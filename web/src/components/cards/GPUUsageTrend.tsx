@@ -1,20 +1,48 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
 import { TrendingUp, Cpu, Server, Clock } from 'lucide-react'
 import { CardClusterFilter } from '../../lib/cards/CardComponents'
-import ReactECharts from 'echarts-for-react'
+import { LazyEChart } from '../charts/LazyEChart'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedGPUNodes } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
+import { useMetricsHistoryReadOnly } from '../../hooks/useMetricsHistory'
+import { gpuNodeCache as mcpGPUNodeCache } from '../../hooks/mcp/compute'
+import type { GPUNode } from '../../hooks/mcp/types'
 import { Skeleton, SkeletonStats } from '../ui/Skeleton'
 import { useCardLoadingState } from './CardDataContext'
 import { useTranslation } from 'react-i18next'
 import { useDemoMode } from '../../hooks/useDemoMode'
+import { normalizeClusterName } from '../../lib/gpu'
 import {
   CHART_HEIGHT_STANDARD,
   CHART_GRID_STROKE,
   CHART_AXIS_STROKE,
   CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TICK_COLOR } from '../../lib/constants'
+  CHART_TICK_COLOR,
+  CHART_AXIS_FONT_SIZE,
+  CHART_BODY_FONT_SIZE,
+  CHART_TEXT_MUTED } from '../../lib/constants'
+import { MS_PER_MINUTE, MS_PER_HOUR } from '../../lib/constants/time'
+
+/**
+ * Maximum age of a metrics-history snapshot we're willing to use as a
+ * fallback when the live GPU-nodes fetch returns empty. Snapshots older than
+ * this are treated as stale and skipped (the card will render its empty
+ * state instead of showing days-old inventory). 30 minutes matches the
+ * `MAX_AGE_MS` used by this card's own on-screen chart history so the two
+ * windows stay consistent.
+ */
+const GPU_SNAPSHOT_STALENESS_MS = 30 * MS_PER_MINUTE // 30 min
+
+/**
+ * Bucket size for the staleness-tick that forces the fallback memo to
+ * re-evaluate as time passes. Without this, a snapshot accepted as fresh
+ * can remain displayed indefinitely because the memo's deps never change.
+ * Rounding `Date.now()` to this bucket means the memo only recomputes when
+ * the bucket boundary crosses — roughly once per minute — which is plenty
+ * of precision for a 30-minute staleness window.
+ */
+const STALENESS_TICK_MS = 60_000
 
 interface GPUDataPoint {
   time: string
@@ -23,21 +51,27 @@ interface GPUDataPoint {
   free: number
 }
 
+// Shape we pass through the card's filter/aggregation pipeline. This matches
+// the live GPUNode shape for the fields we actually use (cluster, gpuType,
+// gpuCount, gpuAllocated). We normalize here so we can transparently fall
+// back to a recent metrics-history snapshot whose field name is `gpuTotal`
+// instead of `gpuCount` — see snapshot fallback below.
+interface EffectiveGPUNode {
+  name: string
+  cluster: string
+  gpuType?: string
+  gpuCount: number
+  gpuAllocated: number
+}
+
 type TimeRange = '15m' | '1h' | '6h' | '24h'
 
 const TIME_RANGE_OPTIONS: { value: TimeRange; label: string; points: number; intervalMs: number }[] = [
-  { value: '15m', label: '15 min', points: 15, intervalMs: 60000 },
-  { value: '1h', label: '1 hour', points: 20, intervalMs: 180000 },
-  { value: '6h', label: '6 hours', points: 24, intervalMs: 900000 },
-  { value: '24h', label: '24 hours', points: 24, intervalMs: 3600000 },
+  { value: '15m', label: '15 min', points: 15, intervalMs: MS_PER_MINUTE },
+  { value: '1h', label: '1 hour', points: 20, intervalMs: 3 * MS_PER_MINUTE },
+  { value: '6h', label: '6 hours', points: 24, intervalMs: 15 * MS_PER_MINUTE },
+  { value: '24h', label: '24 hours', points: 24, intervalMs: MS_PER_HOUR },
 ]
-
-// Normalize cluster name for matching
-function normalizeClusterName(cluster: string): string {
-  if (!cluster) return ''
-  const parts = cluster.split('/')
-  return parts[parts.length - 1] || cluster
-}
 
 export function GPUUsageTrend() {
   const { t } = useTranslation()
@@ -50,9 +84,110 @@ export function GPUUsageTrend() {
     consecutiveFailures } = useCachedGPUNodes()
   const { deduplicatedClusters: clusters } = useClusters()
   const { isDemoMode } = useDemoMode()
+  // Use the shared metrics-history snapshots as a last-known-good fallback
+  // when the live GPU-nodes fetch returns empty (intermittent API failure
+  // against a cluster that does have GPUs). Without this the card shows
+  // "No GPU Nodes" whenever a single poll fails — see GPU Inventory History
+  // card which already reads this same history and stays populated.
+  //
+  // We use the read-only variant here so this card does NOT add a second
+  // round of MCP polling (useGPUNodes) or a second capture `setInterval`.
+  // The driver `useMetricsHistory()` is hosted elsewhere (GPU Inventory
+  // History) and publishes updates through the shared singleton.
+  const { history: metricsHistory } = useMetricsHistoryReadOnly()
 
-  // Only show skeleton when no cached data exists
-  const hasData = gpuNodes.length > 0
+  // Staleness-tick: a time-bucket derived from Date.now() rounded to
+  // STALENESS_TICK_MS. Included in the `effectiveGPUNodes` memo deps so the
+  // memo re-evaluates on every bucket boundary, which lets a snapshot that
+  // was "fresh" when first shown transition to "stale" as the clock advances.
+  const [stalenessTick, setStalenessTick] = useState<number>(
+    () => Math.floor(Date.now() / STALENESS_TICK_MS),
+  )
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      setStalenessTick(Math.floor(Date.now() / STALENESS_TICK_MS))
+    }, STALENESS_TICK_MS)
+    return () => clearInterval(intervalId)
+  }, [])
+
+  // Fall back to the most recent snapshot's GPU nodes if the live list is
+  // empty. Snapshots use `gpuTotal`; we remap to `gpuCount` so downstream
+  // aggregation (currentTotals, filteredNodes) stays unchanged.
+  //
+  // Three-tier fallback (see issues 8080 and 8081):
+  //   1. Live cached GPU nodes from useCachedGPUNodes (SWR)
+  //   2. Most recent non-empty snapshot from useMetricsHistoryReadOnly
+  //   3. The MCP compute.ts localStorage cache (`kubestellar-gpu-cache`)
+  //      which persists across page reloads and is populated by the
+  //      useGPUNodes/mcp hook path
+  //
+  // Tier 3 specifically handles the fresh-page-load + flapping-cluster
+  // case: metrics history hasn't captured a snapshot yet and the live
+  // fetch returned empty, but a previous session's GPU cache is still
+  // sitting in localStorage.
+  const effectiveGPUNodes: EffectiveGPUNode[] = useMemo(() => {
+    if (gpuNodes.length > 0) {
+      return gpuNodes.map(n => ({
+        name: n.name,
+        cluster: n.cluster,
+        gpuType: n.gpuType,
+        gpuCount: n.gpuCount,
+        gpuAllocated: n.gpuAllocated }))
+    }
+    // Don't fall back during the initial load — the card will show its
+    // skeleton while `hookLoading` is true.
+    if (hookLoading && !isFailed && consecutiveFailures === 0) {
+      return []
+    }
+    // Only fall back when the live fetch actually failed. A successful fetch
+    // that returned an empty list is a legitimate "cluster has no GPUs" state
+    // and must NOT be masked by stale history.
+    if (!isFailed && consecutiveFailures === 0) {
+      return []
+    }
+    // Use real `Date.now()` for the age computation so a snapshot that just
+    // crossed the staleness threshold is measured against true elapsed time
+    // rather than the start of the current minute bucket (which can be up to
+    // `STALENESS_TICK_MS - 1` ms smaller than real time and would effectively
+    // extend the staleness window). `stalenessTick` is still in the memo deps
+    // so the recompute fires on each bucket boundary.
+    void stalenessTick
+    const now = Date.now()
+    for (let i = metricsHistory.length - 1; i >= 0; i -= 1) {
+      const snap = metricsHistory[i]
+      const snapNodes = snap?.gpuNodes || []
+      if (snapNodes.length === 0) continue
+      const age = now - new Date(snap.timestamp).getTime()
+      if (age > GPU_SNAPSHOT_STALENESS_MS) {
+        // History is ordered oldest→newest, so every earlier snapshot is
+        // even older — we can stop scanning.
+        break
+      }
+      return snapNodes.map(g => ({
+        name: g.name,
+        cluster: g.cluster,
+        gpuType: g.gpuType,
+        gpuCount: g.gpuTotal,
+        gpuAllocated: g.gpuAllocated }))
+    }
+    // Tier 3: MCP module-level GPU cache (persisted to localStorage by
+    // web/src/hooks/mcp/compute.ts). This is last-resort when both the
+    // live fetch and metrics history are empty — typically on a fresh
+    // page load against a cluster whose GPU fetch is currently flapping.
+    const mcpCachedNodes: GPUNode[] = mcpGPUNodeCache?.nodes || []
+    if (mcpCachedNodes.length > 0) {
+      return mcpCachedNodes.map(n => ({
+        name: n.name,
+        cluster: n.cluster,
+        gpuType: n.gpuType,
+        gpuCount: n.gpuCount,
+        gpuAllocated: n.gpuAllocated }))
+    }
+    return []
+  }, [gpuNodes, metricsHistory, hookLoading, isFailed, consecutiveFailures, stalenessTick])
+
+  // Only show skeleton when no cached data exists (live OR snapshot fallback)
+  const hasData = effectiveGPUNodes.length > 0
   const isLoading = hookLoading && !hasData
   const { selectedClusters, isAllClustersSelected } = useGlobalFilters()
 
@@ -71,7 +206,7 @@ export function GPUUsageTrend() {
 
   // Track historical data points with persistence
   const STORAGE_KEY = 'gpu-usage-trend-history'
-  const MAX_AGE_MS = 30 * 60 * 1000 // 30 minutes - discard older data
+  const MAX_AGE_MS = 30 * MS_PER_MINUTE // 30 minutes - discard older data
 
   const loadSavedHistory = (): GPUDataPoint[] => {
     try {
@@ -105,7 +240,7 @@ export function GPUUsageTrend() {
 
   // Get reachable clusters (those with GPU nodes)
   const gpuClusters = (() => {
-    const clusterNames = new Set(gpuNodes.map(n => normalizeClusterName(n.cluster)))
+    const clusterNames = new Set(effectiveGPUNodes.map(n => normalizeClusterName(n.cluster)))
     return clusters.filter(c => clusterNames.has(normalizeClusterName(c.name)) && c.reachable !== false)
   })()
 
@@ -115,7 +250,7 @@ export function GPUUsageTrend() {
   })()
 
   const filteredNodes = useMemo(() => {
-    let filtered = gpuNodes
+    let filtered: EffectiveGPUNode[] = effectiveGPUNodes
     if (!isAllClustersSelected) {
       filtered = filtered.filter(node => {
         const normalizedNodeCluster = normalizeClusterName(node.cluster)
@@ -139,7 +274,7 @@ export function GPUUsageTrend() {
       })
     }
     return filtered
-  }, [gpuNodes, selectedClusters, isAllClustersSelected, localClusterFilter])
+  }, [effectiveGPUNodes, selectedClusters, isAllClustersSelected, localClusterFilter])
 
   const toggleClusterFilter = (clusterName: string) => {
     setLocalClusterFilter(prev => {
@@ -194,14 +329,14 @@ export function GPUUsageTrend() {
     xAxis: {
       type: 'category' as const,
       data: history.map(d => d.time),
-      axisLabel: { color: CHART_TICK_COLOR, fontSize: 10 },
+      axisLabel: { color: CHART_TICK_COLOR, fontSize: CHART_AXIS_FONT_SIZE },
       axisLine: { lineStyle: { color: CHART_AXIS_STROKE } },
       axisTick: { show: false },
     },
     yAxis: {
       type: 'value' as const,
       minInterval: 1,
-      axisLabel: { color: CHART_TICK_COLOR, fontSize: 10 },
+      axisLabel: { color: CHART_TICK_COLOR, fontSize: CHART_AXIS_FONT_SIZE },
       axisLine: { show: false },
       axisTick: { show: false },
       splitLine: { lineStyle: { color: CHART_GRID_STROKE, type: 'dashed' as const } },
@@ -210,7 +345,7 @@ export function GPUUsageTrend() {
       trigger: 'axis' as const,
       backgroundColor: (CHART_TOOLTIP_CONTENT_STYLE as Record<string, unknown>).backgroundColor as string,
       borderColor: (CHART_TOOLTIP_CONTENT_STYLE as Record<string, unknown>).borderColor as string,
-      textStyle: { color: CHART_TICK_COLOR, fontSize: 12 },
+      textStyle: { color: CHART_TICK_COLOR, fontSize: CHART_BODY_FONT_SIZE },
       formatter: (params: Array<{ seriesName: string; value: number; color: string }>) => {
         let html = ''
         for (const p of (params || [])) {
@@ -223,7 +358,7 @@ export function GPUUsageTrend() {
     legend: {
       data: ['In Use', 'Free'],
       bottom: 0,
-      textStyle: { color: '#888', fontSize: 10 },
+      textStyle: { color: CHART_TEXT_MUTED, fontSize: CHART_AXIS_FONT_SIZE },
       icon: 'rect',
     },
     series: [
@@ -261,7 +396,7 @@ export function GPUUsageTrend() {
   if (isLoading && history.length === 0) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
           <Skeleton variant="text" width={120} height={16} />
           <Skeleton variant="rounded" width={28} height={28} />
         </div>
@@ -271,7 +406,7 @@ export function GPUUsageTrend() {
     )
   }
 
-  if (gpuNodes.length === 0) {
+  if (effectiveGPUNodes.length === 0) {
     return (
       <div className="h-full flex flex-col content-loaded">
         <div className="flex items-center justify-end mb-3" />
@@ -288,7 +423,7 @@ export function GPUUsageTrend() {
 
   return (
     <div className="h-full flex flex-col content-loaded">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
         <div className="flex items-center gap-2">
           {localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -324,7 +459,7 @@ export function GPUUsageTrend() {
         />
       </div>
 
-      <div className="grid grid-cols-4 gap-2 mb-4">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-4">
         <div className="p-2 rounded-lg bg-blue-500/10 border border-blue-500/20" title={`${currentTotals.available} total GPUs available`}>
           <div className="flex items-center gap-1 mb-1">
             <Cpu className="w-3 h-3 text-blue-400" />
@@ -362,7 +497,7 @@ export function GPUUsageTrend() {
           </div>
         ) : (
           <div style={{ width: '100%', minHeight: CHART_HEIGHT_STANDARD, height: CHART_HEIGHT_STANDARD }} role="img" aria-label={`GPU usage trend chart: ${currentTotals.allocated} of ${currentTotals.available} GPUs in use (${usagePercent}% utilization)`}>
-            <ReactECharts
+            <LazyEChart
               option={chartOption}
               style={{ height: CHART_HEIGHT_STANDARD, width: '100%' }}
               notMerge={true}

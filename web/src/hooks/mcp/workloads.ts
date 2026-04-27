@@ -8,8 +8,22 @@ import { kubectlProxy } from '../../lib/kubectlProxy'
 import { STORAGE_KEY_TOKEN } from '../../lib/constants'
 import { REFRESH_INTERVAL_MS, MIN_REFRESH_INDICATOR_MS, getEffectiveInterval, LOCAL_AGENT_URL, clusterCacheRef, fetchWithRetry } from './shared'
 import { subscribePolling } from './pollingManager'
-import { MCP_HOOK_TIMEOUT_MS } from '../../lib/constants/network'
+import { MCP_HOOK_TIMEOUT_MS, LOCAL_AGENT_HTTP_URL } from '../../lib/constants/network'
 import type { PodInfo, PodIssue, Deployment, DeploymentIssue, Job, HPA, ReplicaSet, StatefulSet, DaemonSet, CronJob } from './types'
+import { classifyError, type ClusterErrorType } from '../../lib/errorClassifier'
+
+/**
+ * Per-cluster error surfaced by `useAllPods` when the backend emits a
+ * `cluster_error` SSE event for a particular cluster (Issue 9353). Lets the
+ * drill-down distinguish an RBAC denial ({@link ClusterErrorType} === 'auth')
+ * from a transient 5xx/timeout failure so the UI can render a specific
+ * explanation instead of a generic "detailed list is empty" warning.
+ */
+export interface PodClusterError {
+  cluster: string
+  errorType: ClusterErrorType
+  message: string
+}
 
 // ---------------------------------------------------------------------------
 // Shared Workloads State - enables cache reset notifications to all consumers
@@ -233,7 +247,8 @@ function savePodsCacheToStorage() {
 // ---------------------------------------------------------------------------
 
 export function usePods(cluster?: string, namespace?: string, sortBy: 'restarts' | 'name' = 'restarts', limit = 10) {
-  const cacheKey = `pods:${cluster || 'all'}:${namespace || 'all'}`
+  // Include sortBy and limit in cache key to prevent cross-view stale data (#7218)
+  const cacheKey = `pods:${cluster || 'all'}:${namespace || 'all'}:${sortBy}:${limit}`
 
   // Initialize from cache if available
   const getCachedData = () => {
@@ -314,7 +329,7 @@ export function usePods(cluster?: string, namespace?: string, sortBy: 'restarts'
       if (namespace) sseParams.namespace = namespace
 
       const allPods = await fetchSSE<PodInfo>({
-        url: '/api/mcp/pods/stream',
+        url: `${LOCAL_AGENT_HTTP_URL}/pods/stream`,
         params: sseParams,
         itemsKey: 'pods',
         signal: abortController.signal,
@@ -443,6 +458,14 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(cached?.timestamp || null)
   const [error, setError] = useState<string | null>(null)
+  // Per-cluster errors from the SSE `cluster_error` event (Issue 9353). Lets
+  // consumers (drill-downs) distinguish an RBAC denial on one or more
+  // clusters from a globally-transient failure so the UI can show a
+  // specific "lacks list-pods RBAC on cluster X" message instead of a
+  // generic "detailed list is empty" warning.
+  const [clusterErrors, setClusterErrors] = useState<PodClusterError[]>(
+    [],
+  )
   const sseAbortRef = useRef<AbortController | null>(null)
 
   const refetch = useCallback(async (silent = false) => {
@@ -454,6 +477,7 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
       setPods(demoPods)
       setIsLoading(false)
       setError(null)
+      setClusterErrors([])
       setLastUpdated(new Date())
       return
     }
@@ -468,6 +492,11 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
     const abortController = new AbortController()
     sseAbortRef.current = abortController
 
+    // Collect per-cluster error events during this refetch. We replace the
+    // previous snapshot atomically when the stream settles so a transient
+    // flash of "cluster X failed" isn't left stale after a retry succeeds.
+    const collectedErrors: PodClusterError[] = []
+
     // Use SSE streaming for progressive multi-cluster data
     try {
       const sseParams: Record<string, string> = {}
@@ -475,13 +504,26 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
       if (namespace) sseParams.namespace = namespace
 
       const allPods = await fetchSSE<PodInfo>({
-        url: '/api/mcp/pods/stream',
+        url: `${LOCAL_AGENT_HTTP_URL}/pods/stream`,
         params: sseParams,
         itemsKey: 'pods',
         signal: abortController.signal,
         onClusterData: (_clusterName, items) => {
           setPods(prev => [...prev, ...items])
           setIsLoading(false)
+        },
+        onClusterError: (clusterName, errorMessage) => {
+          // Classify the raw backend error so consumers can render an
+          // RBAC-specific message (auth) instead of "transient failure"
+          // (timeout/network/unknown). Backend error strings already
+          // contain enough context ("pods is forbidden", "401",
+          // "unauthorized", etc.) for the classifier to match.
+          const classified = classifyError(errorMessage)
+          collectedErrors.push({
+            cluster: clusterName,
+            errorType: classified.type,
+            message: errorMessage,
+          })
         },
       })
 
@@ -491,6 +533,7 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
 
       setPods(allPods)
       setError(null)
+      setClusterErrors(collectedErrors)
       setLastUpdated(now)
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return
@@ -499,6 +542,10 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
       if (!silent && !podsCache) {
         setError(message)
       }
+      // Even on catastrophic failure, surface any per-cluster errors we
+      // collected before the stream aborted so the UI can still explain
+      // the partial state.
+      setClusterErrors(collectedErrors)
     } finally {
       if (!silent) {
         setIsLoading(false)
@@ -535,13 +582,24 @@ export function useAllPods(cluster?: string, namespace?: string, forceLive = fal
       if (state.isResetting) {
         setIsLoading(true)
         setPods([])
+        setClusterErrors([])
         setLastUpdated(null)
       }
     }
     return subscribeWorkloadsCache(handleCacheReset)
   }, [])
 
-  return { pods, isLoading, isRefreshing, lastUpdated, error, refetch: () => refetch(false) }
+  return {
+    pods,
+    isLoading,
+    isRefreshing,
+    lastUpdated,
+    error,
+    // Per-cluster errors surfaced from the SSE stream (Issue 9353) so the
+    // multi-cluster drill-down can explain an empty list with "lacks
+    // list-pods RBAC on cluster X" rather than a generic warning.
+    clusterErrors,
+    refetch: () => refetch(false) }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,9 +693,11 @@ export function usePodIssues(cluster?: string, namespace?: string) {
         const clusterInfo = clusterCacheRef.clusters.find(c => c.name === cluster)
         const kubectlContext = clusterInfo?.context || cluster
         const podIssuesData = await kubectlProxy.getPodIssues(kubectlContext, namespace)
+        // Guard against null/undefined when proxy is disconnected or in cooldown
+        const safePodIssues = podIssuesData || []
         const now = new Date()
-        podIssuesCache = { data: podIssuesData, timestamp: now, key: cacheKey }
-        setIssues(podIssuesData)
+        podIssuesCache = { data: safePodIssues, timestamp: now, key: cacheKey }
+        setIssues(safePodIssues)
         setError(null)
         setLastUpdated(now)
         setConsecutiveFailures(0)
@@ -666,8 +726,9 @@ export function usePodIssues(cluster?: string, namespace?: string) {
       if (cluster) sseParams.cluster = cluster
       if (namespace) sseParams.namespace = namespace
 
+      // pod-issues is a backend-only endpoint (#9996) — route SSE via /api/mcp/
       const allIssues = await fetchSSE<PodIssue>({
-        url: '/api/mcp/pod-issues/stream',
+        url: `/api/mcp/pod-issues/stream`,
         params: sseParams,
         itemsKey: 'issues',
         signal: abortController.signal,
@@ -828,8 +889,9 @@ export function useDeploymentIssues(cluster?: string, namespace?: string) {
       if (cluster) sseParams.cluster = cluster
       if (namespace) sseParams.namespace = namespace
 
+      // deployment-issues is a backend-only endpoint (#9996) — route SSE via /api/mcp/
       const allIssues = await fetchSSE<DeploymentIssue>({
-        url: '/api/mcp/deployment-issues/stream',
+        url: `/api/mcp/deployment-issues/stream`,
         params: sseParams,
         itemsKey: 'issues',
         signal: abortController.signal,
@@ -1071,7 +1133,7 @@ export function useDeployments(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const url = `/api/mcp/deployments?${params}`
+      const url = `${LOCAL_AGENT_HTTP_URL}/deployments?${params}`
 
       if (isDemoMode()) {
         setDeployments([])
@@ -1216,7 +1278,7 @@ export function useJobs(cluster?: string, namespace?: string) {
       if (cluster) sseParams.cluster = cluster
       if (namespace) sseParams.namespace = namespace
       const result = await fetchSSE<Job>({
-        url: '/api/mcp/jobs/stream',
+        url: `${LOCAL_AGENT_HTTP_URL}/jobs/stream`,
         params: sseParams,
         itemsKey: 'jobs',
         signal: abortController.signal,
@@ -1290,7 +1352,7 @@ export function useHPAs(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ hpas: HPA[] }>(`/api/mcp/hpas?${params}`)
+      const { data } = await api.get<{ hpas: HPA[] }>(`${LOCAL_AGENT_HTTP_URL}/hpas?${params}`)
       setHPAs(data.hpas || [])
       setError(null)
       setConsecutiveFailures(0)
@@ -1355,7 +1417,7 @@ export function useReplicaSets(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ replicasets: ReplicaSet[] }>(`/api/mcp/replicasets?${params}`)
+      const { data } = await api.get<{ replicasets: ReplicaSet[] }>(`${LOCAL_AGENT_HTTP_URL}/replicasets?${params}`)
       setReplicaSets(data.replicasets || [])
       setError(null)
       setConsecutiveFailures(0)
@@ -1418,7 +1480,7 @@ export function useStatefulSets(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ statefulsets: StatefulSet[] }>(`/api/mcp/statefulsets?${params}`)
+      const { data } = await api.get<{ statefulsets: StatefulSet[] }>(`${LOCAL_AGENT_HTTP_URL}/statefulsets?${params}`)
       setStatefulSets(data.statefulsets || [])
       setError(null)
       setConsecutiveFailures(0)
@@ -1481,7 +1543,7 @@ export function useDaemonSets(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ daemonsets: DaemonSet[] }>(`/api/mcp/daemonsets?${params}`)
+      const { data } = await api.get<{ daemonsets: DaemonSet[] }>(`${LOCAL_AGENT_HTTP_URL}/daemonsets?${params}`)
       setDaemonSets(data.daemonsets || [])
       setError(null)
       setConsecutiveFailures(0)
@@ -1544,7 +1606,7 @@ export function useCronJobs(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ cronjobs: CronJob[] }>(`/api/mcp/cronjobs?${params}`)
+      const { data } = await api.get<{ cronjobs: CronJob[] }>(`${LOCAL_AGENT_HTTP_URL}/cronjobs?${params}`)
       setCronJobs(data.cronjobs || [])
       setError(null)
       setConsecutiveFailures(0)
@@ -1597,7 +1659,7 @@ export function usePodLogs(cluster: string, namespace: string, pod: string, cont
       params.append('pod', pod)
       if (container) params.append('container', container)
       params.append('tail', tail.toString())
-      const { data } = await api.get<{ logs: string }>(`/api/mcp/pods/logs?${params}`)
+      const { data } = await api.get<{ logs: string }>(`${LOCAL_AGENT_HTTP_URL}/pods/logs?${params}`)
       setLogs(data.logs || '')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch logs')

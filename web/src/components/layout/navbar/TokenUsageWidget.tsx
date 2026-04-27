@@ -52,7 +52,7 @@ export function TokenUsageWidget() {
     <div className="relative" ref={tokenRef}>
       <button
         onClick={() => setShowTokenDetails(!showTokenDetails)}
-        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${
+        className={`flex items-center gap-2 px-3 py-1.5 h-9 rounded-lg transition-colors ${
           isDemoData
             ? 'bg-yellow-500/10 border border-yellow-500/20 text-yellow-400'
             : alertLevel === 'stopped'
@@ -88,7 +88,7 @@ export function TokenUsageWidget() {
 
       {/* Token details dropdown */}
       {showTokenDetails && (
-        <div className="absolute top-full right-0 mt-2 w-64 bg-card border border-border rounded-lg shadow-xl p-4 z-50">
+        <div className="absolute top-full right-0 mt-2 w-64 bg-card border border-border rounded-lg shadow-xl p-4 z-dropdown">
           <div className="flex items-center justify-between mb-3">
             <h4 className="text-sm font-medium text-foreground">{t('layout.navbar.tokenUsage')}</h4>
             {isDemoData && (

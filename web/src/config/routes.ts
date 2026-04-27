@@ -46,6 +46,18 @@ export const ROUTES = {
   SECURITY: '/security',
   SECURITY_POSTURE: '/security-posture',
   COMPLIANCE: '/compliance',
+  COMPLIANCE_FRAMEWORKS: '/compliance-frameworks',
+  CHANGE_CONTROL: '/change-control',
+  SEGREGATION_OF_DUTIES: '/segregation-of-duties',
+  COMPLIANCE_REPORTS: '/compliance-reports',
+  DATA_RESIDENCY: '/data-residency',
+  BAA: '/baa',
+  HIPAA: '/hipaa',
+  GXP: '/gxp',
+  NIST: '/nist',
+  STIG: '/stig',
+  AIR_GAP: '/air-gap',
+  FEDRAMP: '/fedramp',
   DATA_COMPLIANCE: '/data-compliance',
   
   // Advanced Features
@@ -64,6 +76,9 @@ export const ROUTES = {
   // Persona dashboards
   CLUSTER_ADMIN: '/cluster-admin',
 
+  // Enterprise Compliance Portal
+  ENTERPRISE: '/enterprise',
+
   // Marketplace
   MARKETPLACE: '/marketplace',
 
@@ -73,6 +88,9 @@ export const ROUTES = {
 
   // Widget
   WIDGET: '/widget',
+
+  // Embed (standalone card for iframe embedding)
+  EMBED_CARD: '/embed/:cardType',
 
   // Feedback / issue shortcuts
   ISSUE: '/issue',
@@ -93,6 +111,12 @@ export const ROUTES = {
   // Multi-Tenancy
   MULTI_TENANCY: '/multi-tenancy',
 
+  // Drasi
+  DRASI: '/drasi',
+
+  // AI Codebase Maturity Model
+  ACMM: '/acmm',
+
   // Dev / test routes
   TEST_UNIFIED_CARD: '/test/unified-card',
   TEST_UNIFIED_STATS: '/test/unified-stats',
@@ -105,7 +129,9 @@ export const ROUTES = {
  * Helper function to create a custom dashboard route with ID
  */
 export function getCustomDashboardRoute(id: string): string {
-  return ROUTES.CUSTOM_DASHBOARD.replace(':id', id)
+  // Encode the id so special characters like '/', '?', '#', '%' don't break
+  // the URL or enable path traversal into unrelated routes.
+  return ROUTES.CUSTOM_DASHBOARD.replace(':id', encodeURIComponent(id))
 }
 
 /**

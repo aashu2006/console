@@ -73,6 +73,11 @@ type DeviceTracker struct {
 
 	mu     sync.RWMutex
 	stopCh chan struct{}
+	// stopOnce guards close(stopCh) against double-Stop panics (#6684).
+	// Shutdown code paths may call Stop() more than once (e.g. graceful
+	// shutdown handler plus defer in tests); close-of-closed-channel
+	// panics the whole process.
+	stopOnce sync.Once
 
 	// Broadcast function for WebSocket updates
 	broadcast          func(msgType string, payload interface{})
@@ -101,9 +106,11 @@ func (t *DeviceTracker) Start() {
 	go t.runLoop()
 }
 
-// Stop stops the device tracker
+// Stop stops the device tracker. Safe to call multiple times (#6684).
 func (t *DeviceTracker) Stop() {
-	close(t.stopCh)
+	t.stopOnce.Do(func() {
+		close(t.stopCh)
+	})
 }
 
 func (t *DeviceTracker) runLoop() {
@@ -178,16 +185,37 @@ func (t *DeviceTracker) scanDevices() {
 		close(snapshotCh)
 	}()
 
-	// Process snapshots as they stream in — broadcast after each cluster's batch
+	// Process snapshots as they stream in — broadcast after each cluster's batch.
+	// Track observed keys so we can evict deleted nodes afterward (#7274).
 	newAlerts := false
+	observedKeys := make(map[string]bool)
 	for snapshot := range snapshotCh {
+		key := snapshot.Cluster + "/" + snapshot.NodeName
+		observedKeys[key] = true
 		if t.processSnapshot(snapshot) {
 			newAlerts = true
 		}
 	}
 
+	// Evict entries for nodes that no longer appear in the API response (#7274).
+	// This prevents unbounded map growth on autoscaling clusters.
+	t.mu.Lock()
+	for key := range t.history {
+		if !observedKeys[key] {
+			delete(t.history, key)
+			delete(t.maxCounts, key)
+			// Clean up any alerts for this node
+			for alertKey := range t.alerts {
+				if strings.HasPrefix(alertKey, key+"/") {
+					delete(t.alerts, alertKey)
+				}
+			}
+		}
+	}
+	t.mu.Unlock()
+
 	if newAlerts && t.broadcast != nil {
-		t.broadcast("device_alerts_updated", t.GetAlerts())
+		t.broadcast("device_alerts_updated", t.GetAlerts()) //nolint:nilaway // broadcast nil-checked above
 	}
 }
 
@@ -411,11 +439,17 @@ func (t *DeviceTracker) checkForBoolDrop(key, nodeName, cluster, deviceType stri
 
 // GetAlerts returns all current device alerts
 func (t *DeviceTracker) GetAlerts() DeviceAlertsResponse {
+	if t == nil {
+		return DeviceAlertsResponse{Alerts: make([]DeviceAlert, 0)}
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	alerts := make([]DeviceAlert, 0, len(t.alerts))
 	for _, alert := range t.alerts {
+		if alert == nil {
+			continue
+		}
 		alerts = append(alerts, *alert)
 	}
 
@@ -428,6 +462,9 @@ func (t *DeviceTracker) GetAlerts() DeviceAlertsResponse {
 
 // GetNodeHistory returns device count history for a specific node
 func (t *DeviceTracker) GetNodeHistory(cluster, nodeName string) []DeviceSnapshot {
+	if t == nil {
+		return nil
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -457,6 +494,9 @@ type DeviceInventoryResponse struct {
 // GetInventory returns all tracked nodes with their device counts
 // Data is already deduplicated at scan time via DeduplicatedClusters
 func (t *DeviceTracker) GetInventory() DeviceInventoryResponse {
+	if t == nil {
+		return DeviceInventoryResponse{Nodes: make([]NodeDeviceInventory, 0)}
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -494,6 +534,9 @@ func (t *DeviceTracker) GetInventory() DeviceInventoryResponse {
 
 // ClearAlert manually clears an alert (e.g., after power cycle)
 func (t *DeviceTracker) ClearAlert(alertID string) bool {
+	if t == nil {
+		return false
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 

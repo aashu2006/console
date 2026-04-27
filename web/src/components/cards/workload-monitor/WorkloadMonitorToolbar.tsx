@@ -53,7 +53,7 @@ export function WorkloadMonitorToolbar({
   return (
     <div className="space-y-2 mb-3">
       {/* Top row: summary + controls */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div className="flex items-center gap-2">
           <StatusBadge color="purple">
             {totalItems} resources
@@ -128,7 +128,7 @@ export function WorkloadMonitorToolbar({
           value={search}
           onChange={(e) => onSearchChange(e.target.value)}
           placeholder={t('common.searchResources')}
-          className="w-full pl-8 pr-3 py-1.5 text-xs bg-secondary rounded-md text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+          className="w-full pl-8 pr-3 py-1.5 text-xs bg-secondary rounded-md text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
         />
       </div>
     </div>

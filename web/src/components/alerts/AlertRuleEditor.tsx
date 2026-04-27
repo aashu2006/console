@@ -4,6 +4,7 @@ import { Trash2, Server, Bell, BellOff, Bot, Webhook, Siren, ShieldAlert } from 
 import { Slack } from '@/lib/icons'
 import { useClusters } from '../../hooks/useMCP'
 import { BaseModal, ConfirmDialog } from '../../lib/modals'
+import { SECONDS_PER_MINUTE, SECONDS_PER_HOUR } from '../../lib/constants/time'
 import type {
   AlertRule,
   AlertCondition,
@@ -20,6 +21,21 @@ const TEMPERATURE_MIN = -50 // Minimum temperature in Fahrenheit
 const TEMPERATURE_MAX = 150 // Maximum temperature in Fahrenheit
 const WIND_SPEED_MIN = 1 // Minimum wind speed in mph
 const WIND_SPEED_MAX = 200 // Maximum wind speed in mph
+
+// Default values for new alert rules (used in unsaved-changes detection)
+const DEFAULT_THRESHOLD = 90 // Default GPU/memory threshold percentage
+const DEFAULT_DURATION_SECS = 60 // Default condition duration in seconds
+const DEFAULT_TEMPERATURE_F = 100 // Default temperature threshold in Fahrenheit
+const DEFAULT_WIND_SPEED_MPH = 40 // Default wind speed threshold in mph
+
+/** Preset duration options shown as clickable chips in the rule editor */
+const DURATION_PRESETS = [
+  { label: 'Immediate', value: 0 },
+  { label: '1 min', value: SECONDS_PER_MINUTE },
+  { label: '5 min', value: 5 * SECONDS_PER_MINUTE },
+  { label: '15 min', value: 15 * SECONDS_PER_MINUTE },
+  { label: '1 hour', value: SECONDS_PER_HOUR },
+] as const
 
 interface AlertRuleEditorProps {
   isOpen?: boolean
@@ -58,8 +74,8 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
   const [conditionType, setAlertConditionType] = useState<AlertConditionType>(
     rule?.condition.type || 'gpu_usage'
   )
-  const [threshold, setThreshold] = useState(rule?.condition.threshold || 90)
-  const [duration, setDuration] = useState(rule?.condition.duration || 60)
+  const [threshold, setThreshold] = useState(rule?.condition.threshold ?? DEFAULT_THRESHOLD)
+  const [duration, setDuration] = useState(rule?.condition.duration ?? DEFAULT_DURATION_SECS)
   const [selectedClusters, setSelectedClusters] = useState<string[]>(
     rule?.condition.clusters || []
   )
@@ -71,8 +87,8 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
   const [weatherCondition, setWeatherCondition] = useState<'severe_storm' | 'extreme_heat' | 'heavy_rain' | 'snow' | 'high_wind'>(
     rule?.condition.weatherCondition || 'severe_storm'
   )
-  const [temperatureThreshold, setTemperatureThreshold] = useState(rule?.condition.temperatureThreshold || 100)
-  const [windSpeedThreshold, setWindSpeedThreshold] = useState(rule?.condition.windSpeedThreshold || 40)
+  const [temperatureThreshold, setTemperatureThreshold] = useState(rule?.condition.temperatureThreshold ?? DEFAULT_TEMPERATURE_F)
+  const [windSpeedThreshold, setWindSpeedThreshold] = useState(rule?.condition.windSpeedThreshold ?? DEFAULT_WIND_SPEED_MPH)
 
   // Channels state
   const [channels, setChannels] = useState<AlertChannel[]>(
@@ -88,6 +104,14 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
     onCancel()
   }
 
+  // Issue 9257 — baseline channels for a new rule. A fresh rule starts with
+  // one default browser channel, so `channels.length > 0` was always true and
+  // the Cancel button always triggered the discard prompt even when nothing
+  // had been edited. Compare against this baseline instead.
+  const DEFAULT_NEW_RULE_CHANNELS: AlertChannel[] = [
+    { type: 'browser', enabled: true, config: {} },
+  ]
+
   const handleClose = () => {
     // Check ALL fields for changes, not just name/description (#5716)
     const hasChanges = rule
@@ -95,11 +119,22 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
          severity !== rule.severity || enabled !== rule.enabled ||
          aiDiagnose !== (rule.aiDiagnose ?? true) ||
          conditionType !== rule.condition.type ||
-         threshold !== (rule.condition.threshold || 90) ||
-         duration !== (rule.condition.duration || 60) ||
+         threshold !== (rule.condition.threshold ?? DEFAULT_THRESHOLD) ||
+         duration !== (rule.condition.duration ?? DEFAULT_DURATION_SECS) ||
+         weatherCondition !== (rule.condition.weatherCondition || 'severe_storm') ||
+         temperatureThreshold !== (rule.condition.temperatureThreshold ?? DEFAULT_TEMPERATURE_F) ||
+         windSpeedThreshold !== (rule.condition.windSpeedThreshold ?? DEFAULT_WIND_SPEED_MPH) ||
          JSON.stringify(selectedClusters) !== JSON.stringify(rule.condition.clusters || []) ||
          JSON.stringify(channels) !== JSON.stringify(rule.channels || []))
-      : (name.trim() !== '' || description.trim() !== '')
+      : (name.trim() !== '' || description.trim() !== '' ||
+         severity !== 'warning' || !enabled || aiDiagnose !== true ||
+         conditionType !== 'gpu_usage' ||
+         threshold !== DEFAULT_THRESHOLD || duration !== DEFAULT_DURATION_SECS ||
+         weatherCondition !== 'severe_storm' ||
+         temperatureThreshold !== DEFAULT_TEMPERATURE_F ||
+         windSpeedThreshold !== DEFAULT_WIND_SPEED_MPH ||
+         selectedClusters.length > 0 ||
+         JSON.stringify(channels) !== JSON.stringify(DEFAULT_NEW_RULE_CHANNELS))
     if (hasChanges) {
       setShowDiscardConfirm(true)
       return
@@ -114,25 +149,36 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
       newErrors.name = t('alerts.nameRequired')
     }
 
+    // Issue 9257 — validation messages previously hardcoded English strings
+    // even though the translation keys already exist (alerts.thresholdRange,
+    // alerts.restartCountMin, alerts.temperatureRange, alerts.windSpeedRange).
     if (conditionType === 'gpu_usage' || conditionType === 'memory_pressure') {
       if (threshold < PERCENTAGE_MIN || threshold > PERCENTAGE_MAX) {
-        newErrors.threshold = `Threshold must be between ${PERCENTAGE_MIN} and ${PERCENTAGE_MAX}`
+        newErrors.threshold = t('alerts.thresholdRange', { min: PERCENTAGE_MIN, max: PERCENTAGE_MAX })
       }
     }
 
     if (conditionType === 'pod_crash') {
       if (threshold < RESTART_COUNT_MIN) {
-        newErrors.threshold = `Restart count must be at least ${RESTART_COUNT_MIN}`
+        newErrors.threshold = t('alerts.restartCountMin', { min: RESTART_COUNT_MIN })
       }
     }
 
     if (conditionType === 'weather_alerts') {
       if (weatherCondition === 'extreme_heat' && (temperatureThreshold < TEMPERATURE_MIN || temperatureThreshold > TEMPERATURE_MAX)) {
-        newErrors.temperatureThreshold = `Temperature must be between ${TEMPERATURE_MIN} and ${TEMPERATURE_MAX}`
+        newErrors.temperatureThreshold = t('alerts.temperatureRange', { min: TEMPERATURE_MIN, max: TEMPERATURE_MAX })
       }
       if (weatherCondition === 'high_wind' && (windSpeedThreshold < WIND_SPEED_MIN || windSpeedThreshold > WIND_SPEED_MAX)) {
-        newErrors.windSpeedThreshold = `Wind speed must be between ${WIND_SPEED_MIN} and ${WIND_SPEED_MAX}`
+        newErrors.windSpeedThreshold = t('alerts.windSpeedRange', { min: WIND_SPEED_MIN, max: WIND_SPEED_MAX })
       }
+    }
+
+    // Issue 9254 — previously a rule could be saved with zero enabled
+    // notification channels, which meant the rule fired silently. Refuse to
+    // save without at least one enabled channel.
+    const enabledChannelCount = channels.filter(ch => ch.enabled).length
+    if (enabledChannelCount === 0) {
+      newErrors.channels = t('alerts.atLeastOneChannelRequired', 'Enable at least one notification channel, or no one will be notified when this rule fires.')
     }
 
     setErrors(newErrors)
@@ -216,15 +262,17 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
           {/* Basic Info */}
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-foreground mb-1">
+              <label htmlFor="alertRuleName" className="block text-sm font-medium text-foreground mb-1">
                 {t('alerts.ruleName')} *
               </label>
               <input
+                id="alertRuleName"
+                name="alertRuleName"
                 type="text"
                 value={name}
                 onChange={e => setName(e.target.value)}
                 placeholder={t('alerts.ruleNamePlaceholder')}
-                className={`w-full px-3 py-2 rounded-lg bg-secondary border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500 ${
+                className={`w-full px-3 py-2 rounded-lg bg-secondary border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500 ${
                   errors.name ? 'border-red-500' : 'border-border'
                 }`}
               />
@@ -234,15 +282,17 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground mb-1">
+              <label htmlFor="alertRuleDescription" className="block text-sm font-medium text-foreground mb-1">
                 {t('alerts.description')}
               </label>
               <textarea
+                id="alertRuleDescription"
+                name="alertRuleDescription"
                 value={description}
                 onChange={e => setDescription(e.target.value)}
                 placeholder={t('alerts.descriptionPlaceholder')}
                 rows={2}
-                className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none"
+                className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500 resize-none"
               />
             </div>
 
@@ -320,17 +370,19 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
             {/* Threshold input */}
             {['gpu_usage', 'memory_pressure'].includes(conditionType) && (
               <div>
-                <label className="block text-xs text-muted-foreground mb-1">
+                <label htmlFor="alertRuleThreshold" className="block text-xs text-muted-foreground mb-1">
                   {t('alerts.thresholdPercent')}
                 </label>
                 <div className="flex items-center gap-2">
                   <input
+                    id="alertRuleThreshold"
+                    name="alertRuleThreshold"
                     type="number"
                     min={1}
                     max={100}
                     value={threshold}
                     onChange={e => setThreshold(Number(e.target.value))}
-                    className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500 ${
+                    className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500 ${
                       errors.threshold ? 'border-red-500' : 'border-border'
                     }`}
                   />
@@ -344,17 +396,19 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
 
             {conditionType === 'pod_crash' && (
               <div>
-                <label className="block text-xs text-muted-foreground mb-1">
+                <label htmlFor="alertRuleRestartThreshold" className="block text-xs text-muted-foreground mb-1">
                   {t('alerts.restartCountThreshold')}
                 </label>
                 <div className="flex items-center gap-2">
                   <input
+                    id="alertRuleRestartThreshold"
+                    name="alertRuleRestartThreshold"
                     type="number"
                     min={1}
                     max={100}
                     value={threshold}
                     onChange={e => setThreshold(Number(e.target.value))}
-                    className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500 ${
+                    className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500 ${
                       errors.threshold ? 'border-red-500' : 'border-border'
                     }`}
                   />
@@ -367,13 +421,15 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
             {conditionType === 'weather_alerts' && (
               <div className="space-y-3">
                 <div>
-                  <label className="block text-xs text-muted-foreground mb-1">
+                  <label htmlFor="alertRuleWeatherCondition" className="block text-xs text-muted-foreground mb-1">
                     {t('alerts.weatherCondition')}
                   </label>
                   <select
+                    id="alertRuleWeatherCondition"
+                    name="alertRuleWeatherCondition"
                     value={weatherCondition}
                     onChange={e => setWeatherCondition(e.target.value as typeof weatherCondition)}
-                    className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
                   >
                     <option value="severe_storm">{t('alerts.weather.severeStorm')}</option>
                     <option value="extreme_heat">{t('alerts.weather.extremeHeat')}</option>
@@ -385,17 +441,19 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
 
                 {weatherCondition === 'extreme_heat' && (
                   <div>
-                    <label className="block text-xs text-muted-foreground mb-1">
+                    <label htmlFor="alertRuleTemperatureThreshold" className="block text-xs text-muted-foreground mb-1">
                       {t('alerts.temperatureThreshold')}
                     </label>
                     <div className="flex items-center gap-2">
                       <input
+                        id="alertRuleTemperatureThreshold"
+                        name="alertRuleTemperatureThreshold"
                         type="number"
                         min={-50}
                         max={150}
                         value={temperatureThreshold}
                         onChange={e => setTemperatureThreshold(Number(e.target.value))}
-                        className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500 ${
+                        className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500 ${
                           errors.temperatureThreshold ? 'border-red-500' : 'border-border'
                         }`}
                       />
@@ -409,17 +467,19 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
 
                 {weatherCondition === 'high_wind' && (
                   <div>
-                    <label className="block text-xs text-muted-foreground mb-1">
+                    <label htmlFor="alertRuleWindSpeedThreshold" className="block text-xs text-muted-foreground mb-1">
                       {t('alerts.windSpeedThreshold')}
                     </label>
                     <div className="flex items-center gap-2">
                       <input
+                        id="alertRuleWindSpeedThreshold"
+                        name="alertRuleWindSpeedThreshold"
                         type="number"
                         min={1}
                         max={200}
                         value={windSpeedThreshold}
                         onChange={e => setWindSpeedThreshold(Number(e.target.value))}
-                        className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500 ${
+                        className={`w-24 px-3 py-2 rounded-lg bg-secondary border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500 ${
                           errors.windSpeedThreshold ? 'border-red-500' : 'border-border'
                         }`}
                       />
@@ -435,19 +495,35 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
 
             {/* Duration */}
             <div>
-              <label className="block text-xs text-muted-foreground mb-1">
+              <label htmlFor="alertRuleDuration" className="block text-xs text-muted-foreground mb-1">
                 {t('alerts.durationSeconds')}
               </label>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                {DURATION_PRESETS.map(preset => (
+                  <button
+                    key={preset.value}
+                    type="button"
+                    onClick={() => setDuration(preset.value)}
+                    className={`px-2.5 py-1.5 text-xs rounded-lg border transition-colors ${
+                      duration === preset.value
+                        ? 'bg-purple-500/20 border-purple-500/30 text-purple-400'
+                        : 'bg-secondary border-border text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
                 <input
+                  id="alertRuleDuration"
+                  name="alertRuleDuration"
                   type="number"
                   min={0}
                   max={3600}
                   value={duration}
                   onChange={e => setDuration(Number(e.target.value))}
-                  className="w-24 px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  className="w-20 px-2 py-1.5 text-xs rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
                 />
-                <span className="text-sm text-muted-foreground">{t('alerts.durationHint')}</span>
+                <span className="text-xs text-muted-foreground">{t('alerts.durationHint')}</span>
               </div>
             </div>
 
@@ -481,6 +557,13 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
 
           {/* Notification Channels */}
           <div className="space-y-4">
+            {/* Issue 9254 — warn when no enabled channel is present so users
+                don't save rules that fire silently. */}
+            {errors.channels && (
+              <div className="p-2 rounded bg-red-500/10 border border-red-500/30 text-xs text-red-400">
+                {errors.channels}
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-medium text-foreground">{t('alerts.notificationChannels')}</h4>
               <div className="flex gap-2">
@@ -572,71 +655,102 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
 
                   {channel.type === 'slack' && (
                     <div className="space-y-2">
+                      <label htmlFor={`alertRuleSlackWebhookUrl-${index}`} className="sr-only">
+                        {t('alerts.slackWebhookUrl')}
+                      </label>
                       <input
+                        id={`alertRuleSlackWebhookUrl-${index}`}
+                        name={`alertRuleSlackWebhookUrl-${index}`}
                         type="text"
-                        placeholder="Slack Webhook URL"
+                        placeholder={t('alerts.slackWebhookUrlPlaceholder')}
                         value={channel.config.slackWebhookUrl || ''}
                         onChange={e =>
                           updateChannel(index, {
                             config: { ...channel.config, slackWebhookUrl: e.target.value },
                           })
                         }
-                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
                       />
+                      <label htmlFor={`alertRuleSlackChannel-${index}`} className="sr-only">
+                        {t('alerts.slackChannel')}
+                      </label>
                       <input
+                        id={`alertRuleSlackChannel-${index}`}
+                        name={`alertRuleSlackChannel-${index}`}
                         type="text"
-                        placeholder="#channel (optional)"
+                        placeholder={t('alerts.slackChannelPlaceholder')}
                         value={channel.config.slackChannel || ''}
                         onChange={e =>
                           updateChannel(index, {
                             config: { ...channel.config, slackChannel: e.target.value },
                           })
                         }
-                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
                       />
                     </div>
                   )}
 
                   {channel.type === 'webhook' && (
-                    <input
-                      type="text"
-                      placeholder="Webhook URL"
-                      value={channel.config.webhookUrl || ''}
-                      onChange={e =>
-                        updateChannel(index, {
-                          config: { ...channel.config, webhookUrl: e.target.value },
-                        })
-                      }
-                      className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    />
+                    <>
+                      <label htmlFor={`alertRuleWebhookUrl-${index}`} className="sr-only">
+                        {t('alerts.webhookUrl')}
+                      </label>
+                      <input
+                        id={`alertRuleWebhookUrl-${index}`}
+                        name={`alertRuleWebhookUrl-${index}`}
+                        type="text"
+                        placeholder={t('alerts.webhookUrlPlaceholder')}
+                        value={channel.config.webhookUrl || ''}
+                        onChange={e =>
+                          updateChannel(index, {
+                            config: { ...channel.config, webhookUrl: e.target.value },
+                          })
+                        }
+                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
+                      />
+                    </>
                   )}
 
                   {channel.type === 'pagerduty' && (
-                    <input
-                      type="password"
-                      placeholder="PagerDuty Routing Key"
-                      value={channel.config.pagerdutyRoutingKey || ''}
-                      onChange={e =>
-                        updateChannel(index, {
-                          config: { ...channel.config, pagerdutyRoutingKey: e.target.value },
-                        })
-                      }
-                      className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    />
+                    <>
+                      <label htmlFor={`alertRulePagerdutyRoutingKey-${index}`} className="sr-only">
+                        {t('alerts.pagerdutyRoutingKey')}
+                      </label>
+                      <input
+                        id={`alertRulePagerdutyRoutingKey-${index}`}
+                        name={`alertRulePagerdutyRoutingKey-${index}`}
+                        type="password"
+                        placeholder={t('alerts.pagerdutyRoutingKeyPlaceholder')}
+                        value={channel.config.pagerdutyRoutingKey || ''}
+                        onChange={e =>
+                          updateChannel(index, {
+                            config: { ...channel.config, pagerdutyRoutingKey: e.target.value },
+                          })
+                        }
+                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
+                      />
+                    </>
                   )}
 
                   {channel.type === 'opsgenie' && (
-                    <input
-                      type="password"
-                      placeholder="OpsGenie API Key"
-                      value={channel.config.opsgenieApiKey || ''}
-                      onChange={e =>
-                        updateChannel(index, {
-                          config: { ...channel.config, opsgenieApiKey: e.target.value },
-                        })
-                      }
-                      className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    />
+                    <>
+                      <label htmlFor={`alertRuleOpsgenieApiKey-${index}`} className="sr-only">
+                        {t('alerts.opsgenieApiKey')}
+                      </label>
+                      <input
+                        id={`alertRuleOpsgenieApiKey-${index}`}
+                        name={`alertRuleOpsgenieApiKey-${index}`}
+                        type="password"
+                        placeholder={t('alerts.opsgenieApiKeyPlaceholder')}
+                        value={channel.config.opsgenieApiKey || ''}
+                        onChange={e =>
+                          updateChannel(index, {
+                            config: { ...channel.config, opsgenieApiKey: e.target.value },
+                          })
+                        }
+                        className="w-full px-3 py-1.5 text-sm rounded bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
+                      />
+                    </>
                   )}
                 </div>
               ))}

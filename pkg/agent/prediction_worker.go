@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +18,10 @@ import (
 const (
 	predictionInitialDelay = 30 * time.Second
 	predictionTimeout      = 60 * time.Second
+
+	// perClusterDataTimeout bounds each goroutine's data-gathering work
+	// (pod issues + GPU nodes + offline nodes) for a single cluster.
+	perClusterDataTimeout = 15 * time.Second
 )
 
 // PredictionSettings holds configuration from the frontend
@@ -76,9 +81,13 @@ type PredictionWorker struct {
 	predictions []AIPrediction
 	providers   []string
 	lastRun     time.Time
-	running     bool
+	running     atomic.Bool
 	mu          sync.RWMutex
 	stopCh      chan struct{}
+	// stopOnce guards Stop() so that concurrent / repeated calls do not
+	// panic on "close of closed channel" — same idempotency pattern as
+	// #6478, #6586, #6623 (#6650).
+	stopOnce sync.Once
 	// ctx is the worker's lifecycle context; cancelled when Stop() is called.
 	// All in-flight analysis goroutines derive their context from this so
 	// they are cancelled promptly during graceful shutdown (#4720).
@@ -90,7 +99,11 @@ type PredictionWorker struct {
 
 	// Token tracking callback
 	trackTokens        func(usage *ProviderTokenUsage)
-	loggedClusterError bool // suppress repeated "no kubeconfig" errors
+	// loggedClusterError suppresses repeated "no kubeconfig" errors. This is
+	// read/written from runAnalysis, which can be invoked concurrently from
+	// the ticker goroutine and from on-demand Trigger() callers, so it must
+	// be accessed atomically to avoid a data race.
+	loggedClusterError atomic.Bool
 }
 
 // NewPredictionWorker creates a new prediction worker
@@ -116,9 +129,13 @@ func (w *PredictionWorker) Start() {
 }
 
 // Stop gracefully shuts down the worker and cancels all in-flight analyses.
+// Safe to call multiple times — only the first call closes stopCh and
+// cancels the lifecycle context (#6650).
 func (w *PredictionWorker) Stop() {
-	w.ctxCancel()
-	close(w.stopCh)
+	w.stopOnce.Do(func() {
+		w.ctxCancel()
+		close(w.stopCh)
+	})
 }
 
 // UpdateSettings updates the worker settings
@@ -163,21 +180,35 @@ func (w *PredictionWorker) GetPredictions() AIPredictionsResponse {
 	}
 }
 
-// TriggerAnalysis manually triggers an analysis
+// TriggerAnalysis manually triggers an analysis.
+//
+// #6673 — Panic safety. Previously if runAnalysis panicked (parser bug,
+// nil map access in a provider implementation, etc.), the `w.running = false`
+// reset would not execute and IsAnalyzing() would return true forever,
+// blocking all subsequent TriggerAnalysis calls until process restart.
+// Callers polling TriggerAnalysis as a lightweight RPC-style surface hung
+// indefinitely. Now we:
+//   1. recover the panic so the process survives,
+//   2. reset w.running in a defer that is guaranteed to run,
+//   3. log the panic with its stack for postmortem.
+// This is the pragmatic subset of the watchdog pattern called out in the
+// issue — a full crash-detection channel for every in-flight worker RPC
+// requires a larger refactor. See the doc comment on Stop() for the full
+// story around graceful shutdown and ctx propagation.
 func (w *PredictionWorker) TriggerAnalysis(providers []string) error {
-	w.mu.Lock()
-	if w.running {
-		w.mu.Unlock()
+	// Use atomic compare-and-swap to prevent concurrent runAnalysis
+	// executions without an unlocked window (#7002).
+	if !w.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("analysis already in progress")
 	}
-	w.running = true
-	w.mu.Unlock()
 
 	go func() {
 		defer func() {
-			w.mu.Lock()
-			w.running = false
-			w.mu.Unlock()
+			if r := recover(); r != nil {
+				slog.Error("[PredictionWorker] panic in runAnalysis; recovered",
+					"panic", r)
+			}
+			w.running.Store(false)
 		}()
 		w.runAnalysis(providers)
 	}()
@@ -187,15 +218,50 @@ func (w *PredictionWorker) TriggerAnalysis(providers []string) error {
 
 // IsAnalyzing returns whether analysis is currently running
 func (w *PredictionWorker) IsAnalyzing() bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.running
+	return w.running.Load()
 }
 
-// runLoop is the main background loop
+// runLoop is the main background loop.
+//
+// #6682 — The initial delay was a plain time.Sleep, which is uninterruptible.
+// A Stop() call arriving during the first 30 seconds of process startup used
+// to block graceful shutdown for the full predictionInitialDelay. Now we wait
+// on a time.After channel vs. ctx.Done so Stop() cancels promptly.
+//
+// #6685 — The interval wait previously used `time.After(interval)` inside
+// the for-loop. time.After allocates a fresh timer on every iteration and
+// leaks the underlying goroutine + channel if the select returns via a
+// different case before the timer fires — benign for small intervals, but
+// with PredictionSettings.Interval defaulting to 10 minutes this adds up
+// under rapid stop/start or settings-change churn. We now allocate a single
+// *time.Timer up front and Reset() it each iteration.
 func (w *PredictionWorker) runLoop() {
-	// Initial analysis after short delay
-	time.Sleep(predictionInitialDelay)
+	// Initial analysis after short delay. The previous implementation used
+	// a bare time.Sleep(predictionInitialDelay), which blocked shutdown for
+	// up to predictionInitialDelay if Stop() was called during startup —
+	// the shutdown signal was invisible until the sleep returned (#6652/#6682).
+	// Use a *time.Timer (not time.After) so it can be drained on early return,
+	// and select on stopCh + ctx.Done so shutdown is responsive during the
+	// startup delay window.
+	initialTimer := time.NewTimer(predictionInitialDelay)
+	select {
+	case <-initialTimer.C:
+	case <-w.stopCh:
+		initialTimer.Stop()
+		slog.Info("[PredictionWorker] Stopping before initial delay")
+		return
+	case <-w.ctx.Done():
+		initialTimer.Stop()
+		slog.Info("[PredictionWorker] Context cancelled before initial delay")
+		return
+	}
+
+	// Single reusable timer for the interval wait (#6685).
+	intervalTimer := time.NewTimer(0)
+	if !intervalTimer.Stop() {
+		<-intervalTimer.C // drain the zero-duration firing before Reset
+	}
+	defer intervalTimer.Stop()
 
 	for {
 		w.mu.RLock()
@@ -203,24 +269,58 @@ func (w *PredictionWorker) runLoop() {
 		w.mu.RUnlock()
 
 		if settings.AIEnabled {
-			w.mu.Lock()
-			if !w.running {
-				w.running = true
-				w.mu.Unlock()
-				w.runAnalysis(nil)
-				w.mu.Lock()
-				w.running = false
+			// Use atomic CAS to prevent concurrent runAnalysis (#7002).
+			if w.running.CompareAndSwap(false, true) {
+				// #6673 — recover from panics in runAnalysis so the
+				// periodic loop survives a single bad run. Without this,
+				// a panic in any provider parser would permanently kill
+				// the worker goroutine but leave the struct pointer
+				// alive, silently stopping all predictions.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("[PredictionWorker] panic in runLoop runAnalysis; recovered",
+								"panic", r)
+						}
+					}()
+					w.runAnalysis(nil)
+				}()
+				w.running.Store(false)
 			}
-			w.mu.Unlock()
 		}
 
-		// Wait for next interval or stop signal
-		interval := time.Duration(settings.Interval) * time.Minute
+		// Wait for next interval or stop signal using the reused timer.
+		// Guard against zero/negative interval to prevent busy-loop DoS (#9620).
+		intervalMinutes := settings.Interval
+		if intervalMinutes < 1 {
+			intervalMinutes = 10
+		}
+		interval := time.Duration(intervalMinutes) * time.Minute
+		intervalTimer.Reset(interval)
 		select {
-		case <-time.After(interval):
+		case <-intervalTimer.C:
 			continue
 		case <-w.stopCh:
+			if !intervalTimer.Stop() {
+				// Drain the channel if the timer already fired to keep
+				// the next potential Reset() race-free.
+				select {
+				case <-intervalTimer.C:
+				default:
+				}
+			}
 			slog.Info("[PredictionWorker] Stopping")
+			return
+		case <-w.ctx.Done():
+			// Handle context cancellation during interval wait, mirroring
+			// the initial-delay select (#6998).
+			if !intervalTimer.Stop() {
+				select {
+				case <-intervalTimer.C:
+				default:
+				}
+			}
+			slog.Info("[PredictionWorker] Context cancelled during interval wait")
 			return
 		}
 	}
@@ -237,8 +337,9 @@ func (w *PredictionWorker) runAnalysis(specificProviders []string) {
 
 	clusterData, err := w.gatherClusterData(ctx)
 	if err != nil {
-		if !w.loggedClusterError {
-			w.loggedClusterError = true
+		// CompareAndSwap returns true exactly once (first false->true flip),
+		// so the slog.Info fires at most once across concurrent callers.
+		if w.loggedClusterError.CompareAndSwap(false, true) {
 			slog.Info("[PredictionWorker] cluster data unavailable (will retry silently)", "error", err)
 		}
 		return
@@ -407,83 +508,110 @@ func (w *PredictionWorker) gatherClusterData(ctx context.Context) (*ClusterAnaly
 		}
 	}
 
-	// Get pod issues from healthy clusters only
-	clusters, err := w.k8sClient.ListClusters(ctx)
+	// Gather pod issues, GPU nodes, and offline nodes in parallel across
+	// healthy clusters. Uses DeduplicatedClusters to avoid querying the same
+	// physical cluster twice when multiple kubeconfig contexts exist.
+	clusters, err := w.k8sClient.DeduplicatedClusters(ctx)
 	if err != nil {
 		slog.Error("[PredictionWorker] error listing clusters", "error", err)
 	} else {
+		podIssues := make([]PodIssueSummary, 0)
+		gpuNodes := make([]GPUNodeSummary, 0)
+		offlineNodes := make([]NodeSummary, 0)
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
 		for _, cluster := range clusters {
 			if !healthyClusterSet[cluster.Name] {
 				slog.Info("[PredictionWorker] skipping offline cluster", "cluster", cluster.Name)
 				continue
 			}
-			pods, err := w.k8sClient.FindPodIssues(ctx, cluster.Context, "")
-			if err != nil {
-				slog.Error("[PredictionWorker] error getting pod issues", "cluster", cluster.Name, "error", err)
-				continue
-			}
-			for _, p := range pods {
-				data.PodIssues = append(data.PodIssues, PodIssueSummary{
-					Name:      p.Name,
-					Namespace: p.Namespace,
-					Cluster:   cluster.Name,
-					Restarts:  p.Restarts,
-					Status:    p.Status,
-				})
-			}
-		}
-	}
+			wg.Add(1)
+			go func(cl k8s.ClusterInfo) {
+				defer wg.Done()
 
-	// Get GPU nodes from healthy clusters only
-	if clusters == nil {
-		var fallbackErr error
-		clusters, fallbackErr = w.k8sClient.ListClusters(ctx)
-		if fallbackErr != nil {
-			slog.Error("[PredictionWorker] fallback ListClusters for GPU nodes failed", "error", fallbackErr)
-		}
-	}
-	for _, cluster := range clusters {
-		if !healthyClusterSet[cluster.Name] {
-			continue
-		}
-		gpuNodes, err := w.k8sClient.GetGPUNodes(ctx, cluster.Context)
-		if err != nil {
-			slog.Error("[PredictionWorker] error getting GPU nodes", "cluster", cluster.Name, "error", err)
-			continue
-		}
-		for _, g := range gpuNodes {
-			data.GPUNodes = append(data.GPUNodes, GPUNodeSummary{
-				Name:      g.Name,
-				Cluster:   g.Cluster,
-				Allocated: g.GPUAllocated,
-				Total:     g.GPUCount,
-			})
-		}
-	}
-
-	// Get offline/unhealthy nodes from healthy clusters only
-	for _, cluster := range clusters {
-		if !healthyClusterSet[cluster.Name] {
-			continue
-		}
-		nodes, err := w.k8sClient.GetNodes(ctx, cluster.Context)
-		if err != nil {
-			slog.Error("[PredictionWorker] error getting nodes", "cluster", cluster.Name, "error", err)
-			continue
-		}
-		for _, n := range nodes {
-			if n.Status != "Ready" || n.Unschedulable {
-				status := n.Status
-				if n.Unschedulable {
-					status = "Cordoned"
+				// Check parent context before starting work
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
-				data.OfflineNodes = append(data.OfflineNodes, NodeSummary{
-					Name:    n.Name,
-					Cluster: cluster.Name,
-					Status:  status,
-				})
-			}
+
+				clusterCtx, cancel := context.WithTimeout(ctx, perClusterDataTimeout)
+				defer cancel()
+
+				// --- Pod issues ---
+				pods, podErr := w.k8sClient.FindPodIssues(clusterCtx, cl.Context, "")
+				if podErr != nil {
+					slog.Error("[PredictionWorker] error getting pod issues", "cluster", cl.Name, "error", podErr)
+				} else {
+					localPods := make([]PodIssueSummary, 0, len(pods))
+					for _, p := range pods {
+						localPods = append(localPods, PodIssueSummary{
+							Name:      p.Name,
+							Namespace: p.Namespace,
+							Cluster:   cl.Name,
+							Restarts:  p.Restarts,
+							Status:    p.Status,
+						})
+					}
+					mu.Lock()
+					podIssues = append(podIssues, localPods...)
+					mu.Unlock()
+				}
+
+				// --- GPU nodes ---
+				gpus, gpuErr := w.k8sClient.GetGPUNodes(clusterCtx, cl.Context)
+				if gpuErr != nil {
+					slog.Error("[PredictionWorker] error getting GPU nodes", "cluster", cl.Name, "error", gpuErr)
+				} else {
+					localGPU := make([]GPUNodeSummary, 0, len(gpus))
+					for _, g := range gpus {
+						localGPU = append(localGPU, GPUNodeSummary{
+							Name:      g.Name,
+							Cluster:   g.Cluster,
+							Allocated: g.GPUAllocated,
+							Total:     g.GPUCount,
+						})
+					}
+					mu.Lock()
+					gpuNodes = append(gpuNodes, localGPU...)
+					mu.Unlock()
+				}
+
+				// --- Offline / unhealthy nodes ---
+				nodes, nodeErr := w.k8sClient.GetNodes(clusterCtx, cl.Context)
+				if nodeErr != nil {
+					slog.Error("[PredictionWorker] error getting nodes", "cluster", cl.Name, "error", nodeErr)
+				} else {
+					localOffline := make([]NodeSummary, 0)
+					for _, n := range nodes {
+						if n.Status != "Ready" || n.Unschedulable {
+							status := n.Status
+							if n.Unschedulable {
+								status = "Cordoned"
+							}
+							localOffline = append(localOffline, NodeSummary{
+								Name:    n.Name,
+								Cluster: cl.Name,
+								Status:  status,
+							})
+						}
+					}
+					if len(localOffline) > 0 {
+						mu.Lock()
+						offlineNodes = append(offlineNodes, localOffline...)
+						mu.Unlock()
+					}
+				}
+			}(cluster)
 		}
+		wg.Wait()
+
+		data.PodIssues = podIssues
+		data.GPUNodes = gpuNodes
+		data.OfflineNodes = offlineNodes
 	}
 
 	return data, nil
@@ -577,13 +705,10 @@ func (w *PredictionWorker) analyzeWithProvider(ctx context.Context, provider AIP
 }
 
 func (w *PredictionWorker) parseAIPredictions(response string, providerName string) ([]AIPrediction, error) {
-	// Extract JSON from response (might have markdown wrapper)
-	jsonStr := response
-	if idx := strings.Index(response, "{"); idx != -1 {
-		jsonStr = response[idx:]
-	}
-	if idx := strings.LastIndex(jsonStr, "}"); idx != -1 {
-		jsonStr = jsonStr[:idx+1]
+	// Find the start of the JSON object, skipping any markdown fences or preamble.
+	jsonStart := strings.Index(response, "{")
+	if jsonStart == -1 {
+		return nil, fmt.Errorf("failed to parse AI response: no JSON object found")
 	}
 
 	var result struct {
@@ -599,7 +724,9 @@ func (w *PredictionWorker) parseAIPredictions(response string, providerName stri
 		} `json:"predictions"`
 	}
 
-	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+	// Use json.Decoder which naturally ignores trailing non-JSON text.
+	dec := json.NewDecoder(strings.NewReader(response[jsonStart:]))
+	if err := dec.Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to parse AI response: %w", err)
 	}
 

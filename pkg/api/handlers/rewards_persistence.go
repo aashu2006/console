@@ -104,7 +104,7 @@ func (h *RewardsPersistenceHandler) GetUserRewards(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "not authenticated"})
 	}
 
-	rewards, err := h.store.GetUserRewards(userID)
+	rewards, err := h.store.GetUserRewards(c.UserContext(), userID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to load rewards"})
 	}
@@ -156,7 +156,7 @@ func (h *RewardsPersistenceHandler) UpdateUserRewards(c *fiber.Ctx) error {
 
 	// Preserve LastDailyBonusAt from the existing row so this endpoint does
 	// NOT become a way to reset the daily-bonus cooldown.
-	existing, err := h.store.GetUserRewards(userID)
+	existing, err := h.store.GetUserRewards(c.UserContext(), userID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to load rewards"})
 	}
@@ -169,13 +169,13 @@ func (h *RewardsPersistenceHandler) UpdateUserRewards(c *fiber.Ctx) error {
 		BonusPoints:      body.BonusPoints,
 		LastDailyBonusAt: existing.LastDailyBonusAt,
 	}
-	if err := h.store.UpdateUserRewards(rewards); err != nil {
+	if err := h.store.UpdateUserRewards(c.UserContext(), rewards); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save rewards"})
 	}
 
 	// Re-read to return canonical server-side state (including the fresh
 	// updated_at timestamp the store assigned).
-	fresh, err := h.store.GetUserRewards(userID)
+	fresh, err := h.store.GetUserRewards(c.UserContext(), userID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to reload rewards"})
 	}
@@ -208,7 +208,9 @@ func (h *RewardsPersistenceHandler) IncrementCoins(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "delta exceeds per-request limit"})
 	}
 
-	updated, err := h.store.IncrementUserCoins(userID, body.Delta)
+	// #6613: thread the request context through the store so a client
+	// disconnect or deadline aborts the BEGIN IMMEDIATE transaction.
+	updated, err := h.store.IncrementUserCoins(c.UserContext(), userID, body.Delta)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to increment coins"})
 	}
@@ -228,12 +230,13 @@ func (h *RewardsPersistenceHandler) ClaimDailyBonus(c *fiber.Ctx) error {
 	}
 
 	interval := time.Duration(dailyBonusIntervalHours) * time.Hour
-	updated, err := h.store.ClaimDailyBonus(userID, dailyBonusPoints, interval, time.Now())
+	// #6613: thread the request context through the store.
+	updated, err := h.store.ClaimDailyBonus(c.UserContext(), userID, dailyBonusPoints, interval, time.Now())
 	if err != nil {
 		if errors.Is(err, store.ErrDailyBonusUnavailable) {
 			// Surface the current state so the UI can still render the
 			// existing balances and the timestamp of the last claim.
-			current, getErr := h.store.GetUserRewards(userID)
+			current, getErr := h.store.GetUserRewards(c.UserContext(), userID)
 			if getErr == nil {
 				resp := toResponse(current)
 				return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{

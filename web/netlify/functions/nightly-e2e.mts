@@ -10,6 +10,7 @@
  */
 import { getStore } from "@netlify/blobs";
 import { unzipSync } from "fflate";
+import { buildCorsHeaders, handlePreflight } from "./_shared/cors";
 
 const CACHE_STORE = "nightly-e2e";
 const CACHE_KEY = "runs";
@@ -169,12 +170,22 @@ function isGPUStep(name: string): boolean {
 // Dynamic image tag fetching from guide YAML files
 // ---------------------------------------------------------------------------
 
-/** Regex for direct image refs: ghcr.io/llm-d/<name>:<tag> */
+/**
+ * Regex for direct image refs: ghcr.io/llm-d/<name>:<tag>
+ * Applied with matchAll() across the full YAML content — no line anchors
+ * needed here since the pattern itself is specific enough.
+ */
 const IMAGE_RE = /ghcr\.io\/llm-d\/([\w][\w.-]*?):([\w][\w.+-]*)/g;
-/** Regex for hub: ghcr.io/llm-d pattern (EPP images) */
-const HUB_RE = /hub:\s*ghcr\.io\/llm-d\b/i;
-const NAME_RE = /name:\s*([\w][\w.-]*)/i;
-const TAG_RE = /tag:\s*([\w][\w.+-]*)/i;
+
+/**
+ * Regex for hub/name/tag EPP image patterns.  ^ and $ anchor each regex to
+ * the full line it is tested against (js/regex/missing-regexp-anchor).
+ * These are always called with exec()/test() on a single trimmed YAML line,
+ * so per-line anchoring is both safe and correct.
+ */
+const HUB_RE = /^.*hub:\s*ghcr\.io\/llm-d\b.*$/i;
+const NAME_RE = /^.*name:\s*([\w][\w.-]*).*$/i;
+const TAG_RE = /^.*tag:\s*([\w][\w.+-]*).*$/i;
 
 /** Parse ghcr.io/llm-d image references from YAML content */
 function parseImagesFromYAML(content: string): Record<string, string> {
@@ -608,15 +619,18 @@ async function fetchAll(
 // ---------------------------------------------------------------------------
 
 export default async (req: Request) => {
+  // See web/netlify/functions/_shared/cors.ts for allowlist rationale (#9879).
+  const corsOpts = {
+    methods: "GET, OPTIONS",
+    headers: "Content-Type, Authorization, Accept",
+  };
   const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+    ...buildCorsHeaders(req, corsOpts),
     "Cache-Control": "no-cache, no-store",
   };
 
   if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return handlePreflight(req, corsOpts);
   }
 
   const token = process.env.GITHUB_TOKEN || "";

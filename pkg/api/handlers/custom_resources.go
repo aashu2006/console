@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -22,8 +23,11 @@ type CustomResourceItem struct {
 }
 
 // CustomResourceResponse is the response for GET /api/mcp/custom-resources.
+// Errors maps cluster name -> error message for per-cluster failures (#7967,
+// #7973). Empty/missing when all fanned-out clusters succeeded.
 type CustomResourceResponse struct {
 	Items      []CustomResourceItem `json:"items"`
+	Errors     map[string]string    `json:"errors,omitempty"`
 	IsDemoData bool                 `json:"isDemoData"`
 }
 
@@ -40,6 +44,12 @@ type CustomResourceResponse struct {
 // Kubernetes RBAC controls access — if the user's kubeconfig cannot list the
 // resource, the per-cluster query silently returns zero items.
 func (h *MCPHandlers) GetCustomResources(c *fiber.Ctx) error {
+	// SECURITY (#7487): custom resource listing can expose sensitive spec/status
+	// data; require a valid console role (viewer or above).
+	if err := requireViewerOrAbove(c, h.store); err != nil {
+		return err
+	}
+
 	if isDemoMode(c) {
 		return c.JSON(CustomResourceResponse{Items: []CustomResourceItem{}, IsDemoData: true})
 	}
@@ -77,8 +87,19 @@ func (h *MCPHandlers) GetCustomResources(c *fiber.Ctx) error {
 	if cluster != "" {
 		items, err := h.listCR(c.Context(), cluster, namespace, gvr)
 		if err != nil {
-			slog.Info("custom-resources: cluster error", "cluster", cluster, "error", err)
-			return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("failed to list %s: %v", resource, err)})
+			slog.Warn("custom-resources: cluster error", "cluster", cluster, "error", err)
+			// #7973: distinguish RBAC 403 (caller has no permission) from
+			// infrastructure 500 (apiserver unreachable, CRD not installed,
+			// etc.). Previously both were collapsed into a 500, which hid
+			// permission errors from the UI and made them look like server
+			// bugs.
+			if apierrors.IsForbidden(err) {
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+					"error":   fmt.Sprintf("forbidden: %v", err),
+					"cluster": cluster,
+				})
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": fmt.Sprintf("failed to list %s: %v", resource, err)})
 		}
 		return c.JSON(CustomResourceResponse{Items: items, IsDemoData: false})
 	}
@@ -86,13 +107,14 @@ func (h *MCPHandlers) GetCustomResources(c *fiber.Ctx) error {
 	// Fan-out across all healthy clusters
 	clusters, _, err := h.k8sClient.HealthyClusters(c.Context())
 	if err != nil {
-		slog.Info("custom-resources: HealthyClusters failed", "error", err)
+		slog.Warn("custom-resources: HealthyClusters failed", "error", err)
 		return c.Status(500).JSON(fiber.Map{"error": "internal server error"})
 	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	allItems := make([]CustomResourceItem, 0)
+	clusterErrors := make(map[string]string)
 
 	clusterCtx, clusterCancel := context.WithCancel(c.Context())
 	defer clusterCancel()
@@ -106,7 +128,22 @@ func (h *MCPHandlers) GetCustomResources(c *fiber.Ctx) error {
 
 			items, err := h.listCR(ctx, clusterName, namespace, gvr)
 			if err != nil {
-				// RBAC denied or CRD not installed on this cluster — skip silently
+				// #7973: propagate per-cluster errors instead of silently
+				// dropping them. Distinguish RBAC 403 from infrastructure
+				// errors and CRD-not-installed (NotFound) in the error tag
+				// so the UI can show something actionable.
+				mu.Lock()
+				switch {
+				case apierrors.IsForbidden(err):
+					clusterErrors[clusterName] = "forbidden: " + err.Error()
+				case apierrors.IsNotFound(err):
+					// CRD not installed on this cluster — common on multi-
+					// cluster fleets where only some clusters run an operator.
+					// Omit from errors map: not an actionable failure.
+				default:
+					clusterErrors[clusterName] = err.Error()
+				}
+				mu.Unlock()
 				return
 			}
 			if len(items) > 0 {
@@ -118,7 +155,11 @@ func (h *MCPHandlers) GetCustomResources(c *fiber.Ctx) error {
 	}
 
 	waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-	return c.JSON(CustomResourceResponse{Items: allItems, IsDemoData: false})
+	resp := CustomResourceResponse{Items: allItems, IsDemoData: false}
+	if len(clusterErrors) > 0 {
+		resp.Errors = clusterErrors
+	}
+	return c.JSON(resp)
 }
 
 // listCR queries a single cluster for custom resource instances using the dynamic client.

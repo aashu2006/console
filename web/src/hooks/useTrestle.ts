@@ -21,18 +21,8 @@ import { settledWithConcurrency } from '../lib/utils/concurrency'
 import { useDemoMode } from './useDemoMode'
 import { registerRefetch, registerCacheReset, unregisterCacheReset } from '../lib/modeTransition'
 import { STORAGE_KEY_TRESTLE_CACHE, STORAGE_KEY_TRESTLE_CACHE_TIME } from '../lib/constants/storage'
-
-/** Refresh interval for automatic polling (2 minutes) */
-const REFRESH_INTERVAL_MS = 120_000
-
-/** Cache TTL: 2 minutes — matches refresh interval */
-// Unused after stale-while-revalidate change: const CACHE_TTL_MS = 120_000
-
-/** Timeout for CRD/deployment existence check (fast — missing resources fail instantly) */
-const CRD_CHECK_TIMEOUT_MS = 8_000
-
-/** Timeout for data fetch */
-const DATA_FETCH_TIMEOUT_MS = 30_000
+import { DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS } from '../lib/constants'
+import { CRD_CHECK_TIMEOUT_MS, CRD_DATA_FETCH_TIMEOUT_MS } from '../lib/constants/network'
 
 /** Demo overall compliance percentage */
 const DEMO_OVERALL_SCORE = 82
@@ -293,7 +283,7 @@ async function fetchSingleCluster(cluster: string): Promise<TrestleClusterStatus
     for (const api of (apiGroups || [])) {
       const result = await kubectlProxy.exec(
         ['get', `${api.resource}.${api.group}`, '-A', '-o', 'json'],
-        { context: cluster, timeout: DATA_FETCH_TIMEOUT_MS }
+        { context: cluster, timeout: CRD_DATA_FETCH_TIMEOUT_MS }
       )
 
       if (result.exitCode === 0 && result.output) {
@@ -427,19 +417,22 @@ export function useTrestle() {
       return
     }
 
-    // Real mode: check all clusters with bounded concurrency.
-    // Buffer results and apply a single state update at the end to prevent
-    // the card from flickering through intermediate states (#4266).
-    const allStatuses: Record<string, TrestleClusterStatus> = {}
-    let checked = 0
-
+    // (#6857) Return { cluster, status } from each callback to avoid shared mutation.
     const tasks = (clusterNames || []).map(cluster => async () => {
       const status = await fetchSingleCluster(cluster)
-      allStatuses[cluster] = status
-      checked++
+      return { cluster, status }
     })
 
-    await settledWithConcurrency(tasks)
+    const settled = await settledWithConcurrency(tasks)
+
+    const allStatuses: Record<string, TrestleClusterStatus> = {}
+    let checked = 0
+    for (const result of settled) {
+      if (result.status === 'fulfilled') {
+        allStatuses[result.value.cluster] = result.value.status
+        checked++
+      }
+    }
 
     if (mountedRef.current) {
       // If no cluster has Trestle installed, fall back to demo data so the

@@ -10,6 +10,7 @@ import { useCardLoadingState } from './CardDataContext'
 import { useCache } from '../../lib/cache'
 import { useTranslation } from 'react-i18next'
 import { FETCH_EXTERNAL_TIMEOUT_MS } from '../../lib/constants'
+import { GREEN_500_BRIGHT, RED_500 } from '../../lib/theme/chartColors'
 import { useToast } from '../ui/Toast'
 import type { TFunction } from 'i18next'
 
@@ -161,9 +162,8 @@ async function fetchRealStockData(symbols: string[]): Promise<StockData[]> {
         sparklineData,
         lastUpdated: new Date() }
     })
-  } catch (error) {
-    console.error('Error fetching real stock data:', error)
-    // Fallback to mock data on error
+  } catch {
+    // Fallback to mock data on error (#8816 — silent fallback is the intended UX)
     return generateMockStockData(symbols)
   }
 }
@@ -232,9 +232,8 @@ async function searchStocks(query: string): Promise<StockSearchResult[]> {
         region: q.exchDisp || q.exchange || 'US',
         currency: q.currency || 'USD' }))
       .slice(0, 10)
-  } catch (error) {
-    console.error('Error searching stocks, using fallback:', error)
-    // Fallback to local search when API fails (e.g., CORS issues)
+  } catch {
+    // Fallback to local search when API fails (e.g., CORS issues) — #8816
     const queryLower = query.toLowerCase()
     return COMMON_STOCKS.filter(stock =>
       stock.symbol.toLowerCase().includes(queryLower) ||
@@ -391,7 +390,7 @@ function Sparkline({ data, isPositive }: { data: number[]; isPositive: boolean }
       <polyline
         points={points}
         fill="none"
-        stroke={isPositive ? 'rgb(34, 197, 94)' : 'rgb(239, 68, 68)'}
+        stroke={isPositive ? GREEN_500_BRIGHT : RED_500}
         strokeWidth="2"
         vectorEffect="non-scaling-stroke"
       />
@@ -465,12 +464,12 @@ function StockRow({
         </div>
 
         {/* Sparkline */}
-        <div className="hidden sm:block flex-shrink-0">
+        <div className="hidden @sm:block shrink-0">
           <Sparkline data={stock.sparklineData} isPositive={isPositive} />
         </div>
 
         {/* Price and change */}
-        <div className="text-right flex-shrink-0">
+        <div className="text-right shrink-0">
           <div className="font-semibold text-sm">${stock.price.toFixed(2)}</div>
           <div className={`text-xs flex items-center justify-end gap-1 ${isPositive ? 'text-green-500' : 'text-red-500'}`}>
             {isPositive ? <TrendingUp className="w-3 h-3" aria-hidden="true" /> : <TrendingDown className="w-3 h-3" aria-hidden="true" />}
@@ -543,7 +542,11 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
 
   // Save stocks to localStorage whenever they change
   useEffect(() => {
-    localStorage.setItem('stock-ticker-saved-stocks', JSON.stringify(savedStocks))
+    try {
+      localStorage.setItem('stock-ticker-saved-stocks', JSON.stringify(savedStocks))
+    } catch {
+      // Ignore storage errors (e.g. private browsing, quota exceeded)
+    }
   }, [savedStocks])
 
   // Stock data via useCache (persists across navigation)
@@ -612,8 +615,8 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
       if (results.length > 0) {
         setShowStockDropdown(true)
       }
-    } catch (error) {
-      console.error('Stock search error:', error)
+    } catch {
+      // User-visible toast already surfaces the failure (#8816)
       showToast(t('cards:stockMarket.searchFailed', 'Stock search failed. Please try again.'), 'error')
       setStockSearchResults([])
       setShowStockDropdown(false)
@@ -710,7 +713,7 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
   return (
     <div className="h-full flex flex-col">
       {/* Header with market status and controls */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <BarChart3 className="w-4 h-4 text-muted-foreground" />
           <div className="text-xs">
@@ -758,7 +761,7 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
                   addStock(stockSearchResults[0])
                 }
               }}
-              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+              className="flex-1 bg-transparent text-sm outline-hidden placeholder:text-muted-foreground"
             />
             {isSearching && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
             {stockSearchInput && (
@@ -781,7 +784,7 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
                 <button
                   key={result.symbol}
                   onClick={() => addStock(result)}
-                  className="w-full p-2 text-left hover:bg-accent transition-colors flex items-center justify-between"
+                  className="w-full p-2 text-left hover:bg-accent transition-colors flex flex-wrap items-center justify-between gap-y-2"
                   disabled={activeSymbols.includes(result.symbol)}
                 >
                   <div>
@@ -801,7 +804,7 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
       </div>
 
       {/* Portfolio summary */}
-      <div className="grid grid-cols-3 gap-2 mb-3 p-2 bg-accent/30 rounded-lg text-xs">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-3 p-2 bg-accent/30 rounded-lg text-xs">
         <div className="text-center">
           <div className="text-muted-foreground">{t('stockMarket.avgChange')}</div>
           <div className={`font-semibold ${portfolioSummary.avgChange >= 0 ? 'text-green-500' : 'text-red-500'}`}>
@@ -841,7 +844,7 @@ export function StockMarketTicker({ config }: StockMarketTickerProps) {
       )}
 
       {/* Footer with pagination and data source */}
-      <div className="flex items-center justify-between mt-2 pt-2 border-t border-border/30">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mt-2 pt-2 border-t border-border/30">
         <div className="text-xs text-muted-foreground flex items-center gap-1">
           <span>{t('stockMarket.dataFrom', { source: dataSource })}</span>
           {useLiveData && <span className="text-green-500">{t('stockMarket.liveLabel')}</span>}

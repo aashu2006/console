@@ -2,16 +2,20 @@ package agent
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"sort"
 	"sync"
+	"time"
 )
 
 // Registry manages available AI providers
 type Registry struct {
-	mu            sync.RWMutex
-	providers     map[string]AIProvider
-	defaultAgent  string
-	selectedAgent map[string]string // sessionID -> agentName
+	mu               sync.RWMutex
+	providers        map[string]AIProvider
+	defaultAgent     string
+	selectedAgent    map[string]string    // sessionID -> agentName
+	selectedAgentLRU map[string]time.Time // sessionID -> last access time
 }
 
 // Global registry instance
@@ -24,8 +28,9 @@ var (
 func GetRegistry() *Registry {
 	registryOnce.Do(func() {
 		globalRegistry = &Registry{
-			providers:     make(map[string]AIProvider),
-			selectedAgent: make(map[string]string),
+			providers:        make(map[string]AIProvider),
+			selectedAgent:    make(map[string]string),
+			selectedAgentLRU: make(map[string]time.Time),
 		}
 	})
 	return globalRegistry
@@ -126,10 +131,18 @@ func (r *Registry) GetSelectedAgent(sessionID string) string {
 	if r == nil {
 		return ""
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.selectedAgent == nil {
+		r.selectedAgent = make(map[string]string)
+	}
+	if r.selectedAgentLRU == nil {
+		r.selectedAgentLRU = make(map[string]time.Time)
+	}
 
 	if agent, ok := r.selectedAgent[sessionID]; ok {
+		r.selectedAgentLRU[sessionID] = time.Now()
 		return agent
 	}
 	return r.defaultAgent
@@ -151,8 +164,57 @@ func (r *Registry) SetSelectedAgent(sessionID, agentName string) error {
 		return fmt.Errorf("provider %s is not available", agentName)
 	}
 
+	// Batch-evict the oldest entries when map exceeds a safety cap to
+	// prevent unbounded growth from sessions that never call
+	// RemoveSelectedAgent (#7209, #10063, #10163).
+	//
+	// Instead of evicting one entry per insert (O(N) scan every time),
+	// we evict the oldest 5% in a single pass. The O(N) cost is amortized
+	// across ~evictBatchSize subsequent inserts.
+	const maxSelectedAgentEntries = 10000
+	const evictBatchDivisor = 20 // 1/20 = 5%
+	if len(r.selectedAgent) >= maxSelectedAgentEntries {
+		evictBatchSize := maxSelectedAgentEntries / evictBatchDivisor
+		if evictBatchSize < 1 {
+			evictBatchSize = 1
+		}
+
+		timestamps := make([]time.Time, 0, len(r.selectedAgentLRU))
+		for _, ts := range r.selectedAgentLRU {
+			timestamps = append(timestamps, ts)
+		}
+		sort.Slice(timestamps, func(i, j int) bool {
+			return timestamps[i].Before(timestamps[j])
+		})
+
+		cutoff := timestamps[evictBatchSize-1]
+		evicted := 0
+		for k, ts := range r.selectedAgentLRU {
+			if !ts.After(cutoff) {
+				delete(r.selectedAgent, k)
+				delete(r.selectedAgentLRU, k)
+				evicted++
+			}
+		}
+		slog.Debug("[Registry] batch-evicted stale sessions",
+			"evicted", evicted, "remaining", len(r.selectedAgent))
+	}
+
 	r.selectedAgent[sessionID] = agentName
+	r.selectedAgentLRU[sessionID] = time.Now()
 	return nil
+}
+
+// RemoveSelectedAgent cleans up the session entry from the selectedAgent map,
+// preventing unbounded growth when sessions disconnect (#7209).
+func (r *Registry) RemoveSelectedAgent(sessionID string) {
+	if r == nil || sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.selectedAgent, sessionID)
+	delete(r.selectedAgentLRU, sessionID)
 }
 
 // List returns all registered providers
@@ -181,13 +243,15 @@ func (r *Registry) List() []ProviderInfo {
 // than executing them. They should not be the default when better options exist.
 var suggestOnlyAgents = map[string]bool{
 	"copilot-cli": true,
-	"gh-copilot":  true,
 }
 
 // promoteExecutingDefault checks if the current default agent only suggests
 // commands (e.g. copilot-cli) and, if so, promotes the first available agent
 // that can actually execute commands to be the default (#3609).
 func (r *Registry) promoteExecutingDefault() {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -197,7 +261,10 @@ func (r *Registry) promoteExecutingDefault() {
 
 	// Look for a better agent that actually executes commands
 	for name, provider := range r.providers {
-		if provider.IsAvailable() && !suggestOnlyAgents[name] &&
+		if provider == nil || !provider.IsAvailable() {
+			continue
+		}
+		if !suggestOnlyAgents[name] &&
 			provider.Capabilities().HasCapability(CapabilityToolExec) {
 			r.defaultAgent = name
 			return
@@ -261,6 +328,11 @@ func InitializeProviders() error {
 	registry.Register(NewClaudeCodeProvider())
 	registry.Register(NewBobProvider())
 
+	// Register in-cluster Kagenti agent (preferred when in-cluster)
+	if p := NewKagentiProvider(); p != nil {
+		registry.Register(p)
+	}
+
 	// Register CLI-based tool-capable agents
 	registry.Register(NewCodexProvider())
 	registry.Register(NewGeminiCLIProvider())
@@ -271,19 +343,51 @@ func InitializeProviders() error {
 	// copilot-cli suggests commands as text rather than executing them,
 	// so it should only be the default when no other agent is available (#3609).
 	registry.Register(NewCopilotCLIProvider())
-	// GHCopilot is deprecated — the gh-copilot extension runs but executes no commands
 
-	// NOTE: API-only agents (Claude API, OpenAI, Gemini) and IDE-based agents
-	// (Cursor, Windsurf, Cline, etc.) are intentionally not registered.
-	// They cannot execute commands to diagnose/repair clusters, which is the
-	// primary value of AI Missions. Only CLI-based agents that can take action
-	// are registered above.
+	// Register chat-only local LLM providers AFTER the tool-capable CLI agents.
+	// Rationale: missions need to execute cluster commands, so they must route
+	// to an agent that returns CapabilityToolExec. The local-LLM HTTP runners
+	// below return CapabilityChat only, so missions still prefer the CLI
+	// agents above (order matters — promoteExecutingDefault() below keeps a
+	// tool-capable agent as default whenever one is available). Registering
+	// the HTTP runners here makes them selectable in the agent-selector
+	// dropdown for chat and analysis workflows without breaking missions.
+	//
+	// Each provider is only advertised as Available when its URL env var is
+	// set (or a sensible loopback default applies, for Ollama and LM Studio).
+	// See docs/security/SECURITY-MODEL.md §3 for the posture these runners
+	// unlock.
+	registry.Register(NewOllamaProvider())
+	registry.Register(NewLlamaCppProvider())
+	registry.Register(NewLocalAIProvider())
+	registry.Register(NewVLLMProvider())
+	registry.Register(NewLMStudioProvider())
+	registry.Register(NewRHAIISProvider())
+	registry.Register(NewRamalamaProvider())
+
+	// Register the OpenAI-compatible gateway and frontend providers. These
+	// have existed in the codebase but were previously unregistered because
+	// they are chat-only. With the capability-aware mission routing above,
+	// registering them is safe and lets operators pick a remote
+	// OpenAI-compatible endpoint from the dropdown (Groq LPU, OpenRouter
+	// gateway, or a self-hosted Open WebUI behind their own model).
+	registry.Register(NewGroqProvider())
+	registry.Register(NewOpenRouterProvider())
+	registry.Register(NewOpenWebUIProvider())
+
+	// NOTE: API-only vendor agents (Claude API, OpenAI direct, Gemini API) and
+	// IDE-based agents (Cursor, Windsurf, Cline, etc.) remain intentionally
+	// unregistered. They cannot execute cluster commands AND they route
+	// traffic out of the cluster to a specific vendor endpoint that the
+	// operator has no say over, which is the opposite of what the local-LLM
+	// providers above offer. Only CLI-based tool-capable agents and
+	// operator-controlled OpenAI-compatible HTTP endpoints are registered.
 
 	// Set default agent based on environment or availability
 	if defaultAgent := os.Getenv("DEFAULT_AGENT"); defaultAgent != "" {
 		if err := registry.SetDefault(defaultAgent); err != nil {
 			// Log warning but don't fail - will use first available
-			fmt.Printf("Warning: Could not set default agent %s: %v\n", defaultAgent, err)
+			slog.Warn("[Registry] could not set default agent", "agent", defaultAgent, "error", err)
 		}
 	}
 

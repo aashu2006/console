@@ -106,6 +106,9 @@ import {
   GPU_RESOURCE_TYPES,
   COMMON_RESOURCE_TYPES,
 } from '../storage'
+// Import the same constant the source hooks use so URL assertions track
+// kc-agent migration automatically (phase 4.5b, #7993 / #8173).
+import { LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 
 // ---------------------------------------------------------------------------
 // Setup / teardown
@@ -236,13 +239,13 @@ describe('usePVCs', () => {
     expect(result.current.error).toBeNull()
   })
 
-  it('returns empty PVCs with error: null on fetch failure', async () => {
+  it('returns empty PVCs with error message on fetch failure', async () => {
     mockApiGet.mockRejectedValue(new Error('fetch error'))
 
     const { result } = renderHook(() => usePVCs())
 
     await waitFor(() => expect(result.current.isLoading).toBe(false))
-    expect(result.current.error).toBeNull()
+    expect(result.current.error).toBe('fetch error')
   })
 })
 
@@ -310,14 +313,14 @@ describe('usePVs', () => {
     expect(mockApiGet.mock.calls.length).toBe(callsAfterPoll)
   })
 
-  it('returns empty list with error: null on fetch failure', async () => {
+  it('returns empty list with error message on fetch failure', async () => {
     mockApiGet.mockRejectedValue(new Error('network error'))
 
     const { result } = renderHook(() => usePVs())
 
     await waitFor(() => expect(result.current.isLoading).toBe(false))
     expect(result.current.pvs).toEqual([])
-    expect(result.current.error).toBeNull()
+    expect(result.current.error).toBe('network error')
   })
 })
 
@@ -882,7 +885,7 @@ describe('createOrUpdateResourceQuota', () => {
 
     const result = await createOrUpdateResourceQuota(spec)
 
-    expect(mockApiPost).toHaveBeenCalledWith('/api/mcp/resourcequotas', spec)
+    expect(mockApiPost).toHaveBeenCalledWith(`${LOCAL_AGENT_HTTP_URL}/resourcequotas`, spec)
     expect(result).toEqual(createdQuota)
   })
 
@@ -909,7 +912,7 @@ describe('deleteResourceQuota', () => {
     await deleteResourceQuota('prod-east', 'default', 'compute-quota')
 
     expect(mockApiDelete).toHaveBeenCalledWith(
-      '/api/mcp/resourcequotas?cluster=prod-east&namespace=default&name=compute-quota'
+      `${LOCAL_AGENT_HTTP_URL}/resourcequotas?cluster=prod-east&namespace=default&name=compute-quota`
     )
   })
 
@@ -1185,6 +1188,69 @@ describe('useResourceQuotas — additional branches', () => {
   })
 })
 
+// ===========================================================================
+// useResourceQuotas - isDemoFallback wiring (Issue 9356)
+// ===========================================================================
+
+describe('useResourceQuotas — isDemoFallback wiring (Issue 9356)', () => {
+  it('returns isDemoFallback: true when serving demo data in demo mode', async () => {
+    mockIsDemoMode.mockReturnValue(true)
+
+    const { result } = renderHook(() => useResourceQuotas())
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.isDemoFallback).toBe(true)
+  })
+
+  it('returns isDemoFallback: false when serving live API data', async () => {
+    const liveQuotas = [{ name: 'live-quota', namespace: 'prod', cluster: 'c1', hard: { pods: '100' }, used: { pods: '20' }, age: '1d' }]
+    mockApiGet.mockResolvedValue({ data: { resourceQuotas: liveQuotas } })
+
+    const { result } = renderHook(() => useResourceQuotas())
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.isDemoFallback).toBe(false)
+    expect(result.current.resourceQuotas).toEqual(liveQuotas)
+  })
+
+  it('returns isDemoFallback: false when live API fails (empty, not demo)', async () => {
+    mockApiGet.mockRejectedValue(new Error('API error'))
+
+    const { result } = renderHook(() => useResourceQuotas())
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.isDemoFallback).toBe(false)
+    expect(result.current.resourceQuotas).toEqual([])
+  })
+
+  it('returns isDemoFallback: false when forceLive bypasses demo mode', async () => {
+    mockIsDemoMode.mockReturnValue(true)
+    const liveQuotas = [{ name: 'live-quota', namespace: 'prod', cluster: 'c1', hard: { pods: '100' }, used: { pods: '20' }, age: '1d' }]
+    mockApiGet.mockResolvedValue({ data: { resourceQuotas: liveQuotas } })
+
+    const { result } = renderHook(() => useResourceQuotas(undefined, undefined, true))
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    // forceLive=true skips demo data, so isDemoFallback must be false
+    // even though global demo mode is on.
+    expect(result.current.isDemoFallback).toBe(false)
+    expect(result.current.resourceQuotas).toEqual(liveQuotas)
+  })
+
+  it('transitions isDemoFallback from true to false when demo mode is disabled', async () => {
+    mockIsDemoMode.mockReturnValue(true)
+    const { result } = renderHook(() => useResourceQuotas())
+
+    await waitFor(() => expect(result.current.isDemoFallback).toBe(true))
+
+    mockIsDemoMode.mockReturnValue(false)
+    mockApiGet.mockResolvedValue({ data: { resourceQuotas: [] } })
+    await act(async () => { result.current.refetch() })
+
+    await waitFor(() => expect(result.current.isDemoFallback).toBe(false))
+  })
+})
+
 describe('useLimitRanges — additional branches', () => {
   it('filters demo limit ranges by both cluster and namespace', async () => {
     mockIsDemoMode.mockReturnValue(true)
@@ -1239,7 +1305,7 @@ describe('deleteResourceQuota', () => {
   it('calls DELETE with correct params', async () => {
     await deleteResourceQuota('cluster-x', 'namespace-y', 'quota-z')
     expect(mockApiDelete).toHaveBeenCalledWith(
-      '/api/mcp/resourcequotas?cluster=cluster-x&namespace=namespace-y&name=quota-z'
+      `${LOCAL_AGENT_HTTP_URL}/resourcequotas?cluster=cluster-x&namespace=namespace-y&name=quota-z`
     )
   })
 

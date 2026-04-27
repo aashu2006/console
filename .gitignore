@@ -18,6 +18,7 @@ coverage.out
 .env
 .env.local
 .env.*.local
+.jwt-secret
 
 # IDE
 .idea/
@@ -43,7 +44,9 @@ coverage/
 web/playwright-report/
 web/test-results/
 web/blob-report/
+web/playwright/.cache/
 web/playwright/.auth/
+web/auth.json
 
 # Temp directories
 a2a-rebase/
@@ -69,6 +72,8 @@ vendor/
 *.bak
 web/.netlify/
 web/e2e/test-results/
+web/e2e/user-flows/test-results/
 
 # Storybook
 web/storybook-static/
+web/node_modules

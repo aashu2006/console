@@ -17,18 +17,24 @@ import type { Card } from './dashboardUtils'
 const COLLAPSED_CARD_ROW_SPAN = 1
 
 /**
- * Minimum pixel height a non-collapsed sortable card cell should occupy.
- * Mirrors the legacy `auto-rows-[minmax(180px,auto)]` baseline so expanded
- * cards keep their previous look when the grid container itself uses
- * `auto-rows-min` (which is required so collapsed cards can shrink).
+ * Minimum pixel height contributed by ONE row of card span, used to mirror
+ * the legacy `auto-rows-[minmax(180px,auto)]` baseline while the grid itself
+ * uses `auto-rows-min` (required so collapsed cards can shrink).
+ *
+ * Effective card min-height = row count × this constant. Scaling with the
+ * row span is what makes the "Resize height" menu actually change card
+ * height (#8289, #8298). With a flat constant, `gridRow: span N` only
+ * reserves N grid rows but `auto-rows-min` collapses those rows to the
+ * card's content, so taller row counts had no visible effect.
  */
-const EXPANDED_CARD_MIN_HEIGHT_PX = 180
+const EXPANDED_CARD_ROW_MIN_HEIGHT_PX = 180
 
 interface SortableCardProps {
   card: Card
   onConfigure: () => void
   onRemove: () => void
   onWidthChange: (newWidth: number) => void
+  onHeightChange: (newHeight: number) => void
   isDragging: boolean
   isRefreshing?: boolean
   onRefresh?: () => void
@@ -68,7 +74,7 @@ const NARROW_BREAKPOINT = 1024
 /** Minimum card column span at narrow viewports */
 const MIN_NARROW_COLS = 6
 
-export const SortableCard = memo(function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, isRefreshing, onRefresh, lastUpdated, onKeyDown, registerRef, registerExpandTrigger, onInsertBefore: _onInsertBefore, onInsertAfter, isWorkloadDragActive: _isWorkloadDragActive }: SortableCardProps) {
+export const SortableCard = memo(function SortableCard({ card, onConfigure, onRemove, onWidthChange, onHeightChange, isDragging, isRefreshing, onRefresh, lastUpdated, onKeyDown, registerRef, registerExpandTrigger, onInsertBefore: _onInsertBefore, onInsertAfter, isWorkloadDragActive: _isWorkloadDragActive }: SortableCardProps) {
   const {
     attributes,
     listeners,
@@ -108,8 +114,9 @@ export const SortableCard = memo(function SortableCard({ card, onConfigure, onRe
     gridRow: `span ${effectiveRowSpan}`,
     // Only enforce the legacy minimum height when expanded; collapsed cards
     // must be free to shrink to their header height so neighbouring rows can
-    // pack upward instead of leaving dead space.
-    minHeight: isCollapsed ? undefined : `${EXPANDED_CARD_MIN_HEIGHT_PX}px`,
+    // pack upward instead of leaving dead space. Scale with posH so the
+    // "Resize height" menu actually grows/shrinks the card (#8289, #8298).
+    minHeight: isCollapsed ? undefined : `${posH * EXPANDED_CARD_ROW_MIN_HEIGHT_PX}px`,
     opacity: isDragging ? 0.5 : 1,
   }
 
@@ -132,7 +139,7 @@ export const SortableCard = memo(function SortableCard({ card, onConfigure, onRe
     <div
       ref={(el) => { setNodeRef(el); registerRef?.(el) }}
       style={style}
-      className="relative group/card h-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background focus-visible:rounded-xl"
+      className="relative group/card h-full outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background focus-visible:rounded-xl"
       tabIndex={0}
       role="gridcell"
       aria-label={formatCardTitle(card.card_type)}
@@ -141,7 +148,14 @@ export const SortableCard = memo(function SortableCard({ card, onConfigure, onRe
       {onInsertAfter && (
         <button
           onClick={(e) => { e.stopPropagation(); onInsertAfter() }}
-          className="absolute -top-2 -right-2 z-20 opacity-0 group-hover/card:opacity-100 transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
+          // #8383: Anchor to the right edge centered vertically so the "+"
+          // sits between this card and the next column, not on top of the
+          // card header action row where the kebab / maximize / report
+          // buttons live. `top-2 right-2` from the original #8337 fix put
+          // this button in the same coordinate space as the kebab menu
+          // (which sits at roughly right:16px inside the header) causing
+          // a direct overlap at rest and on hover.
+          className="absolute top-1/2 -translate-y-1/2 right-2 z-20 opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
           aria-label="Add card"
           title="Add card here"
         >
@@ -156,12 +170,14 @@ export const SortableCard = memo(function SortableCard({ card, onConfigure, onRe
         isDemoData={DEMO_DATA_CARDS.has(card.card_type)}
         isLive={LIVE_DATA_CARDS.has(card.card_type)}
         cardWidth={card.position?.w || 4}
+        cardHeight={card.position?.h || 2}
         isRefreshing={isRefreshing}
         onRefresh={onRefresh}
         lastUpdated={lastUpdated}
         onConfigure={onConfigure}
         onRemove={onRemove}
         onWidthChange={onWidthChange}
+        onHeightChange={onHeightChange}
         registerExpandTrigger={registerExpandTrigger}
         dragHandle={
           <button

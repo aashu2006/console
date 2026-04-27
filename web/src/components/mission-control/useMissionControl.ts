@@ -5,13 +5,18 @@
  * console-kb project index lookup, and localStorage persistence.
  */
 
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react'
+import { useToast } from '../ui/Toast'
 import { useMissions } from '../../hooks/useMissions'
 import { useDebouncedValue } from '../../hooks/useDebouncedValue'
 import { useHelmReleases } from '../../hooks/mcp/helm'
 import { useClusters } from '../../hooks/mcp/clusters'
 import { isDemoMode } from '../../lib/demoMode'
+import { fetchKubaraCatalog, fetchKubaraValues, parseResourceRequests } from '../../lib/kubara'
+import type { KubaraResourceRequests } from '../../lib/kubara'
 import { getDemoMissionControlState } from './demoState'
+import { MILLICORES_PER_CORE, MIB_PER_GIB } from '../../lib/constants/units'
+import { MS_PER_DAY } from '../../lib/constants/time'
 import type {
   MissionControlState,
   PayloadProject,
@@ -23,7 +28,21 @@ import type {
 
 const STORAGE_KEY = 'kc_mission_control_state'
 // Wizard state expires after 7 days to avoid persisting abandoned mission drafts
-const WIZARD_STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const WIZARD_STATE_TTL_MS = 7 * MS_PER_DAY
+/**
+ * #6664 — Schema version for persisted Mission Control state. Bump when the
+ * shape of `MissionControlState` changes in a backward-incompatible way.
+ * Mismatched versions are cleared silently on load so stale payloads from
+ * older builds never flow into downstream type-unsafe code paths.
+ */
+const PERSISTED_SCHEMA_VERSION = 1
+/**
+ * #6665 — Key used to surface a "your wizard draft may be lost" banner when
+ * persistState() hits a quota error. Stored as an ephemeral flag in
+ * sessionStorage so the next render of the Mission Control dialog can read
+ * and display it once.
+ */
+const QUOTA_BANNER_KEY = 'kc_mission_control_quota_error'
 
 // ---------------------------------------------------------------------------
 // #6379 — Project-name sanitization (prompt injection defence)
@@ -101,8 +120,36 @@ export function buildInstallPromptForProject(
  * projects appear within one frame of the stream pausing.
  */
 const STREAM_JSON_DEBOUNCE_MS = 250
-/** #6468 — sessionStorage persist debounce window (ms). Coalesces bursts of state changes. */
+/**
+ * #6723 — Hard input-length guard for `extractBalancedBlocks`.
+ * The balanced-brace scanner is O(n) in the best case but worst-case O(n²)
+ * when the input contains many unclosed openers (each scan walks to the
+ * end of input before giving up). A 10 MB garbage payload freezes the
+ * main thread for seconds-to-minutes. We refuse to scan inputs larger
+ * than this threshold and log a warning instead. 200 KB is large enough
+ * to accommodate realistic streamed JSON blocks (Phase 1 payloads are
+ * rarely over 50 KB) but small enough that the scan completes in < 16 ms.
+ */
+const MAX_BALANCED_BLOCKS_INPUT = 200_000
+/** #6468 — localStorage persist debounce window (ms). Coalesces bursts of
+ * state changes before calling persistState(), which writes to localStorage
+ * (see STORAGE_KEY usage below). Earlier revision of this comment said
+ * "sessionStorage" which is incorrect — fixed in PR #6518 item D.
+ * #6732 — Alias kept so future refactors can find the "per-keystroke" intent
+ * via either name. Both constants resolve to the same 300 ms window. */
 const PERSIST_STATE_DEBOUNCE_MS = 300
+/** #6732 — Explicit per-keystroke debounce window (ms). Same value as
+ * PERSIST_STATE_DEBOUNCE_MS; this name documents the intent at the call site
+ * that the debounce specifically protects localStorage from every keystroke
+ * in the description/title inputs. */
+const PERSIST_KEYSTROKE_DEBOUNCE_MS = PERSIST_STATE_DEBOUNCE_MS
+/** #6727 — Upper bound on the body length of a ```json ... ``` fence block
+ * when scanning AI output. The old pattern `([\s\S]*?)` on a malformed fence
+ * (e.g. ``` ``` followed by tens of thousands of `a` with no close fence)
+ * forces the regex engine into catastrophic backtracking. Bounding the inner
+ * repetition lets the engine bail quickly while still handling realistic
+ * JSON payloads (largest observed in production is ~20 kB). */
+const MAX_FENCE_BODY = 50_000
 
 // ---------------------------------------------------------------------------
 // Persisted state (survives page reload / accidental close)
@@ -111,6 +158,20 @@ const PERSIST_STATE_DEBOUNCE_MS = 300
 interface PersistedStateEntry {
   state: Partial<MissionControlState>
   savedAt: number
+  /** #6664 — Schema version; missing or mismatched means discard. */
+  schemaVersion?: number
+}
+
+/**
+ * #6664 — Guard predicate for persisted state. A structurally valid JSON
+ * value (`42`, `"null"`, `[]`, etc.) would otherwise slip past the bare
+ * `JSON.parse` check and crash at the `'savedAt' in entry` lookup below
+ * with `TypeError: Cannot use 'in' operator to search for 'savedAt' in 42`.
+ * The surrounding `try/catch` swallowed that error and silently wiped the
+ * user's wizard draft, so we fail explicitly here with a warning.
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function loadPersistedState(): Partial<MissionControlState> | null {
@@ -122,9 +183,45 @@ function loadPersistedState(): Partial<MissionControlState> | null {
       if (isDemoMode()) return getDemoMissionControlState()
       return null
     }
-    const entry = JSON.parse(raw) as PersistedStateEntry | Partial<MissionControlState>
+    const parsedRaw: unknown = JSON.parse(raw)
+    // #6664 — Reject non-object top-level values (numbers, strings, arrays,
+    // null) before the `in` operator is used below. Clear the corrupt key so
+    // a second load doesn't keep hitting this path, and log a warning so
+    // users notice their wizard draft was discarded.
+    if (!isPlainObject(parsedRaw)) {
+      console.warn(
+        `[MissionControl] issue 6664 — persisted state at "${STORAGE_KEY}" is not a plain object ` +
+        `(typeof=${typeof parsedRaw}, isArray=${Array.isArray(parsedRaw)}); clearing.`,
+      )
+      try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+      if (isDemoMode()) return getDemoMissionControlState()
+      return null
+    }
+    const entry = parsedRaw as unknown as PersistedStateEntry | Partial<MissionControlState>
     // Support both new format (with savedAt timestamp) and legacy format (plain state)
     if ('savedAt' in entry && typeof entry.savedAt === 'number') {
+      // #6664 — Schema-version check. Unknown or mismatched versions get
+      // cleared. Legacy entries without schemaVersion are still accepted so
+      // existing sessions don't lose work on the rollout of this fix.
+      if (
+        entry.schemaVersion !== undefined &&
+        entry.schemaVersion !== PERSISTED_SCHEMA_VERSION
+      ) {
+        console.warn(
+          `[MissionControl] issue 6664 — persisted schema version ${entry.schemaVersion} ` +
+          `does not match current ${PERSISTED_SCHEMA_VERSION}; clearing.`,
+        )
+        // #7093 — Surface the schema-mismatch reset to the user via the
+        // same sessionStorage banner mechanism used for quota errors. Without
+        // this, the user sees Phase 1 with no explanation after a frontend
+        // feature rollout that bumps the schema version.
+        try {
+          sessionStorage.setItem(QUOTA_BANNER_KEY, 'schema_mismatch')
+        } catch { /* sessionStorage may also be unavailable */ }
+        try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+        if (isDemoMode()) return getDemoMissionControlState()
+        return null
+      }
       // Check TTL — discard wizard state older than WIZARD_STATE_TTL_MS
       if (Date.now() - entry.savedAt > WIZARD_STATE_TTL_MS) {
         localStorage.removeItem(STORAGE_KEY)
@@ -149,12 +246,66 @@ function loadPersistedState(): Partial<MissionControlState> | null {
   }
 }
 
+/**
+ * #6665 — Detect a DOMException that represents a storage quota error.
+ * Matches both the named exception and the legacy numeric code 22 used by
+ * older Safari/WebKit builds. Mirrors the pattern used in `saveMissions`.
+ */
+function isQuotaExceededError(e: unknown): boolean {
+  return (
+    e instanceof DOMException &&
+    (e.name === 'QuotaExceededError' ||
+      e.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+      e.code === 22)
+  )
+}
+
 function persistState(state: MissionControlState) {
   try {
-    const entry: PersistedStateEntry = { state, savedAt: Date.now() }
+    const entry: PersistedStateEntry = {
+      state,
+      savedAt: Date.now(),
+      schemaVersion: PERSISTED_SCHEMA_VERSION }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(entry))
+  } catch (e) {
+    // #6665 — Do not silently swallow quota errors. Log a warning naming
+    // the wizard so the user can see which draft was at risk, and surface
+    // an ephemeral flag in sessionStorage so the Mission Control dialog
+    // can show a one-time banner on its next render. sessionStorage is
+    // used (not localStorage) because the flag is only meaningful for the
+    // current tab — and because localStorage is, by construction, the
+    // thing that just failed.
+    if (isQuotaExceededError(e)) {
+      const title = state.title || '(untitled mission)'
+      console.warn(
+        `[MissionControl] issue 6665 — localStorage quota exceeded while ` +
+        `persisting Mission Control wizard state for "${title}". Your ` +
+        `in-progress draft is not being persisted and will be lost on ` +
+        `reload unless space is freed.`,
+      )
+      try {
+        sessionStorage.setItem(QUOTA_BANNER_KEY, title)
+      } catch {
+        // sessionStorage may also be full or unavailable — nothing we can do.
+      }
+    } else {
+      console.error('[MissionControl] Failed to persist state:', e)
+    }
+  }
+}
+
+/**
+ * #6665 — Read and clear the quota-error banner flag. Returns the mission
+ * title that was being persisted when the quota error fired, or `null` if
+ * no banner is pending. Called by the Mission Control dialog on mount.
+ */
+export function consumePersistQuotaBanner(): string | null {
+  try {
+    const v = sessionStorage.getItem(QUOTA_BANNER_KEY)
+    if (v !== null) sessionStorage.removeItem(QUOTA_BANNER_KEY)
+    return v
   } catch {
-    // quota exceeded — silently ignore
+    return null
   }
 }
 
@@ -189,13 +340,26 @@ function makeInitialState(persisted?: Partial<MissionControlState> | null): Miss
  * fenced ```json blocks and returns the first one containing that key.
  * Falls back to the first parseable block otherwise.
  */
-export function extractJSON<T>(text: string, requiredKey?: string): T | null {
-  const fencedRe = /```json\s*\n?([\s\S]*?)```/g
+export function extractJSON<T>(text: string, requiredKey?: string, warnKey?: string): T | null {
+  // #6727 — Bounded inner repetition prevents catastrophic backtracking on
+  // malformed input (e.g. an open fence with tens of thousands of body chars
+  // and no close fence). `{0,MAX_FENCE_BODY}` caps the engine's work per
+  // match attempt to O(MAX_FENCE_BODY). Constructed via `RegExp` so the
+  // numeric bound interpolates cleanly.
+  const fencedRe = new RegExp(
+    String.raw`\`\`\`json\s*\n?([\s\S]{0,${MAX_FENCE_BODY}}?)\`\`\``,
+    'g',
+  )
   const candidates: T[] = []
   let m: RegExpExecArray | null
   while ((m = fencedRe.exec(text)) !== null) {
     try {
-      const parsed = JSON.parse(m[1]) as T
+      // #6728 — Trim whitespace and strip a leading BOM before parsing.
+      // Some agents (notably streaming providers that re-wrap output) emit a
+      // \ufeff BOM at the start of the fenced body, which JSON.parse rejects
+      // as "Unexpected token" even though the body is otherwise valid.
+      const body = m[1].replace(/^\uFEFF/, '').trim()
+      const parsed = JSON.parse(body) as T
       if (requiredKey && typeof parsed === 'object' && parsed !== null && requiredKey in parsed) {
         return parsed
       }
@@ -210,12 +374,16 @@ export function extractJSON<T>(text: string, requiredKey?: string): T | null {
   // for balanced braces, then return the last valid (and largest) parse.
   // This avoids the old greedy regex which grabbed from the first { to the
   // last } and failed when prose contained intermediate braces.  (#5505)
-  const blocks = extractBalancedBlocks(text)
+  const blocks = extractBalancedBlocks(text, warnKey)
   let best: T | null = null
   let bestLen = 0
   for (const block of blocks) {
     try {
-      const parsed = JSON.parse(block) as T
+      // #6728 — Trim + BOM strip before JSON.parse (see fenced-block path
+      // above). extractBalancedBlocks can pick up a leading BOM when the
+      // opening `{` is the very first non-BOM character in the message.
+      const body = block.replace(/^\uFEFF/, '').trim()
+      const parsed = JSON.parse(body) as T
       if (requiredKey && typeof parsed === 'object' && parsed !== null && requiredKey in parsed) {
         return parsed
       }
@@ -231,11 +399,53 @@ export function extractJSON<T>(text: string, requiredKey?: string): T | null {
 }
 
 /**
+ * #6749-D — Deduped warn set for the `extractBalancedBlocks` oversize
+ * guard. During Mission Control streaming, `extractJSON` is re-invoked on
+ * every debounced chunk, so logging the #6723 guard on every call produced
+ * a flood of identical warnings. The set is keyed by caller-supplied
+ * tokens (typically a mission ID) so the warning fires once per mission
+ * instead of once per chunk. Cleared by `reset()` above via
+ * `resetOversizedWarnings()` (#6758: the old comment referenced a
+ * nonexistent `oversizedWarnedRef`; the actual mechanism is the exported
+ * helper below).
+ */
+const oversizedWarnSet = new Set<string>()
+export function resetOversizedWarnings(): void {
+  oversizedWarnSet.clear()
+}
+
+/**
  * Scan `text` for top-level balanced `{ ... }` and `[ ... ]` blocks.
  * Returns them in order of appearance.  Handles nested braces correctly so
  * `{ "a": { "b": 1 } }` is returned as one block, not two.
+ *
+ * `warnKey` (#6749-D) is an optional de-dup token for the oversized-input
+ * warning path: the same caller (e.g. one mission ID) only logs the guard
+ * message once, not on every streamed chunk. If omitted, a legacy
+ * always-log token is used so existing callers retain their warning.
  */
-function extractBalancedBlocks(text: string): string[] {
+function extractBalancedBlocks(text: string, warnKey?: string): string[] {
+  // #6723 — Refuse pathological inputs. The scanner is worst-case O(n²)
+  // on inputs with many unclosed openers, which freezes the main thread
+  // on 10 MB garbage payloads. Return early with a console warning so
+  // upstream callers fall back to their regex path or fenced-block path.
+  if (text.length > MAX_BALANCED_BLOCKS_INPUT) {
+    const key = warnKey ?? '__legacy__'
+    // #6749-D — Only log the first oversized hit per warnKey. Subsequent
+    // calls with the same key (streaming re-parses of the same mission)
+    // silently return [] without spamming the console.
+    if (!oversizedWarnSet.has(key)) {
+      oversizedWarnSet.add(key)
+      console.warn(
+        `[useMissionControl] extractBalancedBlocks: input too large ` +
+        `(${text.length} chars > ${MAX_BALANCED_BLOCKS_INPUT}), skipping scan ` +
+        `to avoid main-thread block (#6723). Further oversized inputs for ` +
+        `key "${key}" will be suppressed until reset.`
+      )
+    }
+    return []
+  }
+
   const results: string[] = []
   const openers = new Set(['{', '['])
   const closerFor: Record<string, string> = { '{': '}', '[': ']' }
@@ -306,13 +516,23 @@ function extractBalancedBlocks(text: string): string[] {
 // ---------------------------------------------------------------------------
 
 export function useMissionControl() {
+  const { showToast } = useToast()
   const [state, setState] = useState<MissionControlState>(() =>
     makeInitialState(loadPersistedState())
   )
-  const { startMission, sendMessage, missions } = useMissions()
+  const { startMission, sendMessage, missions, dismissMission } = useMissions()
   const { releases: helmReleases } = useHelmReleases()
   const { clusters, isLoading: clustersLoading, lastUpdated: clustersLastUpdated } = useClusters()
   const lastParsedContentRef = useRef('')
+  // #9496 — Track whether the AI suggestion request timed out. When the
+  // AI_SUGGEST_TIMEOUT_MS safety net fires, we set this ref so the parse
+  // effect ignores any late-arriving streamed content that would otherwise
+  // overwrite user-entered data. Cleared when a new AI request starts.
+  const aiTimedOutRef = useRef(false)
+  // #9496 — Track whether the user has started typing (adding/removing
+  // projects manually) after an AI timeout. Once set, late-arriving AI
+  // responses are unconditionally ignored to prevent phantom overwrites.
+  const userInteractedAfterTimeoutRef = useRef(false)
   // #6403 — Stale persisted state can reference clusters that were renamed or
   // deleted between sessions. When the current cluster list loads, cross-check
   // every referenced cluster name and drop assignments/targetClusters for
@@ -327,19 +547,36 @@ export function useMissionControl() {
   // apply the result if the counter hasn't advanced.
   const userMutationGenerationRef = useRef(0)
   const lastDispatchedGenerationRef = useRef(0)
-  const bumpUserGeneration = () => {
+  // #6833 — Wrap in useCallback so consumers don't re-render on every
+  // parent render. The function only mutates a ref, so it has no deps.
+  const bumpUserGeneration = useCallback(() => {
     userMutationGenerationRef.current += 1
-  }
+  }, [])
 
-  // issue 6468 — Persist on change, debounced.
-  // Previously this fired on EVERY state change, which during AI streaming
-  // or rapid slider drags caused dozens of sessionStorage writes per second.
-  // Debouncing by 300ms coalesces bursts into a single write while still
-  // surviving accidental tab close within a half second of the last edit.
-  const debouncedState = useDebouncedValue(state, PERSIST_STATE_DEBOUNCE_MS)
+  // issue 6468 / #6732 — Persist on change, debounced.
+  // Previously this fired on EVERY state change, which during AI streaming,
+  // rapid slider drags, or rapid typing in the description/title inputs
+  // caused dozens of localStorage writes per second. Debouncing by
+  // PERSIST_KEYSTROKE_DEBOUNCE_MS coalesces bursts into a single write while
+  // still surviving accidental tab close within a half second of the last edit.
+  const debouncedState = useDebouncedValue(state, PERSIST_KEYSTROKE_DEBOUNCE_MS)
   useEffect(() => {
     persistState(debouncedState)
   }, [debouncedState])
+
+  // #7092 — Flush the latest state synchronously on tab close so the
+  // debounce window doesn't lose the final edit. `stateRef` (defined below,
+  // line ~901) always holds the latest state; we reference it here via the
+  // effect closure. The listener is registered once and cleaned up on unmount.
+  const stateRefForFlush = useRef(state)
+  useLayoutEffect(() => { stateRefForFlush.current = state }, [state])
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      persistState(stateRefForFlush.current)
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
 
   // #6403 — Reconcile persisted cluster references against the current
   // cluster list. Runs once after clusters have actually finished loading,
@@ -348,6 +585,7 @@ export function useMissionControl() {
   // on `!clustersLoading && clustersLastUpdated != null` so an empty cached
   // state during initial fetch does not wipe valid persisted assignments.
   useEffect(() => {
+    let isMounted = true
     if (staleReconcileDoneRef.current) return
     if (!clusters) return
     // issue 6427 — wait until useClusters() has produced a real load, not
@@ -388,6 +626,8 @@ export function useMissionControl() {
     // (the live cluster list), not a react-to-user event, so setState in
     // this effect is the right tool here. The ref guard above ensures it
     // runs exactly once per load.
+    // #6786 — isMounted guard prevents setState after unmount.
+    if (!isMounted) return
     /* eslint-disable react-hooks/set-state-in-effect */
     setStaleClusterNames(allStale)
     const staleAssignmentNames = new Set(staleFromAssignments)
@@ -404,6 +644,7 @@ export function useMissionControl() {
     console.warn(
       `[MissionControl] issue 6403 — dropped ${allStale.length} stale cluster reference(s) from persisted state: ${allStale.join(', ')}`,
     )
+    return () => { isMounted = false }
   }, [clusters, clustersLoading, clustersLastUpdated, state.assignments, state.targetClusters])
 
   const acknowledgeStaleClusters = () => {
@@ -421,7 +662,7 @@ export function useMissionControl() {
   // when streaming appends to it (messages.length stays the same during streaming)
   const latestAssistantContent = useMemo(() => {
     if (!planningMission) return ''
-    const msgs = planningMission.messages.filter((m) => m.role === 'assistant')
+    const msgs = (planningMission.messages ?? []).filter((m) => m.role === 'assistant')
     return msgs[msgs.length - 1]?.content ?? ''
   }, [planningMission?.messages])
 
@@ -433,13 +674,29 @@ export function useMissionControl() {
 
   useEffect(() => {
     if (!planningMission) return
+    // #6670 — After reset, the wizard's `planningMissionId` is cleared but
+    // the old mission object may still live in the useMissions context and
+    // deliver late streamed messages. If the wizard no longer owns a
+    // planning mission, drop the parse so stale AI output cannot pollute
+    // the fresh wizard state with ghost projects/assignments.
+    if (!state.planningMissionId) return
+    if (planningMission.id !== state.planningMissionId) return
+    // #9496 — Ignore late-arriving streamed content after the AI request
+    // timed out. The backend mission was dismissed on timeout, but buffered
+    // chunks can still arrive. Without this guard, extractJSON fires on
+    // those chunks and silently overwrites the user's manual edits.
+    if (aiTimedOutRef.current) return
+    // #9496 — If the user has interacted (added/removed/edited projects)
+    // after a timeout, unconditionally ignore any further AI content to
+    // prevent phantom overwrites of user-typed data.
+    if (userInteractedAfterTimeoutRef.current) return
     // #6384 item 3 — Gate the expensive parse on the debounced value being
     // non-empty. While the stream is actively arriving, `useDebouncedValue`
     // keeps returning the stale (possibly empty) value until the stream
     // pauses for STREAM_JSON_DEBOUNCE_MS, so we effectively skip parsing
     // mid-burst. The old comment referenced a non-existent length check.
     if (!debouncedAssistantContent) return
-    const assistantMsgs = planningMission.messages.filter((m) => m.role === 'assistant')
+    const assistantMsgs = (planningMission.messages ?? []).filter((m) => m.role === 'assistant')
     const latest = assistantMsgs[assistantMsgs.length - 1]
     if (!latest) return
 
@@ -448,15 +705,31 @@ export function useMissionControl() {
 
     // Try to parse structured data from the latest AI message
     if (state.phase === 'define') {
-      const parsed = extractJSON<{ projects?: PayloadProject[] }>(latest.content, 'projects')
-      if (parsed?.projects && parsed.projects.length > 0) {
+      const parsed = extractJSON<{ projects?: PayloadProject[] }>(
+        latest.content,
+        'projects',
+        state.planningMissionId ?? undefined,
+      )
+      // #6725 — Schema guard. The AI occasionally returns
+      // `{ "projects": { ... } }` (object) instead of
+      // `{ "projects": [ ... ] }` (array). Without this guard, downstream
+      // `.filter` / `.map` calls crash the hook. Treat any non-array value
+      // as "no projects" and skip the update.
+      const projectsRaw = parsed?.projects
+      const projectsArr = Array.isArray(projectsRaw) ? projectsRaw : []
+      if (projectsRaw !== undefined && !Array.isArray(projectsRaw)) {
+        console.warn(
+          '[MissionControl] issue 6725 — AI returned non-array `projects` payload; ignoring.',
+        )
+      }
+      if (projectsArr.length > 0) {
         // #6383 — The AI can return `{"projects": [{}]}` with objects
         // missing a usable `name`. Filter them out before downstream code
         // tries to read `p.name` / `p.displayName` and crashes.
         // #6379 — Also filter out names that fail the allow-list check,
         // so a malicious or hallucinated name can't get as far as
         // Phase 4's install-prompt splicer.
-        const validProjects = parsed.projects.filter((p) => {
+        const validProjects = projectsArr.filter((p) => {
           if (!isSafeProjectName(p?.name)) return false
           // displayName is optional — if present it must also be safe,
           // otherwise we fall back to `name` at the splice site.
@@ -469,15 +742,19 @@ export function useMissionControl() {
           console.warn('[MissionControl] AI returned projects payload with no valid entries; skipping update.')
           return
         }
-        if (validProjects.length !== parsed.projects.length) {
+        if (validProjects.length !== projectsArr.length) {
           console.warn(
-            `[MissionControl] filtered ${parsed.projects.length - validProjects.length} invalid project(s) from AI payload`
+            `[MissionControl] filtered ${projectsArr.length - validProjects.length} invalid project(s) from AI payload`
           )
         }
-        // Ensure dependencies defaults to []
+        // Ensure dependencies defaults to [] and tag Kubara-matched charts (#8481)
+        const kubaraNames = kubaraChartNamesRef.current
         const normalized = validProjects.map((p) => ({
           ...p,
-          dependencies: p.dependencies ?? [] }))
+          dependencies: p.dependencies ?? [],
+          // #8481 — Tag projects that have a matching Kubara chart so
+          // LaunchSequence can embed production Helm values in the prompt.
+          kubaraChartName: kubaraNames.has(p.name) ? p.name : undefined }))
         lastParsedContentRef.current = latest.content
         setState((prev) => ({
           ...prev,
@@ -488,8 +765,18 @@ export function useMissionControl() {
         assignments?: ClusterAssignment[]
         phases?: DeployPhase[]
         warnings?: string[]
-      }>(latest.content, 'assignments')
-      if (parsed?.assignments) {
+      }>(latest.content, 'assignments', state.planningMissionId ?? undefined)
+      // #6726 — Schema guard. Same class of crash as #6725 for projects:
+      // the AI can return `{ "assignments": { ... } }` instead of an array,
+      // which immediately crashes the `.map(a => a.clusterName)` below.
+      const assignmentsRaw = parsed?.assignments
+      const assignmentsArr = Array.isArray(assignmentsRaw) ? assignmentsRaw : []
+      if (assignmentsRaw !== undefined && !Array.isArray(assignmentsRaw)) {
+        console.warn(
+          '[MissionControl] issue 6726 — AI returned non-array `assignments` payload; ignoring.',
+        )
+      }
+      if (assignmentsArr.length > 0) {
         // #6404 — Discard late-arriving AI responses that would clobber
         // manual assignments. If the user has mutated state (or changed
         // phase) since this prompt was dispatched, drop the result.
@@ -504,7 +791,7 @@ export function useMissionControl() {
         }
         lastParsedContentRef.current = latest.content
         setState((prev) => {
-          const aiAssignments = parsed.assignments!
+          const aiAssignments = assignmentsArr
           const aiClusterNames = new Set(aiAssignments.map(a => a.clusterName))
           // Keep clusters the AI didn't mention as-is (user may have manually edited them)
           const preserved = prev.assignments
@@ -512,41 +799,92 @@ export function useMissionControl() {
           return {
             ...prev,
             assignments: [...aiAssignments, ...preserved],
-            phases: parsed.phases ?? prev.phases }
+            phases: parsed?.phases ?? prev.phases }
         })
       }
     }
-  }, [debouncedAssistantContent, state.phase, state.planningMissionId, planningMission?.status])
+  // NOTE (#6782): `extractJSON` is intentionally omitted from this dependency
+  // array — it is a module-level pure function (not a closure over component
+  // state), so it can never go stale. Adding it would be harmless but noisy.
+  // #7113 — `planningMission?.messages?.length` triggers re-parse when a new
+  // message is appended but debounced content hasn't changed (final-token stall).
+  }, [debouncedAssistantContent, state.phase, state.planningMissionId, planningMission?.status, planningMission?.messages?.length])
 
   // Update streaming state from mission status
+  //
+  // #6669 — A mission can transition directly to 'failed' / 'cancelled' /
+  // 'blocked' without passing through 'running' first (e.g. immediate
+  // WebSocket error, preflight rejection). Previously the streaming flag
+  // was only cleared when the status was 'running' === false AFTER first
+  // going true; an error right out of the gate left `aiStreaming: true`
+  // for the full AI_SUGGEST_TIMEOUT_MS (30s) while the Phase 1 panel spun
+  // with no visible error. Clear the flag immediately on any terminal
+  // state so the UI surfaces the error in the same tick.
   useEffect(() => {
     if (!planningMission) return
-    const isStreaming = planningMission.status === 'running'
+    const status = planningMission.status
+    const TERMINAL_STATES: ReadonlySet<typeof status> = new Set([
+      'failed',
+      'completed',
+      'cancelled',
+      'blocked',
+    ] as const)
+    const isStreaming = status === 'running'
+    const isTerminal = TERMINAL_STATES.has(status)
     if (isStreaming !== state.aiStreaming) {
       setState((prev) => ({ ...prev, aiStreaming: isStreaming }))
+      // #6827 — Clear the synchronous guard when streaming ends so a new
+      // request can be initiated.
+      if (!isStreaming) aiRequestInFlightRef.current = false
+    } else if (isTerminal && state.aiStreaming) {
+      // Defensive second-pass: if the streaming flag is still true on a
+      // terminal status (no intermediate 'running' ever observed), force it
+      // false. The above branch already handles the common case via the
+      // `isStreaming !== state.aiStreaming` compare, but a status that
+      // skips 'running' entirely means the effect never ran with
+      // `isStreaming === true`, so we clear it explicitly here (#6669).
+      setState((prev) => ({ ...prev, aiStreaming: false }))
+      aiRequestInFlightRef.current = false // #6827
     }
   }, [planningMission?.status, state.aiStreaming])
 
   // Safety-net: clear aiStreaming if no planning mission appears within 30s (#5669).
   // This handles the case where startMission() was called but no AI provider is configured,
   // so planningMission never transitions to 'running' and the UI stays stuck.
+  // #9496 — Also cancel the backend mission and mark the request as timed out
+  // so late-arriving streamed content is ignored by the parse effect.
   const AI_SUGGEST_TIMEOUT_MS = 30_000
   useEffect(() => {
     if (!state.aiStreaming) return
     const timer = setTimeout(() => {
+      // #9496 — Cancel the backend mission to stop the stream. Use the ref
+      // for the latest planningMissionId to avoid a stale closure.
+      // Perform side effects outside setState to avoid replayed updaters.
+      const missionId = planningMissionIdRef.current
+      if (missionId) {
+        try { dismissMission(missionId) } catch { /* ignore */ }
+      }
       setState((prev) => {
         if (!prev.aiStreaming) return prev
+        aiRequestInFlightRef.current = false // #6827
+        // #9496 — Mark as timed out so the parse effect ignores late arrivals
+        aiTimedOutRef.current = true
         return { ...prev, aiStreaming: false }
       })
     }, AI_SUGGEST_TIMEOUT_MS)
     return () => clearTimeout(timer)
-  }, [state.aiStreaming])
+  }, [state.aiStreaming, dismissMission])
 
   // ---------------------------------------------------------------------------
   // Reconcile assignments when projects change (cascade Phase 1 → 2 → 3)
   // ---------------------------------------------------------------------------
 
-  const prevProjectNamesRef = useRef<string>(JSON.stringify(state.projects.map((p) => p.name).sort()))
+  // #6784 — Initialize with empty string instead of a computed snapshot.
+  // useRef's initial value only runs on first render; if state.projects changes
+  // before the reconciliation effect fires, the ref would hold a stale snapshot.
+  // An empty string ensures the very first effect invocation always detects a
+  // difference and syncs the ref to the current project list.
+  const prevProjectNamesRef = useRef<string>('')
 
   useEffect(() => {
     const currentKey = JSON.stringify(state.projects.map((p) => p.name).sort())
@@ -587,6 +925,10 @@ export function useMissionControl() {
   // ---------------------------------------------------------------------------
 
   const setDescription = (description: string) => {
+    // #9496 — Mark user interaction so late AI responses are ignored after timeout.
+    // The user typing in the description box after a timeout is a clear signal
+    // that they've taken manual control of the wizard.
+    if (aiTimedOutRef.current) userInteractedAfterTimeoutRef.current = true
     setState((prev) => ({ ...prev, description }))
   }
 
@@ -595,29 +937,72 @@ export function useMissionControl() {
   }
 
   const setTargetClusters = (targetClusters: string[]) => {
-    setState((prev) => ({ ...prev, targetClusters }))
+    setState((prev) => {
+      const next = { ...prev, targetClusters }
+      // #7096 — Structural array changes must persist synchronously, not
+      // through the debounce window. Otherwise a rapid setPhase + setTargetClusters
+      // sequence within one debounce window saves phase: assign without the
+      // matching assignments, producing missing state on reload.
+      persistState(next)
+      return next
+    })
   }
 
   // Use refs for the latest state to avoid stale closures in askAIForSuggestions.
   // Without this, the first click on "Suggest" can be a no-op because the callback
   // captures a stale planningMissionId or targetClusters from a previous render (#4547).
   const stateRef = useRef(state)
+  // #6827 — Synchronous guard to prevent double-invocation of askAIForSuggestions.
+  // The stateRef-based guard (aiStreaming) is updated via useEffect (async), so two
+  // rapid Enter keystrokes within a single frame can both pass it. This ref is set
+  // synchronously at the top of askAIForSuggestions and cleared when streaming ends.
+  const aiRequestInFlightRef = useRef(false)
   const helmReleasesRef = useRef(helmReleases)
-  useEffect(() => { stateRef.current = state }, [state])
-  useEffect(() => { helmReleasesRef.current = helmReleases }, [helmReleases])
+  // #8481 — Kubara catalog chart names (populated by askAIForSuggestions,
+  // read by the AI response parser to tag projects with kubaraChartName).
+  const kubaraChartNamesRef = useRef<Set<string>>(new Set())
+  // #6834 — Dedicated ref for planningMissionId so askAIForSuggestions always
+  // reads the latest value, even when a prior setState hasn't been committed yet.
+  const planningMissionIdRef = useRef(state.planningMissionId)
+  // #7146 — Use useLayoutEffect for ref syncs to prevent render tearing.
+  // With useEffect, concurrent render runs can read stale ref values because
+  // the sync fires asynchronously after paint. useLayoutEffect fires
+  // synchronously after DOM mutations but before paint, ensuring callbacks
+  // always see the latest state during the same render cycle.
+  useLayoutEffect(() => { stateRef.current = state }, [state])
+  useLayoutEffect(() => { planningMissionIdRef.current = state.planningMissionId }, [state.planningMissionId])
+  useLayoutEffect(() => { helmReleasesRef.current = helmReleases }, [helmReleases])
 
-  const askAIForSuggestions = (description: string, existingProjects: PayloadProject[] = []) => {
+  const askAIForSuggestions = async (description: string, existingProjects: PayloadProject[] = []) => {
+      // #6827 — Synchronous ref guard: two rapid Enter keystrokes in a single
+      // frame can both pass the stateRef.current.aiStreaming check below because
+      // that ref is updated via useEffect (runs after render). This ref is set
+      // immediately (synchronously) so the second call sees it and bails.
+      if (aiRequestInFlightRef.current) {
+        console.warn('[MissionControl] #6827 — askAIForSuggestions already in flight (ref guard); ignoring')
+        return
+      }
+      aiRequestInFlightRef.current = true
+      // #9496 — Clear timeout/interaction guards from any previous request so
+      // the new AI stream is processed normally.
+      aiTimedOutRef.current = false
+      userInteractedAfterTimeoutRef.current = false
+
       const currentState = stateRef.current
       // #6406 — Guard against rapid-click parallel requests. The button is
       // already `disabled={aiStreaming}` in the UI, but keyboard users and
       // rapid double-clicks can still land a second call before the state
       // updates — so early-return here too (belt-and-suspenders).
       if (currentState.aiStreaming) {
+        aiRequestInFlightRef.current = false
         console.warn('[MissionControl] issue 6406 — askAIForSuggestions called while already streaming; ignoring')
         return
       }
       const currentHelmReleases = helmReleasesRef.current
-      let missionId = currentState.planningMissionId
+      // #6834 — Read from the dedicated ref instead of stateRef to avoid a
+      // stale null when a prior setState (which set planningMissionId) hasn't
+      // been committed yet. This prevents creating a duplicate planning mission.
+      let missionId = planningMissionIdRef.current ?? currentState.planningMissionId
 
       const existingContext =
         existingProjects.length > 0
@@ -638,9 +1023,26 @@ export function useMissionControl() {
         ? `\n\nIMPORTANT — Cluster inspection results (helm releases already installed across clusters):\n${JSON.stringify(scopedReleases.map(r => ({ name: r.name, chart: r.chart, namespace: r.namespace, status: r.status, cluster: r.cluster })), null, 2)}\n\nFor each suggested project, check if it is already installed on the clusters. Include a "Cluster Inspection Summary" table in your analysis showing which components are Running vs Not installed on each cluster.`
         : ''
 
+      // #8481 — Pre-fetch Kubara catalog index so the AI knows which
+      // production-tested Helm charts are available in the Kubara platform.
+      // The fetch is non-blocking: if it fails the prompt simply omits the
+      // catalog context (graceful degradation, no user-visible error).
+      let kubaraCatalogContext = ''
+      try {
+        const catalog = await fetchKubaraCatalog()
+        if ((catalog || []).length > 0) {
+          const chartNames = (catalog || []).map(c => c.name)
+          // Populate ref so the AI response parser can tag matched projects
+          kubaraChartNamesRef.current = new Set(chartNames)
+          kubaraCatalogContext = `\n\nKubara Platform Catalog — The following production-tested Helm charts are available via the Kubara platform (kubara-io/kubara). When a Kubara chart matches a suggested project, prefer it and note "(Kubara chart available)" in the reason:\n${JSON.stringify(chartNames)}`
+        }
+      } catch {
+        // Non-critical — catalog context is optional enrichment
+      }
+
       const prompt = `You are helping plan a Kubernetes fix deployment.
 User's goal: "${description}"
-${clusterScope}${existingContext}${helmContext}
+${clusterScope}${existingContext}${helmContext}${kubaraCatalogContext}
 
 First, provide a brief executive analysis of the user's requirements and your recommended architecture approach. Explain what layers of the stack need to be covered (security, networking, observability, etc.) and why.
 
@@ -676,23 +1078,38 @@ Return a JSON block with this exact structure:
 Include 3-8 projects. Mark the most critical as "required" and nice-to-haves as "recommended" or "optional".
 Include real CNCF projects only. Consider dependencies between projects.`
 
-      if (!missionId) {
-        missionId = startMission({
-          title: 'Mission Control Planning',
-          description: 'AI-assisted fix planning',
-          type: 'custom',
-          initialPrompt: prompt })
-        setState((prev) => ({
-          ...prev,
-          planningMissionId: missionId,
-          aiStreaming: true }))
-      } else {
-        sendMessage(missionId, prompt)
-        setState((prev) => ({ ...prev, aiStreaming: true }))
+      // #6811 — Wrap startMission/sendMessage in try/catch so a synchronous
+      // throw (e.g. demo mode, ensureConnection rejection) doesn't leave
+      // aiStreaming stuck true with no mission to clear it.
+      try {
+        if (!missionId) {
+          missionId = startMission({
+            title: 'Mission Control Planning',
+            description: 'AI-assisted fix planning',
+            type: 'custom',
+            initialPrompt: prompt })
+          // #6834 — Update the ref synchronously so a rapid second click reads
+          // the missionId before React commits the setState below.
+          planningMissionIdRef.current = missionId
+          setState((prev) => ({
+            ...prev,
+            planningMissionId: missionId,
+            aiStreaming: true }))
+        } else {
+          sendMessage(missionId, prompt)
+          setState((prev) => ({ ...prev, aiStreaming: true }))
+        }
+      } catch (err) {
+        aiRequestInFlightRef.current = false
+        console.error('[MissionControl] #6811 — askAIForSuggestions failed:', err)
+        showToast('AI suggestion request failed — please try again', 'error')
       }
     }
 
   const addProject = (project: PayloadProject) => {
+    bumpUserGeneration() // #7112 — invalidate in-flight AI streams on manual CRUD
+    // #9496 — Mark user interaction so late AI responses are ignored after timeout
+    if (aiTimedOutRef.current) userInteractedAfterTimeoutRef.current = true
     // Tag every explicit add as user-added so mergeProjects preserves it
     // across AI refinement cycles (#6465).
     const tagged: PayloadProject = { ...project, userAdded: true }
@@ -704,18 +1121,27 @@ Include real CNCF projects only. Consider dependencies between projects.`
   }
 
   const removeProject = (name: string) => {
+    bumpUserGeneration() // #7112 — invalidate in-flight AI streams on manual CRUD
+    // #9496 — Mark user interaction so late AI responses are ignored after timeout
+    if (aiTimedOutRef.current) userInteractedAfterTimeoutRef.current = true
     setState((prev) => ({
       ...prev,
       projects: prev.projects.filter((p) => p.name !== name) }))
   }
 
   const updateProjectPriority = (name: string, priority: PayloadProject['priority']) => {
+      bumpUserGeneration() // #7112 — invalidate in-flight AI streams on manual CRUD
+      // #9496 — Mark user interaction so late AI responses are ignored after timeout
+      if (aiTimedOutRef.current) userInteractedAfterTimeoutRef.current = true
       setState((prev) => ({
         ...prev,
         projects: prev.projects.map((p) => (p.name === name ? { ...p, priority } : p)) }))
     }
 
   const replaceProject = (oldName: string, newProject: PayloadProject) => {
+      bumpUserGeneration() // #7112 — invalidate in-flight AI streams on manual CRUD
+      // #9496 — Mark user interaction so late AI responses are ignored after timeout
+      if (aiTimedOutRef.current) userInteractedAfterTimeoutRef.current = true
       setState((prev) => {
         // Preserve the original AI-suggested name for swap tracking
         const existing = prev.projects.find((p) => p.name === oldName)
@@ -747,8 +1173,20 @@ Include real CNCF projects only. Consider dependencies between projects.`
   // ---------------------------------------------------------------------------
 
   const askAIForAssignments = (projects: PayloadProject[], clustersJson: string) => {
+      // #7111 — Synchronous ref guard (mirrors askAIForSuggestions). Two rapid
+      // clicks within one frame both pass the aiStreaming state check because
+      // that flag updates asynchronously via useEffect.
+      if (aiRequestInFlightRef.current) {
+        console.warn('[MissionControl] #7111 — askAIForAssignments already in flight (ref guard); ignoring')
+        return
+      }
+      aiRequestInFlightRef.current = true
+      // #9496 — Clear timeout/interaction guards from any previous request
+      aiTimedOutRef.current = false
+      userInteractedAfterTimeoutRef.current = false
       // #6406 — Early return if a planning request is already in flight.
       if (stateRef.current.aiStreaming) {
+        aiRequestInFlightRef.current = false
         console.warn('[MissionControl] issue 6406 — askAIForAssignments called while already streaming; ignoring')
         return
       }
@@ -807,21 +1245,29 @@ Order phases by dependency — prerequisites first. Each phase completes before 
       // the parse effect can discard this response if the user has since
       // mutated state.
       lastDispatchedGenerationRef.current = userMutationGenerationRef.current
-      // If no planning mission exists (user went manual on Phase 1), start one
-      // so the AI assign button is not silently a no-op (#5502)
-      if (!missionId) {
-        missionId = startMission({
-          title: 'Mission Control Planning',
-          description: 'AI-assisted cluster assignment',
-          type: 'custom',
-          initialPrompt: prompt })
-        setState((prev) => ({
-          ...prev,
-          planningMissionId: missionId,
-          aiStreaming: true }))
-      } else {
-        sendMessage(missionId, prompt)
-        setState((prev) => ({ ...prev, aiStreaming: true }))
+      // #7117 — Wrap in try/catch (mirrors askAIForSuggestions #6811) so a
+      // synchronous throw doesn't leave aiStreaming stuck true.
+      try {
+        // If no planning mission exists (user went manual on Phase 1), start one
+        // so the AI assign button is not silently a no-op (#5502)
+        if (!missionId) {
+          missionId = startMission({
+            title: 'Mission Control Planning',
+            description: 'AI-assisted cluster assignment',
+            type: 'custom',
+            initialPrompt: prompt })
+          setState((prev) => ({
+            ...prev,
+            planningMissionId: missionId,
+            aiStreaming: true }))
+        } else {
+          sendMessage(missionId, prompt)
+          setState((prev) => ({ ...prev, aiStreaming: true }))
+        }
+      } catch (err) {
+        aiRequestInFlightRef.current = false
+        console.error('[MissionControl] #7117 — askAIForAssignments failed:', err)
+        showToast('AI assignment request failed — please try again', 'error')
       }
     }
 
@@ -877,7 +1323,10 @@ Order phases by dependency — prerequisites first. Each phase completes before 
               storageHeadroomPercent: 50,
               overallScore: 50 } })
         }
-        return { ...prev, assignments }
+        const next = { ...prev, assignments }
+        // #7096 — Structural array changes persist synchronously
+        persistState(next)
+        return next
       })
     }
 
@@ -890,7 +1339,13 @@ Order phases by dependency — prerequisites first. Each phase completes before 
     // response dispatched in Phase 2 must not silently overwrite Phase 3
     // state after the user has advanced.
     bumpUserGeneration()
-    setState((prev) => ({ ...prev, phase }))
+    setState((prev) => {
+      const next = { ...prev, phase }
+      // #7096 — Phase transitions are structural changes that must persist
+      // synchronously (see setTargetClusters comment for rationale).
+      persistState(next)
+      return next
+    })
   }
 
   const setOverlay = (overlay: OverlayMode) => {
@@ -909,9 +1364,14 @@ Order phases by dependency — prerequisites first. Each phase completes before 
   // Launch
   // ---------------------------------------------------------------------------
 
-  const updateLaunchProgress = (progress: PhaseProgress[]) => {
+  // #7148 — Wrap in useCallback to prevent identity changes from causing
+  // cascading re-renders in LaunchSequence. The mission-monitor effect in
+  // LaunchSequence lists onUpdateProgress in its dependency array; without
+  // a stable reference, every parent re-render creates a new function
+  // identity, re-triggering the effect and causing a double-render loop.
+  const updateLaunchProgress = useCallback((progress: PhaseProgress[]) => {
     setState((prev) => ({ ...prev, launchProgress: progress }))
-  }
+  }, [])
 
   const setGroundControlDashboardId = (id: string) => {
     setState((prev) => ({ ...prev, groundControlDashboardId: id }))
@@ -922,9 +1382,48 @@ Order phases by dependency — prerequisites first. Each phase completes before 
   // ---------------------------------------------------------------------------
 
   const reset = () => {
+    // #6670 — Also dismiss the in-flight planning mission so late stream
+    // responses cannot pollute the freshly reset wizard. Without this, the
+    // old mission object kept delivering assistant messages that the parse
+    // effect above would happily splice into the new wizard state.
+    const prevPlanningMissionId = state.planningMissionId
+    if (prevPlanningMissionId) {
+      try { dismissMission(prevPlanningMissionId) } catch { /* ignore */ }
+    }
+    // #6749-D — Reset the module-level oversized-warning dedupe set so the
+    // next planning mission can log its own first-hit warning instead of
+    // inheriting the suppressed state from a previous mission.
+    resetOversizedWarnings()
+    // #6783 — Reset the stale-cluster reconciliation guard so a second wizard
+    // run re-checks persisted cluster references against the live cluster list.
+    // Without this, staleReconcileDoneRef stays `true` from the first run and
+    // reconciliation is permanently skipped.
+    staleReconcileDoneRef.current = false
+    // #7099 — Reset the project-names ref so the reconciliation effect detects
+    // changes on the next wizard run. Without this, a stale string from the
+    // previous mission could match the new project list and skip reconciliation
+    // of valid manual additions.
+    prevProjectNamesRef.current = ''
+    // #7097 — Reset mutation generation counters so late-arriving AI streams
+    // from the previous mission are properly discarded.
+    userMutationGenerationRef.current = 0
+    lastDispatchedGenerationRef.current = 0
+    // #9496 — Clear timeout/interaction guards so the next mission starts clean
+    aiTimedOutRef.current = false
+    userInteractedAfterTimeoutRef.current = false
     localStorage.removeItem(STORAGE_KEY)
     lastParsedContentRef.current = ''
     setState(makeInitialState())
+  }
+
+  const hydrateFromPlan = (partial: Partial<MissionControlState>) => {
+    setState(() => ({
+      ...makeInitialState(),
+      ...partial,
+      phase: 'blueprint' as const,
+      aiStreaming: false,
+      launchProgress: [],
+    }))
   }
 
   // Detect installed projects via helm releases + cluster namespaces
@@ -1087,7 +1586,7 @@ Order phases by dependency — prerequisites first. Each phase completes before 
   // Auto-assign: deterministic local algorithm (no AI)
   // ---------------------------------------------------------------------------
 
-  const autoAssignProjects = (availableClusters: Array<{ name: string; context?: string; server?: string; distribution?: string; cpuCores?: number; memoryGB?: number; storageGB?: number; cpuUsageCores?: number; cpuRequestsCores?: number; memoryUsageGB?: number; memoryRequestsGB?: number }>) => {
+  const autoAssignProjects = async (availableClusters: Array<{ name: string; context?: string; server?: string; distribution?: string; cpuCores?: number; memoryGB?: number; storageGB?: number; cpuUsageCores?: number; cpuRequestsCores?: number; memoryUsageGB?: number; memoryRequestsGB?: number }>) => {
       if (availableClusters.length === 0 || state.projects.length === 0) return
 
       // Category groups — projects in the same group have affinity
@@ -1106,8 +1605,46 @@ Order phases by dependency — prerequisites first. Each phase completes before 
         Storage: 'storage',
         'Backup & Recovery': 'storage' }
 
+      // #8485 — Pre-fetch Kubara catalog to look up resource requests for
+      // projects that have a matching chart. The catalog fetch is cached
+      // in-memory so repeated calls within the TTL are free.
+      let kubaraChartNames = new Set<string>()
+      try {
+        const catalog = await fetchKubaraCatalog()
+        kubaraChartNames = new Set((catalog || []).map(c => c.name))
+      } catch {
+        // Non-critical — sizing falls back to generic headroom scoring
+      }
+
+      // #8485 — Fetch resource requests for matched projects in parallel.
+      // Map: projectName → KubaraResourceRequests (only for projects with a
+      // matching Kubara chart that has parseable resource requests).
+      const projectResources = new Map<string, KubaraResourceRequests>()
+      const resourceFetchPromises: Array<Promise<void>> = []
+      for (const project of state.projects) {
+        if (kubaraChartNames.has(project.name)) {
+          resourceFetchPromises.push(
+            fetchKubaraValues(project.name)
+              .then((yaml) => {
+                if (yaml) {
+                  const resources = parseResourceRequests(yaml)
+                  if (resources) {
+                    projectResources.set(project.name, resources)
+                  }
+                }
+              })
+              .catch(() => { /* Non-critical — skip this project's sizing */ }),
+          )
+        }
+      }
+      await Promise.all(resourceFetchPromises)
+
       // Score each cluster for resource headroom (0-100)
       const clusterScores = new Map<string, number>()
+      // #8485 — Track remaining capacity per cluster (in real units) so
+      // Kubara resource requests can be subtracted as projects are assigned.
+      const clusterCpuFreeMillicores = new Map<string, number>()
+      const clusterMemFreeMiB = new Map<string, number>()
       for (const c of availableClusters) {
         const cpuTotal = c.cpuCores ?? 0
         const cpuUsed = c.cpuUsageCores ?? c.cpuRequestsCores ?? 0
@@ -1116,6 +1653,9 @@ Order phases by dependency — prerequisites first. Each phase completes before 
         const cpuFree = cpuTotal > 0 ? ((cpuTotal - cpuUsed) / cpuTotal) * 100 : 50
         const memFree = memTotal > 0 ? ((memTotal - memUsed) / memTotal) * 100 : 50
         clusterScores.set(c.name, (cpuFree + memFree) / 2)
+        // Store remaining capacity in absolute units for Kubara sizing
+        clusterCpuFreeMillicores.set(c.name, (cpuTotal - cpuUsed) * MILLICORES_PER_CORE)
+        clusterMemFreeMiB.set(c.name, (memTotal - memUsed) * MIB_PER_GIB)
       }
 
       // Track how many projects each cluster gets (for load balancing)
@@ -1155,6 +1695,9 @@ Order phases by dependency — prerequisites first. Each phase completes before 
         (a, b) => rankPriority(a.priority) - rankPriority(b.priority)
       )
 
+      /** #8485 — Penalty applied when a cluster lacks capacity for the chart's resource requests */
+      const INSUFFICIENT_CAPACITY_PENALTY = 40
+
       for (const project of sortedProjects) {
         const pName = project.name
         const group = CATEGORY_GROUPS[project.category] ?? project.category.toLowerCase()
@@ -1165,6 +1708,9 @@ Order phases by dependency — prerequisites first. Each phase completes before 
           // Don't add to newAssignments — it's already installed
           continue
         }
+
+        // #8485 — Look up Kubara resource requests for this project
+        const chartResources = projectResources.get(pName)
 
         // Score each cluster for this project
         let bestCluster = availableClusters[0].name
@@ -1190,6 +1736,18 @@ Order phases by dependency — prerequisites first. Each phase completes before 
           const load = clusterLoad.get(c.name) ?? 0
           score -= load * 8
 
+          // #8485 — Kubara resource-aware capacity check: penalize clusters
+          // that don't have enough free CPU/memory for this chart's requests.
+          if (chartResources) {
+            const freeCpu = clusterCpuFreeMillicores.get(c.name) ?? 0
+            const freeMem = clusterMemFreeMiB.get(c.name) ?? 0
+            const cpuFits = chartResources.cpuMillicores <= 0 || freeCpu >= chartResources.cpuMillicores
+            const memFits = chartResources.memoryMiB <= 0 || freeMem >= chartResources.memoryMiB
+            if (!cpuFits || !memFits) {
+              score -= INSUFFICIENT_CAPACITY_PENALTY
+            }
+          }
+
           if (score > bestScore) {
             bestScore = score
             bestCluster = c.name
@@ -1199,6 +1757,17 @@ Order phases by dependency — prerequisites first. Each phase completes before 
         // Assign
         newAssignments.get(bestCluster)!.push(pName)
         clusterLoad.set(bestCluster, (clusterLoad.get(bestCluster) ?? 0) + 1)
+
+        // #8485 — Subtract assigned chart's resource requests from the
+        // cluster's remaining capacity so subsequent projects see accurate
+        // headroom. This prevents packing too many resource-heavy charts
+        // onto a single cluster.
+        if (chartResources) {
+          const prevCpu = clusterCpuFreeMillicores.get(bestCluster) ?? 0
+          const prevMem = clusterMemFreeMiB.get(bestCluster) ?? 0
+          clusterCpuFreeMillicores.set(bestCluster, prevCpu - chartResources.cpuMillicores)
+          clusterMemFreeMiB.set(bestCluster, prevMem - chartResources.memoryMiB)
+        }
 
         // Record category affinity
         if (!categoryCluster.has(group)) {
@@ -1261,7 +1830,9 @@ Order phases by dependency — prerequisites first. Each phase completes before 
     staleClusterNames,
     acknowledgeStaleClusters,
     // Reset
-    reset }
+    reset,
+    // Deep link hydration
+    hydrateFromPlan }
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,9 +1861,16 @@ export function mergeProjects(
   for (const p of incoming) {
     const prev = existingMap.get(p.name)
     if (prev) {
-      // User wins: keep existing entry (and its userAdded/originalName/
-      // priority customizations) rather than overwriting with AI's version.
-      result.push(prev)
+      // #6507(A) — Only preserve existing entry verbatim when it's user-added
+      // (manual add / swap / library pick). For AI-suggested entries, accept
+      // the incoming AI version so the AI can refine its own prior suggestions
+      // (e.g. priority / category / notes updates) on re-ask.
+      const isUserAdded = prev.userAdded === true || prev.category === 'Custom'
+      if (isUserAdded) {
+        result.push(prev)
+      } else {
+        result.push(p)
+      }
     } else {
       result.push(p)
     }

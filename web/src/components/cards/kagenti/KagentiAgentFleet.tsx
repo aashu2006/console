@@ -17,7 +17,8 @@ function StatusBadge({ status }: { status: string }) {
         ? 'bg-yellow-500/15 text-yellow-400 border-yellow-500/20'
         : status === 'Failed'
           ? 'bg-red-500/15 text-red-400 border-red-500/20'
-          : 'bg-gray-500/15 text-muted-foreground border-gray-500/20'
+          // Issue 9071: default/unknown uses semantic tokens so it adapts to light/dark.
+          : 'bg-muted text-muted-foreground border-border'
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 text-2xs font-medium rounded border ${classes}`}>
       {status}
@@ -38,13 +39,16 @@ export function KagentiAgentFleet({ config }: KagentiAgentFleetProps) {
   const {
     data: agents,
     isLoading,
+    isRefreshing,
     isDemoFallback,
     consecutiveFailures,
   } = useKagentiAgents({ cluster: config?.cluster })
 
+  const hasAnyData = agents.length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
-    hasAnyData: agents.length > 0,
+    isLoading: isLoading && !hasAnyData,
+    isRefreshing,
+    hasAnyData,
     isFailed: consecutiveFailures >= 3,
     consecutiveFailures,
     isDemoData: isDemoFallback,
@@ -149,7 +153,9 @@ export function KagentiAgentFleet({ config }: KagentiAgentFleetProps) {
               </div>
             </div>
             <div className="text-xs text-muted-foreground">
-              {agent.readyReplicas}/{agent.replicas}
+              {agent.replicas != null && agent.readyReplicas != null
+                ? `${agent.readyReplicas}/${agent.replicas}`
+                : 'N/A'}
             </div>
             <StatusBadge status={agent.status} />
             <ChevronRight className="w-3 h-3 text-muted-foreground/20 group-hover:text-muted-foreground" />

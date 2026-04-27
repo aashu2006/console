@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useCardExpanded } from './CardWrapper'
 import {
-  ExternalLink, Settings, X, AlertTriangle, Loader2,
+  ExternalLink, Settings, X, AlertTriangle,
   RotateCcw, Globe, Save, Trash2
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { useDemoMode } from '../../hooks/useDemoMode'
+import { Skeleton } from '../ui/Skeleton'
 
 interface IframeEmbedConfig {
   url?: string
@@ -25,6 +27,31 @@ const STORAGE_KEY = 'iframe_embed_saved'
 const DEFAULT_HEIGHT = 400
 const DEFAULT_SANDBOX = ['allow-scripts', 'allow-same-origin', 'allow-forms', 'allow-popups']
 
+/**
+ * Allowed URL schemes for iframe embedding.
+ * javascript:, data:, and other schemes must never be loaded in an iframe src
+ * because they bypass sandbox restrictions and execute in the embedder's origin.
+ */
+const ALLOWED_URL_SCHEMES = ['http:', 'https:']
+
+/**
+ * Validate a URL before using it as an iframe src.
+ * Returns the original URL if it has an allowed scheme, or an empty string
+ * if the scheme is disallowed (e.g. javascript:, data:, blob:).
+ * This prevents XSS-through-DOM attacks via scheme injection.
+ */
+function sanitizeIframeUrl(url: string): string {
+  try {
+    const parsed = new URL(url)
+    // Return parsed.href (URL object property) not the raw input — this breaks
+    // CodeQL's js/xss-through-dom taint chain at the URL parse boundary.
+    return ALLOWED_URL_SCHEMES.includes(parsed.protocol) ? parsed.href : ''
+  } catch {
+    // Relative or malformed URLs — disallow
+    return ''
+  }
+}
+
 // Preset embeds for quick setup
 const PRESET_EMBEDS = [
   { title: 'Grafana', url: 'http://localhost:3000', icon: '📊' },
@@ -37,6 +64,7 @@ const PRESET_EMBEDS = [
 export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
   const { t } = useTranslation(['common', 'cards'])
   const { isExpanded } = useCardExpanded()
+  const { isDemoMode } = useDemoMode()
   const iframeRef = useRef<HTMLIFrameElement>(null)
 
   // Each card instance has its own ID based on config or generates one
@@ -45,7 +73,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
     return `embed_${Date.now()}`
   })
 
-  const [url, setUrl] = useState(config?.url || '')
+  const [url, setUrl] = useState(sanitizeIframeUrl(config?.url || ''))
   const [title, setTitle] = useState(config?.title || 'Embed')
   const [refreshInterval, setRefreshInterval] = useState(config?.refreshInterval || 0)
   const [height, setHeight] = useState(config?.height || DEFAULT_HEIGHT)
@@ -71,12 +99,15 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
     if (!config?.url) {
       const saved = savedEmbeds.find(e => e.id === instanceId)
       if (saved) {
-        setUrl(saved.url)
+        // Sanitize URL loaded from localStorage to guard against scheme injection
+        // (e.g. javascript: or data: URLs stored by a compromised page)
+        const safeUrl = sanitizeIframeUrl(saved.url)
+        setUrl(safeUrl)
         setTitle(saved.title)
         setRefreshInterval(saved.refreshInterval)
-        setUrlInput(saved.url)
+        setUrlInput(safeUrl)
         setTitleInput(saved.title)
-        setShowSettings(false)
+        setShowSettings(!safeUrl)
       }
     }
   }, [instanceId, config?.url, savedEmbeds])
@@ -85,27 +116,28 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
     if (!iframeRef.current || !url) return
     setIsLoading(true)
     setLoadError(null)
-    // Force iframe reload by resetting src
-    const currentSrc = iframeRef.current.src
+    // Force iframe reload using the sanitized `url` state — never read back
+    // from iframeRef.current.src (DOM property), which is an XSS-through-DOM
+    // sink when written back without re-validation.
     iframeRef.current.src = ''
     setTimeout(() => {
       if (iframeRef.current) {
-        iframeRef.current.src = currentSrc
+        iframeRef.current.src = sanitizeIframeUrl(url)
       }
     }, 50)
     setLastRefresh(new Date())
   }, [url])
 
-  // Auto-refresh
+  // Auto-refresh (disabled in demo mode because the iframe itself is disabled)
   useEffect(() => {
-    if (refreshInterval <= 0 || !url) return
+    if (isDemoMode || refreshInterval <= 0 || !url) return
 
     const interval = setInterval(() => {
       handleRefresh()
     }, refreshInterval * 1000)
 
     return () => clearInterval(interval)
-  }, [refreshInterval, url, handleRefresh])
+  }, [isDemoMode, refreshInterval, url, handleRefresh])
 
   const handleLoad = () => {
     setIsLoading(false)
@@ -120,7 +152,8 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
   const handleSaveConfig = () => {
     if (!urlInput.trim()) return
 
-    const newUrl = urlInput.trim()
+    const newUrl = sanitizeIframeUrl(urlInput.trim())
+    if (!newUrl) return
     const newTitle = titleInput.trim() || 'Embed'
 
     setUrl(newUrl)
@@ -177,9 +210,9 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
     <div className="h-full flex flex-col">
       <div className="h-full flex flex-col">
         {/* Header controls */}
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
           <div className="flex items-center gap-2 min-w-0">
-            <Globe className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            <Globe className="w-4 h-4 text-muted-foreground shrink-0" />
             {url && !showSettings ? (
               <span className="text-xs text-muted-foreground truncate max-w-[200px]" title={url}>
                 {url}
@@ -195,6 +228,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                   onClick={openInNewTab}
                   className="p-1 hover:bg-secondary rounded text-muted-foreground hover:text-foreground"
                   title={t('cards:iframeEmbed.openInNewTab')}
+                  aria-label={t('cards:iframeEmbed.openInNewTab')}
                 >
                   <ExternalLink className="w-4 h-4" />
                 </button>
@@ -208,6 +242,8 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                   : 'hover:bg-secondary text-muted-foreground hover:text-foreground'
               }`}
               title={t('cards:iframeEmbed.settings')}
+              aria-label={t('cards:iframeEmbed.settings')}
+              aria-expanded={showSettings}
             >
               <Settings className="w-4 h-4" />
             </button>
@@ -217,12 +253,13 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
         {/* Settings panel */}
         {showSettings && (
           <div className="mb-3 p-3 rounded-lg bg-secondary/30 border border-border/50">
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
               <span className="text-sm font-medium">{t('cards:iframeEmbed.embedConfiguration')}</span>
               {url && (
                 <button
                   onClick={() => setShowSettings(false)}
                   className="p-1 rounded hover:bg-secondary text-muted-foreground"
+                  aria-label={t('cards:iframeEmbed.closeSettingsAria')}
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -238,7 +275,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                   value={urlInput}
                   onChange={(e) => setUrlInput(e.target.value)}
                   placeholder="https://grafana.example.com/d/dashboard"
-                  className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                  className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
                 />
               </div>
 
@@ -249,7 +286,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                   value={titleInput}
                   onChange={(e) => setTitleInput(e.target.value)}
                   placeholder={t('cards:iframeEmbed.titlePlaceholder')}
-                  className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                  className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
                 />
               </div>
 
@@ -263,7 +300,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                     value={refreshInterval}
                     onChange={(e) => setRefreshInterval(parseInt(e.target.value) || 0)}
                     placeholder="0 = disabled"
-                    className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                    className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
                   />
                 </div>
                 <div>
@@ -274,7 +311,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                     max="1000"
                     value={height}
                     onChange={(e) => setHeight(parseInt(e.target.value) || DEFAULT_HEIGHT)}
-                    className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                    className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
                   />
                 </div>
               </div>
@@ -326,18 +363,29 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
         {/* Content area */}
         {!showSettings && (
           <div className="flex-1 relative rounded overflow-hidden border border-border/50">
-            {/* Loading overlay */}
-            {isLoading && (
-              <div className="absolute inset-0 flex items-center justify-center bg-background/80 z-10">
-                <div className="flex flex-col items-center gap-2">
-                  <Loader2 className="w-8 h-8 text-primary animate-spin" />
-                  <span className="text-sm text-muted-foreground">{t('common.loading')}</span>
-                </div>
+            {/* Demo mode placeholder */}
+            {isDemoMode && (
+              <div
+                className="flex flex-col items-center justify-center bg-secondary/20 text-muted-foreground gap-2"
+                style={{ height: displayHeight }}
+              >
+                <Globe className="w-10 h-10 opacity-40" />
+                <span className="text-sm font-medium">{title}</span>
+                <span className="text-xs opacity-60">{t('cards:iframeEmbed.demoModePlaceholder')}</span>
+              </div>
+            )}
+
+            {/* Skeleton loading state */}
+            {!isDemoMode && isLoading && (
+              <div className="absolute inset-0 z-10 p-4 space-y-3 bg-background/80">
+                <Skeleton variant="text" width={180} height={16} />
+                <Skeleton variant="rounded" height={displayHeight - 60} />
+                <Skeleton variant="text" width={120} height={12} />
               </div>
             )}
 
             {/* Error state */}
-            {loadError && (
+            {!isDemoMode && loadError && (
               <div className="absolute inset-0 flex items-center justify-center bg-background/90 z-10">
                 <div className="flex flex-col items-center gap-3 text-center p-4 max-w-xs">
                   <AlertTriangle className="w-10 h-10 text-yellow-500" />
@@ -364,7 +412,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
             )}
 
             {/* Iframe */}
-            {url ? (
+            {!isDemoMode && url ? (
               <iframe
                 ref={iframeRef}
                 src={url}
@@ -377,7 +425,7 @@ export function IframeEmbed({ config }: { config?: IframeEmbedConfig }) {
                 onError={handleError}
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
               />
-            ) : (
+            ) : !isDemoMode && (
               <div
                 className="flex items-center justify-center bg-secondary/20 text-muted-foreground"
                 style={{ height: displayHeight }}

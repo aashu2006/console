@@ -20,7 +20,9 @@ export interface ActiveUsersInfo {
 const POLL_INTERVAL = 10_000 // Poll every 10 seconds
 const HEARTBEAT_INTERVAL = 30_000 // Heartbeat every 30 seconds
 const HEARTBEAT_JITTER = 3_000 // Jitter (0-3s) to spread heartbeats without long delays
-const WS_RECONNECT_DELAY = 5_000
+
+import { MAX_WS_RECONNECT_ATTEMPTS, getWsBackoffDelay } from '../lib/constants/network'
+
 const RECOVERY_DELAY = 30_000 // Retry after circuit breaker trips
 /** Timeout for fetch() call to the active-users endpoint */
 const ACTIVE_USERS_FETCH_TIMEOUT_MS = 5_000
@@ -40,7 +42,8 @@ function isJsonResponse(resp: Response): boolean {
 // Singleton state to share across all hook instances
 let sharedInfo: ActiveUsersInfo = {
   activeUsers: 0,
-  totalConnections: 0 }
+  totalConnections: 0
+}
 let pollStarted = false
 let pollInterval: ReturnType<typeof setInterval> | null = null
 let consecutiveFailures = 0
@@ -53,6 +56,10 @@ const stateSubscribers = new Set<(state: { loading?: boolean; error?: boolean })
 let presenceWs: WebSocket | null = null
 let presenceStarted = false
 let presencePingInterval: ReturnType<typeof setInterval> | null = null
+/** Pending reconnect timer for the presence WebSocket — prevents duplicate connections (#7784) */
+let presenceReconnectTimer: ReturnType<typeof setTimeout> | null = null
+/** Track current reconnect attempt number for presence WebSocket */
+let presenceReconnectAttempts = 0
 
 // Netlify heartbeat state (serverless mode)
 let heartbeatStarted = false
@@ -76,8 +83,10 @@ export function __resetForTest(): void {
   subscribers.clear()
   stateSubscribers.clear()
   if (presencePingInterval) { clearInterval(presencePingInterval); presencePingInterval = null }
+  if (presenceReconnectTimer) { clearTimeout(presenceReconnectTimer); presenceReconnectTimer = null }
   if (presenceWs) { presenceWs.onclose = null; presenceWs.close(); presenceWs = null }
   presenceStarted = false
+  presenceReconnectAttempts = 0
   if (heartbeatTimeoutId) { clearTimeout(heartbeatTimeoutId); heartbeatTimeoutId = null }
   heartbeatStarted = false
   recentCounts.length = 0
@@ -88,10 +97,14 @@ function getSessionId(): string {
   let id = sessionStorage.getItem('kc-session-id')
   if (!id) {
     // crypto.randomUUID() requires a secure context (HTTPS / localhost).
-    // Fall back to Math.random-based ID for HTTP contexts.
-    id = typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+    // Fall back to crypto.getRandomValues() for HTTP contexts where randomUUID is unavailable.
+    if (typeof crypto.randomUUID === 'function') {
+      id = crypto.randomUUID()
+    } else {
+      const arr = new Uint8Array(9)
+      crypto.getRandomValues(arr)
+      id = `${Date.now().toString(36)}-${Array.from(arr).map(b => b.toString(36).padStart(2, '0')).join('')}`
+    }
     sessionStorage.setItem('kc-session-id', id)
   }
   return id
@@ -102,9 +115,10 @@ async function sendHeartbeat() {
   try {
     await fetch('/api/active-users', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       body: JSON.stringify({ sessionId: getSessionId() }),
-      signal: AbortSignal.timeout(5000) })
+      signal: AbortSignal.timeout(5000)
+    })
   } catch {
     // Best-effort — don't block on failure
   }
@@ -120,7 +134,11 @@ function startHeartbeat() {
 
   // Subsequent heartbeats with jitter to spread them out
   function scheduleNextHeartbeat() {
-    const jitter = Math.random() * HEARTBEAT_JITTER
+    // Use crypto.getRandomValues() — Math.random() is not cryptographically secure.
+    // HEARTBEAT_JITTER fits well within a Uint32.
+    const arr = new Uint32Array(1)
+    crypto.getRandomValues(arr)
+    const jitter = (arr[0] / 0x100000000) * HEARTBEAT_JITTER
     heartbeatTimeoutId = setTimeout(() => {
       sendHeartbeat()
       scheduleNextHeartbeat()
@@ -140,6 +158,10 @@ function stopHeartbeat() {
 
 // Tear down presence WebSocket connection
 function stopPresenceConnection() {
+  if (presenceReconnectTimer) {
+    clearTimeout(presenceReconnectTimer)
+    presenceReconnectTimer = null
+  }
   if (presencePingInterval) {
     clearInterval(presencePingInterval)
     presencePingInterval = null
@@ -150,6 +172,8 @@ function stopPresenceConnection() {
     presenceWs = null
   }
   presenceStarted = false
+  // Reset reconnect attempts when stopping
+  presenceReconnectAttempts = 0
 }
 
 // Start WebSocket presence connection (backend mode)
@@ -174,6 +198,8 @@ function startPresenceConnection() {
     }
 
     presenceWs.onopen = () => {
+      // Reset reconnect attempts on successful connection
+      presenceReconnectAttempts = 0
       // Read token fresh to avoid stale closure on reconnects
       const currentToken = localStorage.getItem(STORAGE_KEY_TOKEN)
       presenceWs?.send(JSON.stringify({ type: 'auth', token: currentToken }))
@@ -199,10 +225,24 @@ function startPresenceConnection() {
 
     presenceWs.onclose = () => {
       if (presencePingInterval) clearInterval(presencePingInterval)
-      // Reconnect after delay
-      setTimeout(() => {
+      // Clear any pending reconnect before scheduling a new one (#7784)
+      if (presenceReconnectTimer) clearTimeout(presenceReconnectTimer)
+
+      // Check if we've exceeded max reconnect attempts
+      if (presenceReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) {
+        console.warn('[ActiveUsers] Max reconnect attempts exceeded, giving up')
+        return
+      }
+
+      const delay = getWsBackoffDelay(presenceReconnectAttempts)
+      console.debug(`[ActiveUsers] Connection lost, reconnecting in ${Math.round(delay)}ms (attempt ${presenceReconnectAttempts + 1}/${MAX_WS_RECONNECT_ATTEMPTS})`)
+
+      // Reconnect after exponential backoff delay
+      presenceReconnectTimer = setTimeout(() => {
+        presenceReconnectTimer = null
+        presenceReconnectAttempts++
         if (presenceStarted && localStorage.getItem(STORAGE_KEY_TOKEN)) connect()
-      }, WS_RECONNECT_DELAY)
+      }, delay)
     }
 
     presenceWs.onerror = () => {
@@ -260,10 +300,11 @@ async function fetchActiveUsers() {
 
     const smoothedData: ActiveUsersInfo = {
       activeUsers: smoothedCount,
-      totalConnections: smoothedCount }
+      totalConnections: smoothedCount
+    }
 
     const dataChanged = smoothedData.activeUsers !== sharedInfo.activeUsers ||
-        smoothedData.totalConnections !== sharedInfo.totalConnections
+      smoothedData.totalConnections !== sharedInfo.totalConnections
     if (dataChanged) {
       sharedInfo = smoothedData
     }
@@ -284,7 +325,7 @@ function startPolling() {
   if (pollStarted) return
   pollStarted = true
   consecutiveFailures = 0 // Reset failures on new start
-  
+
   // Notify loading state
   notifySubscribers({ loading: true, error: false })
 
@@ -387,5 +428,6 @@ export function useActiveUsers() {
     viewerCount,
     isLoading,
     hasError,
-    refetch }
+    refetch
+  }
 }

@@ -14,7 +14,7 @@ export interface WidgetCardDefinition {
   supportsTheme: boolean
   minRefreshInterval: number // milliseconds
   defaultSize: { width: number; height: number }
-  category: 'cluster' | 'workload' | 'gpu' | 'security' | 'monitoring'
+  category: 'cluster' | 'workload' | 'gpu' | 'security' | 'monitoring' | 'ci-cd'
 }
 
 export interface WidgetStatDefinition {
@@ -37,8 +37,56 @@ export interface WidgetTemplateDefinition {
   layout: 'grid' | 'row' | 'column' | 'dashboard'
   gridCols?: number
   size: { width: number; height: number }
-  category: 'overview' | 'gpu' | 'pods' | 'security' | 'custom'
+  category: 'overview' | 'gpu' | 'pods' | 'security' | 'custom' | 'ci-cd'
 }
+
+/**
+ * Valid category values for card widgets.
+ * Derived from the WidgetCardDefinition['category'] union type.
+ */
+export const VALID_CARD_CATEGORIES: WidgetCardDefinition['category'][] = [
+  'cluster',
+  'workload',
+  'gpu',
+  'security',
+  'monitoring',
+  'ci-cd',
+]
+
+/**
+ * Valid category values for template widgets.
+ * Derived from the WidgetTemplateDefinition['category'] union type.
+ */
+export const VALID_TEMPLATE_CATEGORIES: WidgetTemplateDefinition['category'][] = [
+  'overview',
+  'gpu',
+  'pods',
+  'security',
+  'custom',
+  'ci-cd',
+]
+
+/**
+ * Valid layout values for template widgets.
+ * Derived from the WidgetTemplateDefinition['layout'] union type.
+ */
+export const VALID_TEMPLATE_LAYOUTS: WidgetTemplateDefinition['layout'][] = [
+  'grid',
+  'row',
+  'column',
+  'dashboard',
+]
+
+/**
+ * Valid format values for stat widgets.
+ * Derived from the WidgetStatDefinition['format'] union type.
+ */
+export const VALID_STAT_FORMATS: WidgetStatDefinition['format'][] = [
+  'number',
+  'percentage',
+  'bytes',
+  'duration',
+]
 
 // Cards that support widget export
 export const WIDGET_CARDS: Record<string, WidgetCardDefinition> = {
@@ -179,7 +227,7 @@ export const WIDGET_CARDS: Record<string, WidgetCardDefinition> = {
   storage_overview: {
     cardType: 'storage_overview',
     displayName: 'Storage Overview',
-    description: 'Persistent volume and storage class overview',
+    description: 'PVC and storage class overview across clusters',
     apiEndpoints: ['/api/mcp/storage'],
     supportsTheme: true,
     minRefreshInterval: 60000,
@@ -282,6 +330,77 @@ export const WIDGET_CARDS: Record<string, WidgetCardDefinition> = {
     minRefreshInterval: 60000,
     defaultSize: { width: 280, height: 200 },
     category: 'monitoring',
+  },
+  // ── CI/CD Pipeline Cards ────────────────────────────────────────────
+  nightly_release_pulse: {
+    cardType: 'nightly_release_pulse',
+    displayName: 'Nightly Release Pulse',
+    description: 'Latest nightly release status, streak, and workflow pass rates',
+    apiEndpoints: ['/api/github-pipelines?view=pulse'],
+    supportsTheme: true,
+    minRefreshInterval: 60_000,
+    defaultSize: { width: 300, height: 200 },
+    category: 'ci-cd',
+  },
+  workflow_matrix: {
+    cardType: 'workflow_matrix',
+    displayName: 'Workflow Matrix',
+    description: 'Heatmap of CI workflow runs across repos with pass/fail history',
+    apiEndpoints: ['/api/github-pipelines?view=matrix'],
+    supportsTheme: true,
+    minRefreshInterval: 60_000,
+    defaultSize: { width: 400, height: 300 },
+    category: 'ci-cd',
+  },
+  pipeline_flow: {
+    cardType: 'pipeline_flow',
+    displayName: 'Live Runs',
+    description: 'In-flight CI/CD workflow runs with real-time status',
+    apiEndpoints: ['/api/github-pipelines?view=flow'],
+    supportsTheme: true,
+    minRefreshInterval: 30_000,
+    defaultSize: { width: 400, height: 250 },
+    category: 'ci-cd',
+  },
+  recent_failures: {
+    cardType: 'recent_failures',
+    displayName: 'Recent Failures',
+    description: 'Recently failed CI workflows with failed step and re-run actions',
+    apiEndpoints: ['/api/github-pipelines?view=failures'],
+    supportsTheme: true,
+    minRefreshInterval: 60_000,
+    defaultSize: { width: 300, height: 250 },
+    category: 'ci-cd',
+  },
+  issue_activity_chart: {
+    cardType: 'issue_activity_chart',
+    displayName: 'Daily Issues & PRs',
+    description: 'Issues opened/closed and PRs merged per day over a configurable window',
+    apiEndpoints: ['/api/github/repos'],
+    supportsTheme: true,
+    minRefreshInterval: 60_000,
+    defaultSize: { width: 400, height: 250 },
+    category: 'ci-cd',
+  },
+  github_ci_monitor: {
+    cardType: 'github_ci_monitor',
+    displayName: 'GitHub CI Monitor',
+    description: 'Live GitHub Actions workflow status with pass rate and queue depth',
+    apiEndpoints: ['/api/github/repos'],
+    supportsTheme: true,
+    minRefreshInterval: 30_000,
+    defaultSize: { width: 300, height: 300 },
+    category: 'ci-cd',
+  },
+  github_activity: {
+    cardType: 'github_activity',
+    displayName: 'GitHub Activity',
+    description: 'PRs, issues, releases, and contributors for a GitHub repo',
+    apiEndpoints: ['/api/github/repos'],
+    supportsTheme: true,
+    minRefreshInterval: 60_000,
+    defaultSize: { width: 300, height: 250 },
+    category: 'ci-cd',
   },
 }
 

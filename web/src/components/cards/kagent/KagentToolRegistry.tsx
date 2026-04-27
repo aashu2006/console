@@ -6,6 +6,7 @@ import { DynamicCardErrorBoundary } from '../DynamicCardErrorBoundary'
 import { CardSearchInput, CardControlsRow, CardPaginationFooter } from '../../../lib/cards/CardComponents'
 import { useCardData, commonComparators } from '../../../lib/cards/cardHooks'
 import { Skeleton } from '../../ui/Skeleton'
+import { useTranslation } from 'react-i18next'
 
 interface KagentToolRegistryProps {
   config?: { cluster?: string }
@@ -19,7 +20,7 @@ function StatusBadge({ status }: { status: string }) {
         ? 'bg-yellow-500/15 text-yellow-400 border-yellow-500/20'
         : status === 'Failed'
           ? 'bg-red-500/15 text-red-400 border-red-500/20'
-          : 'bg-gray-500/15 text-muted-foreground border-gray-500/20'
+          : 'bg-gray-500/15 dark:bg-gray-400/15 text-muted-foreground border-gray-500/20 dark:border-gray-400/20'
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 text-2xs font-medium rounded border ${classes}`}>
       {status}
@@ -40,11 +41,11 @@ function KindBadge({ kind }: { kind: string }) {
 
 function ProtocolBadge({ protocol }: { protocol: string }) {
   const colorMap: Record<string, string> = {
-    stdio: 'bg-gray-500/10 text-gray-400 border-gray-500/20',
+    stdio: 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20',
     sse: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
     streamableHTTP: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
   }
-  const classes = colorMap[protocol] || 'bg-gray-500/10 text-gray-400 border-gray-500/20'
+  const classes = colorMap[protocol] || 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20'
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 text-2xs font-medium rounded border ${classes}`}>
       {protocol}
@@ -54,20 +55,22 @@ function ProtocolBadge({ protocol }: { protocol: string }) {
 
 type SortField = 'name' | 'kind' | 'status' | 'cluster'
 
-const SORT_OPTIONS: { value: SortField; label: string }[] = [
-  { value: 'name', label: 'Name' },
-  { value: 'kind', label: 'Kind' },
-  { value: 'status', label: 'Status' },
-  { value: 'cluster', label: 'Cluster' },
-]
+const SORT_OPTION_KEYS = [
+  { value: 'name' as const, labelKey: 'kagentToolRegistry.sortName' },
+  { value: 'kind' as const, labelKey: 'kagentToolRegistry.sortKind' },
+  { value: 'status' as const, labelKey: 'kagentToolRegistry.sortStatus' },
+  { value: 'cluster' as const, labelKey: 'kagentToolRegistry.sortCluster' },
+] as const
 
 // #6216 part 2: wrapped at the bottom in DynamicCardErrorBoundary.
 function KagentToolRegistryInternal({ config }: KagentToolRegistryProps) {
+  const { t } = useTranslation(['cards'])
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
 
   const {
     data: tools,
     isLoading,
+    isRefreshing,
     isDemoFallback,
     consecutiveFailures,
   } = useKagentCRDTools({ cluster: config?.cluster })
@@ -75,6 +78,7 @@ function KagentToolRegistryInternal({ config }: KagentToolRegistryProps) {
   const hasAnyData = tools.length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
     isLoading: isLoading && !hasAnyData,
+    isRefreshing,
     hasAnyData,
     isFailed: consecutiveFailures >= 3,
     consecutiveFailures,
@@ -127,8 +131,8 @@ function KagentToolRegistryInternal({ config }: KagentToolRegistryProps) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-center">
         <Wrench className="w-10 h-10 text-muted-foreground/30 mb-3" />
-        <div className="text-sm font-medium text-muted-foreground">No Tool Servers</div>
-        <div className="text-xs text-muted-foreground/60 mt-1">Deploy ToolServer or RemoteMCPServer CRDs</div>
+        <div className="text-sm font-medium text-muted-foreground">{t('kagentToolRegistry.noToolServers')}</div>
+        <div className="text-xs text-muted-foreground/60 mt-1">{t('kagentToolRegistry.deployHint')}</div>
       </div>
     )
   }
@@ -154,13 +158,13 @@ function KagentToolRegistryInternal({ config }: KagentToolRegistryProps) {
           limit: itemsPerPage,
           onLimitChange: setItemsPerPage,
           sortBy: sorting.sortBy,
-          sortOptions: SORT_OPTIONS,
+          sortOptions: SORT_OPTION_KEYS.map(opt => ({ value: opt.value, label: t(opt.labelKey) })),
           onSortChange: (v) => sorting.setSortBy(v as SortField),
           sortDirection: sorting.sortDirection,
           onSortDirectionChange: sorting.setSortDirection,
         }}
         extra={
-          <CardSearchInput value={filters.search} onChange={filters.setSearch} placeholder="Search tool servers..." />
+          <CardSearchInput value={filters.search} onChange={filters.setSearch} placeholder={t('kagentToolRegistry.searchPlaceholder')} />
         }
       />
 
@@ -188,7 +192,7 @@ function KagentToolRegistryInternal({ config }: KagentToolRegistryProps) {
                 <ProtocolBadge protocol={tool.protocol} />
                 {toolCount > 0 && (
                   <span className="text-xs text-muted-foreground">
-                    {toolCount} tool{toolCount !== 1 ? 's' : ''}
+                    {t('kagentToolRegistry.toolCount', { count: toolCount })}
                   </span>
                 )}
                 <StatusBadge status={tool.status} />
@@ -201,7 +205,7 @@ function KagentToolRegistryInternal({ config }: KagentToolRegistryProps) {
               {isExpanded && toolCount > 0 && (
                 <div className="ml-8 mr-2 mb-1 space-y-0.5">
                   {tool.discoveredTools.map(dt => (
-                    <div key={dt.name} className="text-xs text-muted-foreground flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5">
+                    <div key={dt.name} className="text-xs text-muted-foreground flex items-center gap-1.5 px-2 py-0.5 rounded bg-black/5 dark:bg-white/5">
                       <span className="text-cyan-400/80 font-mono">{dt.name}</span>
                       {dt.description && <span className="truncate">{dt.description}</span>}
                     </div>

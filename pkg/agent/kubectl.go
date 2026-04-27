@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kubestellar/console/pkg/agent/protocol"
@@ -19,12 +21,34 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
+const (
+	// kubectlExecTimeout bounds how long any kubectl subprocess can run
+	// before it is killed. Prevents goroutine/FD leaks from hung apiservers. (#7258)
+	kubectlExecTimeout = 60 * time.Second
+
+	// kubectlRenameTimeout bounds the kubectl config rename-context command. (#7279)
+	kubectlRenameTimeout = 30 * time.Second
+
+	// kubectlReloadMinInterval is the minimum time between kubeconfig file
+	// re-reads driven by ReloadIfStale. handleClustersHTTP is polled by the
+	// frontend and previously called Reload() on every request, which does a
+	// full disk read + YAML parse. Two seconds is short enough to feel
+	// responsive after the user adds a context, long enough to absorb bursty
+	// polling. (#8075)
+	kubectlReloadMinInterval = 2 * time.Second
+)
+
 // execCommand allows mocking exec.Command for testing
 var execCommand = exec.Command
 
+// execCommandContext allows mocking exec.CommandContext for testing (#7258)
+var execCommandContext = exec.CommandContext
+
 type KubectlProxy struct {
+	mu         sync.RWMutex // guards config against concurrent read/write (#7259)
 	kubeconfig string
 	config     *api.Config
+	lastReload time.Time // wall time of last successful Reload, for ReloadIfStale (#8075)
 }
 
 func NewKubectlProxy(kubeconfig string) (*KubectlProxy, error) {
@@ -48,6 +72,9 @@ func NewKubectlProxy(kubeconfig string) (*KubectlProxy, error) {
 }
 
 func (k *KubectlProxy) ListContexts() ([]protocol.ClusterInfo, string) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
 	var clusters []protocol.ClusterInfo
 	current := k.config.CurrentContext
 
@@ -70,13 +97,21 @@ func (k *KubectlProxy) ListContexts() ([]protocol.ClusterInfo, string) {
 	return clusters, current
 }
 
-func (k *KubectlProxy) Execute(context, namespace string, args []string) protocol.KubectlResponse {
+func (k *KubectlProxy) Execute(ctxName, namespace string, args []string) protocol.KubectlResponse {
+	return k.ExecuteWithContext(context.Background(), ctxName, namespace, args)
+}
+
+// ExecuteWithContext runs a kubectl command, deriving the execution deadline
+// from the supplied parent context. When the parent is cancelled (e.g. the
+// WebSocket connection closes), the kubectl process is killed immediately
+// instead of running until its own timeout expires (#9997).
+func (k *KubectlProxy) ExecuteWithContext(parent context.Context, ctxName, namespace string, args []string) protocol.KubectlResponse {
 	cmdArgs := []string{}
 	if k.kubeconfig != "" {
 		cmdArgs = append(cmdArgs, "--kubeconfig", k.kubeconfig)
 	}
-	if context != "" {
-		cmdArgs = append(cmdArgs, "--context", context)
+	if ctxName != "" {
+		cmdArgs = append(cmdArgs, "--context", ctxName)
 	}
 	if namespace != "" {
 		cmdArgs = append(cmdArgs, "-n", namespace)
@@ -87,14 +122,32 @@ func (k *KubectlProxy) Execute(context, namespace string, args []string) protoco
 		return protocol.KubectlResponse{ExitCode: 1, Error: "Disallowed kubectl command"}
 	}
 
-	cmd := execCommand("kubectl", cmdArgs...)
+	// Bound kubectl execution with a context timeout to prevent goroutine/FD leaks (#7258).
+	// Derive from the parent context so client disconnect also cancels the command (#9997).
+	ctx, cancel := context.WithTimeout(parent, kubectlExecTimeout)
+	defer cancel()
+
+	cmd := execCommandContext(ctx, "kubectl", cmdArgs...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	// kubectlCommandTimeout prevents a hung kubectl call from blocking
+	// the handler indefinitely (e.g. unreachable apiserver) (#7206).
+	const kubectlCommandTimeout = 30 * time.Second
+	timer := time.AfterFunc(kubectlCommandTimeout, func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	})
+
 	err := cmd.Run()
+	timedOut := !timer.Stop()
 	exitCode := 0
 	if err != nil {
+		if timedOut {
+			return protocol.KubectlResponse{ExitCode: 1, Error: fmt.Sprintf("kubectl timed out after %s", kubectlCommandTimeout)}
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
@@ -174,6 +227,18 @@ var allowedScaleResources = map[string]bool{
 	"sts":          true,
 }
 
+// allowedRolloutSubcommands restricts rollout to read-only operations (#7205).
+var allowedRolloutSubcommands = map[string]bool{
+	"status":  true,
+	"history": true,
+}
+
+// allowedAuthSubcommands restricts auth to read-only operations (#7204).
+var allowedAuthSubcommands = map[string]bool{
+	"can-i":  true,
+	"whoami": true,
+}
+
 // blockedConfigSubcommands are config subcommands that modify kubeconfig
 var blockedConfigSubcommands = map[string]bool{
 	"set":             true,
@@ -200,11 +265,41 @@ func (k *KubectlProxy) validateArgs(args []string) bool {
 		return false
 	}
 
-	// Special case: config command - block mutation subcommands
-	if command == "config" && len(args) > 1 {
+	// Special case: rollout command - only allow read-only subcommands (#7205)
+	if command == "rollout" {
+		if len(args) < 2 {
+			return false // Need at least "rollout <subcommand>"
+		}
 		subcommand := strings.ToLower(args[1])
-		if blockedConfigSubcommands[subcommand] {
+		if !allowedRolloutSubcommands[subcommand] {
 			return false
+		}
+	}
+
+	// Special case: auth command - only allow read-only subcommands (#7204)
+	if command == "auth" {
+		if len(args) < 2 {
+			return false // Need at least "auth <subcommand>"
+		}
+		subcommand := strings.ToLower(args[1])
+		if !allowedAuthSubcommands[subcommand] {
+			return false
+		}
+	}
+
+	// Special case: config command — block mutation subcommands.
+	// Skip leading flags (--flag / -x) to find the real subcommand,
+	// since kubectl accepts global flags before subcommands (#7261).
+	if command == "config" && len(args) > 1 {
+		for _, a := range args[1:] {
+			token := strings.ToLower(a)
+			if strings.HasPrefix(token, "-") {
+				continue // skip flags
+			}
+			if blockedConfigSubcommands[token] {
+				return false
+			}
+			break // first non-flag token is the subcommand
 		}
 	}
 
@@ -265,27 +360,83 @@ func (k *KubectlProxy) validateArgs(args []string) bool {
 	return true
 }
 
-func (k *KubectlProxy) GetCurrentContext() string { return k.config.CurrentContext }
+func (k *KubectlProxy) GetCurrentContext() string {
+	if k == nil || k.config == nil {
+		return ""
+	}
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.config.CurrentContext
+}
 
 // GetKubeconfigPath returns the path to the kubeconfig file
-func (k *KubectlProxy) GetKubeconfigPath() string { return k.kubeconfig }
+func (k *KubectlProxy) GetKubeconfigPath() string {
+	if k == nil {
+		return ""
+	}
+	return k.kubeconfig
+}
 
-// Reload reloads the kubeconfig from disk
+// Reload reloads the kubeconfig from disk. Uses write lock to prevent
+// data races with concurrent readers (#7259).
 func (k *KubectlProxy) Reload() {
+	config, err := clientcmd.LoadFromFile(k.kubeconfig)
+	if err == nil {
+		k.mu.Lock()
+		k.config = config
+		k.lastReload = time.Now()
+		k.mu.Unlock()
+	}
+}
+
+// ReloadIfStale reloads the kubeconfig from disk only if the previous reload
+// was more than minInterval ago. This absorbs bursty polling from frontend
+// callers (e.g. handleClustersHTTP) without skipping updates after the user
+// adds a context. Returns true if a fresh load was performed. (#8075)
+func (k *KubectlProxy) ReloadIfStale(minInterval time.Duration) bool {
+	k.mu.RLock()
+	fresh := !k.lastReload.IsZero() && time.Since(k.lastReload) < minInterval
+	k.mu.RUnlock()
+	if fresh {
+		return false
+	}
+	config, err := clientcmd.LoadFromFile(k.kubeconfig)
+	if err != nil {
+		// Record the attempt even on failure so a broken kubeconfig doesn't
+		// cause a hot loop of LoadFromFile calls on every request.
+		k.mu.Lock()
+		k.lastReload = time.Now()
+		k.mu.Unlock()
+		return false
+	}
+	k.mu.Lock()
+	k.config = config
+	k.lastReload = time.Now()
+	k.mu.Unlock()
+	return true
+}
+
+// reloadLocked reloads the kubeconfig from disk without acquiring the mutex.
+// Caller must already hold k.mu.
+func (k *KubectlProxy) reloadLocked() {
 	config, err := clientcmd.LoadFromFile(k.kubeconfig)
 	if err == nil {
 		k.config = config
 	}
 }
 
-// RenameContext renames a kubeconfig context
+// RenameContext renames a kubeconfig context.
+// Uses context timeout to prevent hanging on unreachable clusters (#7279).
 func (k *KubectlProxy) RenameContext(oldName, newName string) error {
 	cmdArgs := []string{"config", "rename-context", oldName, newName}
 	if k.kubeconfig != "" {
 		cmdArgs = append([]string{"--kubeconfig", k.kubeconfig}, cmdArgs...)
 	}
 
-	cmd := execCommand("kubectl", cmdArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), kubectlRenameTimeout)
+	defer cancel()
+
+	cmd := execCommandContext(ctx, "kubectl", cmdArgs...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -296,7 +447,9 @@ func (k *KubectlProxy) RenameContext(oldName, newName string) error {
 	// Reload the config to reflect changes
 	config, err := clientcmd.LoadFromFile(k.kubeconfig)
 	if err == nil {
+		k.mu.Lock()
 		k.config = config
+		k.mu.Unlock()
 	}
 
 	return nil
@@ -314,7 +467,11 @@ type KubeconfigPreviewEntry struct {
 
 // PreviewKubeconfig parses a kubeconfig YAML and returns the contexts it contains
 // along with whether each would be new or already exists.
+// SECURITY: AuthInfo entries with Exec plugins are flagged with auth method "exec (blocked)".
 func (k *KubectlProxy) PreviewKubeconfig(yamlContent string) ([]KubeconfigPreviewEntry, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
 	incoming, err := clientcmd.Load([]byte(yamlContent))
 	if err != nil {
 		return nil, fmt.Errorf("invalid kubeconfig YAML: %w", err)
@@ -344,6 +501,8 @@ func (k *KubectlProxy) PreviewKubeconfig(yamlContent string) ([]KubeconfigPrevie
 // ImportKubeconfig merges a kubeconfig YAML string into the existing kubeconfig file.
 // It backs up the existing file first, then merges new contexts/clusters/users.
 // Returns lists of added and skipped context names.
+//
+// SECURITY: AuthInfo entries with Exec plugins are rejected to prevent RCE (#7260).
 func (k *KubectlProxy) ImportKubeconfig(yamlContent string) (added []string, skipped []string, err error) {
 	incoming, err := clientcmd.Load([]byte(yamlContent))
 	if err != nil {
@@ -353,9 +512,21 @@ func (k *KubectlProxy) ImportKubeconfig(yamlContent string) (added []string, ski
 		return nil, nil, fmt.Errorf("kubeconfig contains no contexts")
 	}
 
-	// Backup existing kubeconfig if the file exists
+	// SECURITY: Reject any AuthInfo with an exec plugin — uploading a
+	// kubeconfig with exec.command = "/bin/sh" achieves RCE (#7260).
+	for name, ai := range incoming.AuthInfos {
+		if ai != nil && ai.Exec != nil {
+			return nil, nil, fmt.Errorf("SECURITY: kubeconfig user %q uses exec-based auth (command: %s) — exec plugins are not allowed for imported configs", name, ai.Exec.Command)
+		}
+	}
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	// Backup existing kubeconfig if the file exists.
+	// Uses UnixNano to avoid collisions from concurrent imports (#7276).
 	if _, statErr := os.Stat(k.kubeconfig); statErr == nil {
-		backupPath := fmt.Sprintf("%s.bak-%d", k.kubeconfig, time.Now().Unix())
+		backupPath := fmt.Sprintf("%s.bak-%d", k.kubeconfig, time.Now().UnixNano())
 		data, readErr := os.ReadFile(k.kubeconfig)
 		if readErr != nil {
 			return nil, nil, fmt.Errorf("failed to read kubeconfig for backup: %w", readErr)
@@ -431,8 +602,8 @@ func (k *KubectlProxy) ImportKubeconfig(yamlContent string) (added []string, ski
 		return nil, nil, fmt.Errorf("failed to write merged kubeconfig: %w", writeErr)
 	}
 
-	// Reload from file to stay in sync
-	k.Reload()
+	// Reload from file to stay in sync (already holding lock, use internal variant)
+	k.reloadLocked()
 
 	return added, skipped, nil
 }
@@ -511,7 +682,11 @@ type TestConnectionResult struct {
 }
 
 // AddCluster builds a kubeconfig entry from structured input and merges it.
+// Uses mutex for thread safety (#7259) and UnixNano for backup paths (#7276).
 func (k *KubectlProxy) AddCluster(req AddClusterRequest) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
 	// Validate required fields
 	if req.ContextName == "" || req.ClusterName == "" || req.ServerURL == "" || req.AuthType == "" {
 		return fmt.Errorf("contextName, clusterName, serverUrl, and authType are required")
@@ -586,9 +761,10 @@ func (k *KubectlProxy) AddCluster(req AddClusterRequest) error {
 		Namespace: req.Namespace,
 	}
 
-	// Backup existing kubeconfig if the file exists
+	// Backup existing kubeconfig if the file exists.
+	// Uses UnixNano to avoid collisions from concurrent imports (#7276).
 	if _, statErr := os.Stat(k.kubeconfig); statErr == nil {
-		backupPath := fmt.Sprintf("%s.bak-%d", k.kubeconfig, time.Now().Unix())
+		backupPath := fmt.Sprintf("%s.bak-%d", k.kubeconfig, time.Now().UnixNano())
 		data, readErr := os.ReadFile(k.kubeconfig)
 		if readErr != nil {
 			return fmt.Errorf("failed to read kubeconfig for backup: %w", readErr)
@@ -619,8 +795,8 @@ func (k *KubectlProxy) AddCluster(req AddClusterRequest) error {
 		return fmt.Errorf("failed to write kubeconfig: %w", writeErr)
 	}
 
-	// Reload
-	k.Reload()
+	// Reload (already holding lock, use internal variant)
+	k.reloadLocked()
 	return nil
 }
 

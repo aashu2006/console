@@ -32,7 +32,6 @@ import { LOCAL_AGENT_HTTP_URL, STORAGE_KEY_CLUSTER_LAYOUT, STORAGE_KEY_CLUSTER_O
 import { safeGetItem, safeSetItem } from '../../lib/utils/localStorage'
 import { useModalState } from '../../lib/modals'
 import { useToast } from '../ui/Toast'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import type { StatBlockValue } from '../ui/StatsOverview'
 import { formatMemoryStat } from '../../lib/formatStats'
 import { RotatingTip } from '../ui/RotatingTip'
@@ -55,9 +54,9 @@ export function Clusters() {
   const { isConnected, status: agentStatus } = useLocalAgent()
   const { isDemoMode } = useDemoMode()
   const isModeSwitching = useIsModeSwitching()
-  const { startMission } = useMissions()
+  const { startMission, openSidebar } = useMissions()
   const { showKeyPrompt: pruneShowKeyPrompt, checkKeyAndRun: pruneCheckKeyAndRun, goToSettings: pruneGoToSettings, dismissPrompt: pruneDismissPrompt } = useApiKeyCheck()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
+  const { showKeyPrompt: createShowKeyPrompt, checkKeyAndRun: createCheckKeyAndRun, goToSettings: createGoToSettings, dismissPrompt: createDismissPrompt } = useApiKeyCheck()
   const { showToast } = useToast()
 
   // When demo mode is OFF and agent is not connected, force skeleton display
@@ -72,7 +71,9 @@ export function Clusters() {
     clusterGroups,
     addClusterGroup,
     deleteClusterGroup,
-    selectClusterGroup } = useGlobalFilters()
+    selectClusterGroup,
+    selectedDistributions,
+    isAllDistributionsSelected } = useGlobalFilters()
   const [searchParams, setSearchParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
@@ -120,7 +121,7 @@ export function Clusters() {
       try {
         JSON.parse(savedOrder)
       } catch {
-        showToast('Cluster sort preferences were corrupted and have been reset to defaults.', 'warning')
+        showToast(t('cluster.sortPreferencesCorrupted'), 'warning')
       }
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -148,7 +149,7 @@ export function Clusters() {
   }, [location.key]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleRenameContext = async (oldName: string, newName: string) => {
-    if (!isConnected) throw new Error('Local agent not connected')
+    if (!isConnected) throw new Error(t('cluster.renameNoAgent'))
     // Use agentFetch so the Authorization: Bearer <KC_AGENT_TOKEN> header
     // is injected — plain fetch() is rejected with 401 when the agent has
     // a token configured (#6133).
@@ -215,6 +216,8 @@ export function Clusters() {
     globalSelectedClusters,
     isAllClustersSelected,
     customFilter,
+    selectedDistributions,
+    isAllDistributionsSelected,
     sortBy,
     sortAsc,
     customOrder })
@@ -307,7 +310,7 @@ export function Clusters() {
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   // ── beforeCards: Stale banner + Cluster Info Cards + Cluster Groups ──
 
@@ -384,6 +387,20 @@ export function Clusters() {
                   safeSetItem(STORAGE_KEY_CLUSTER_LAYOUT, mode)
                 }}
                 onAddCluster={() => setShowAddCluster(true)}
+                onCreateClusterWithAI={() => {
+                  createCheckKeyAndRun(async () => {
+                    const prompt = await loadMissionPrompt(
+                      'create-cluster',
+                      'Help me create a new Kubernetes cluster. Ask me about the provider (kind, k3d, EKS, GKE, AKS, OpenShift), cluster name, node count, and Kubernetes version. Then generate and execute the appropriate commands to create the cluster and add it to my kubeconfig.',
+                    )
+                    startMission({
+                      title: t('cluster.createClusterWithAI'),
+                      description: 'AI-guided cluster creation across any provider',
+                      type: 'deploy',
+                      initialPrompt: prompt })
+                    openSidebar()
+                  })
+                }}
               />
               {filteredClusters.length === 0 && !isLoading && !showSkeletonContent ? (
                 <EmptyClusterState onAddCluster={() => setShowAddCluster(true)} />
@@ -420,6 +437,7 @@ export function Clusters() {
 
   return (
     <DashboardPage
+      testId="clusters-page"
       title={t('navigation.clusters')}
       subtitle={t('cluster.subtitle')}
       icon="Server"
@@ -496,6 +514,9 @@ export function Clusters() {
 
       {/* API Key Prompt for Prune action */}
       <ApiKeyPromptModal isOpen={pruneShowKeyPrompt} onDismiss={pruneDismissPrompt} onGoToSettings={pruneGoToSettings} />
+
+      {/* API Key Prompt for Create Cluster with AI action (#6454) */}
+      <ApiKeyPromptModal isOpen={createShowKeyPrompt} onDismiss={createDismissPrompt} onGoToSettings={createGoToSettings} />
 
       {/* Add Cluster Dialog */}
       <AddClusterDialog open={showAddCluster} onClose={() => setShowAddCluster(false)} />

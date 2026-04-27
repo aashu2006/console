@@ -8,8 +8,27 @@ import (
 	"log/slog"
 	"net"
 	"net/smtp"
+	"strings"
 	"time"
 )
+
+const (
+	// SMTPDialTimeout bounds the initial TCP connect to the SMTP server.
+	SMTPDialTimeout = 10 * time.Second
+	// SMTPOpTimeout bounds each individual SMTP phase (TLS handshake,
+	// STARTTLS, AUTH, MAIL/RCPT, DATA, QUIT). Without per-phase deadlines a
+	// stalled server could hang the notifier indefinitely after the TCP
+	// connection succeeds (#8391).
+	SMTPOpTimeout = 30 * time.Second
+)
+
+// setSMTPDeadline arms a fresh per-operation deadline on conn. Called before
+// each SMTP phase so a stalled phase doesn't consume the entire budget of the
+// next one. Returns any error from SetDeadline so callers can surface it.
+// (#8391)
+func setSMTPDeadline(conn net.Conn) error {
+	return conn.SetDeadline(time.Now().Add(SMTPOpTimeout))
+}
 
 // EmailNotifier handles email notifications via SMTP
 type EmailNotifier struct {
@@ -40,8 +59,11 @@ func (e *EmailNotifier) Send(alert Alert) error {
 	if e.SMTPHost == "" {
 		return fmt.Errorf("SMTP host not configured")
 	}
+	if e.From == "" {
+		return fmt.Errorf("from address not configured")
+	}
 	if len(e.To) == 0 {
-		return fmt.Errorf("no email recipients configured")
+		return fmt.Errorf("no recipients configured")
 	}
 
 	subject := fmt.Sprintf("[%s] %s - %s", alert.Severity, alert.RuleName, alert.Cluster)
@@ -82,12 +104,20 @@ func (e *EmailNotifier) Send(alert Alert) error {
 
 // sendWithTLS sends an email using STARTTLS to encrypt the connection before
 // transmitting SMTP credentials. This prevents plaintext credential exposure
-// on non-localhost connections (#4730).
+// on non-localhost connections (#4730). Every SMTP phase gets a fresh
+// per-operation deadline (SMTPOpTimeout) so a stalled phase cannot hang the
+// notifier indefinitely (#8391).
 func (e *EmailNotifier) sendWithTLS(addr string, auth smtp.Auth, msg string) error {
-	// Connect to SMTP server
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	// Connect to SMTP server with an initial dial timeout.
+	conn, err := net.DialTimeout("tcp", addr, SMTPDialTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to connect to SMTP server: %w", err)
+	}
+
+	// Arm a deadline for the SMTP banner / NewClient handshake.
+	if err := setSMTPDeadline(conn); err != nil {
+		conn.Close()
+		return fmt.Errorf("failed to set SMTP deadline: %w", err)
 	}
 
 	client, err := smtp.NewClient(conn, e.SMTPHost)
@@ -102,28 +132,44 @@ func (e *EmailNotifier) sendWithTLS(addr string, auth smtp.Auth, msg string) err
 		ServerName: e.SMTPHost,
 		MinVersion: tls.VersionTLS12,
 	}
+	// Reset the deadline before STARTTLS so the handshake has its full budget.
+	if err := setSMTPDeadline(conn); err != nil {
+		return fmt.Errorf("failed to set STARTTLS deadline: %w", err)
+	}
 	if err := client.StartTLS(tlsConfig); err != nil {
 		return fmt.Errorf("STARTTLS failed (SMTP server may not support TLS): %w", err)
 	}
 
 	// Authenticate after TLS is established
 	if auth != nil {
+		if err := setSMTPDeadline(conn); err != nil {
+			return fmt.Errorf("failed to set AUTH deadline: %w", err)
+		}
 		if err := client.Auth(auth); err != nil {
 			return fmt.Errorf("SMTP auth failed: %w", err)
 		}
 	}
 
 	// Set sender and recipients
+	if err := setSMTPDeadline(conn); err != nil {
+		return fmt.Errorf("failed to set MAIL deadline: %w", err)
+	}
 	if err := client.Mail(e.From); err != nil {
 		return fmt.Errorf("SMTP MAIL FROM failed: %w", err)
 	}
 	for _, recipient := range e.To {
+		if err := setSMTPDeadline(conn); err != nil {
+			return fmt.Errorf("failed to set RCPT deadline: %w", err)
+		}
 		if err := client.Rcpt(recipient); err != nil {
 			return fmt.Errorf("SMTP RCPT TO failed for %s: %w", recipient, err)
 		}
 	}
 
 	// Write message body
+	if err := setSMTPDeadline(conn); err != nil {
+		return fmt.Errorf("failed to set DATA deadline: %w", err)
+	}
 	w, err := client.Data()
 	if err != nil {
 		return fmt.Errorf("SMTP DATA failed: %w", err)
@@ -135,6 +181,10 @@ func (e *EmailNotifier) sendWithTLS(addr string, auth smtp.Auth, msg string) err
 		return fmt.Errorf("failed to close email body: %w", err)
 	}
 
+	// Final deadline for QUIT so a stalled close doesn't hang the notifier.
+	if err := setSMTPDeadline(conn); err != nil {
+		return fmt.Errorf("failed to set QUIT deadline: %w", err)
+	}
 	return client.Quit()
 }
 
@@ -154,11 +204,27 @@ func (e *EmailNotifier) Test() error {
 	return e.Send(testAlert)
 }
 
-// buildMessage constructs the full email message with headers
+// sanitizeHeaderValue strips CR/LF characters from a value destined for an
+// SMTP header. Without this, attacker-controlled content in From, To, or
+// Subject could inject additional headers or alter message structure (#7535).
+func sanitizeHeaderValue(v string) string {
+	r := strings.NewReplacer("\r", "", "\n", "")
+	return r.Replace(v)
+}
+
+// buildMessage constructs the full email message with headers.
+// All dynamic values are sanitized to prevent header injection (#7535).
 func (e *EmailNotifier) buildMessage(subject, body string) string {
-	msg := fmt.Sprintf("From: %s\r\n", e.From)
-	msg += fmt.Sprintf("To: %s\r\n", e.To[0])
-	msg += fmt.Sprintf("Subject: %s\r\n", subject)
+	safeFrom := sanitizeHeaderValue(e.From)
+	safeTo := make([]string, len(e.To))
+	for i, addr := range e.To {
+		safeTo[i] = sanitizeHeaderValue(addr)
+	}
+	safeSubject := sanitizeHeaderValue(subject)
+
+	msg := fmt.Sprintf("From: %s\r\n", safeFrom)
+	msg += fmt.Sprintf("To: %s\r\n", strings.Join(safeTo, ", "))
+	msg += fmt.Sprintf("Subject: %s\r\n", safeSubject)
 	msg += "MIME-Version: 1.0\r\n"
 	msg += "Content-Type: text/html; charset=UTF-8\r\n"
 	msg += "\r\n"

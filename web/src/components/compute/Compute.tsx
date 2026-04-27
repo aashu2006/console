@@ -5,7 +5,6 @@ import { Button } from '../ui/Button'
 import { useClusters, useGPUNodes } from '../../hooks/useMCP'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { StatBlockValue } from '../ui/StatsOverview'
 import { DashboardPage } from '../../lib/dashboards/DashboardPage'
 import { getDefaultCards } from '../../config/dashboards'
@@ -46,7 +45,6 @@ export function Compute() {
     selectedClusters: globalSelectedClusters,
     isAllClustersSelected } = useGlobalFilters()
   const { drillToResources } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
 
   // State for cluster comparison selection
   const [selectedForComparison, setSelectedForComparison] = useState<string[]>([])
@@ -82,7 +80,7 @@ export function Compute() {
     totalNodes: reachableClusters.reduce((sum, c) => sum + (c.nodeCount || 0), 0),
     totalPods: reachableClusters.reduce((sum, c) => sum + (c.podCount || 0), 0),
     totalGPUs: gpuNodes
-      .filter(node => isAllClustersSelected || globalSelectedClusters.includes(node.cluster.split('/')[0]))
+      .filter(node => isAllClustersSelected || globalSelectedClusters.includes(node.cluster))
       .reduce((sum, node) => sum + node.gpuCount, 0) }
 
   // Check if we have any reachable clusters with actual data (not refreshing).
@@ -98,9 +96,11 @@ export function Compute() {
   // Cache the last known good stats to show during refresh
   const cachedStats = useRef(currentStats)
 
-  // Update cache when we have real data (not all zeros during refresh)
+  // Update cache when we have real data — including valid zero-node states
+  // after scale-down (#7347). The hasActualData guard already ensures nodeCount
+  // has been reported, so a zero value is a real measurement, not a placeholder.
   useEffect(() => {
-    if (hasActualData && (currentStats.totalNodes > 0 || currentStats.totalCPUs > 0)) {
+    if (hasActualData) {
       cachedStats.current = currentStats
     }
   }, [hasActualData, currentStats])
@@ -167,7 +167,10 @@ export function Compute() {
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
+
+  /** Maximum number of clusters that can be selected for side-by-side comparison. */
+  const MAX_COMPARISON_CLUSTERS = 4
 
   // Cluster comparison handlers
   const toggleClusterSelection = (clusterName: string) => {
@@ -175,8 +178,7 @@ export function Compute() {
       if (prev.includes(clusterName)) {
         return prev.filter(name => name !== clusterName)
       }
-      // Max 4 clusters
-      if (prev.length >= 4) return prev
+      if (prev.length >= MAX_COMPARISON_CLUSTERS) return prev
       return [...prev, clusterName]
     })
   }
@@ -202,19 +204,25 @@ export function Compute() {
           aria-controls="cluster-comparison-list"
         >
           <GitCompare className="w-4 h-4" />
-          <span>Cluster Comparison</span>
+          <span>{t('compute.clusterComparison')}</span>
           {showClusterList ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </button>
         {selectedForComparison.length > 0 && (
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">
-              {selectedForComparison.length} selected
+              {t('compute.countSelected', { count: selectedForComparison.length })}
             </span>
+            {selectedForComparison.length >= MAX_COMPARISON_CLUSTERS && (
+              <span className="flex items-center gap-1 text-xs text-yellow-400">
+                <AlertCircle className="w-3 h-3" />
+                {t('compute.maxClustersReached', { max: MAX_COMPARISON_CLUSTERS })}
+              </span>
+            )}
             <button
               onClick={clearSelection}
               className="text-xs text-muted-foreground hover:text-foreground transition-colors"
             >
-              Clear
+              {t('actions.clear')}
             </button>
             {selectedForComparison.length >= 2 && (
               <Button
@@ -223,7 +231,7 @@ export function Compute() {
                 onClick={handleCompare}
                 icon={<GitCompare className="w-4 h-4" />}
               >
-                Compare ({selectedForComparison.length})
+                {t('compute.compareWithCount', { count: selectedForComparison.length })}
               </Button>
             )}
           </div>
@@ -234,7 +242,7 @@ export function Compute() {
         <div id="cluster-comparison-list" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
           {filteredClusters.map((cluster) => {
             const isSelected = selectedForComparison.includes(cluster.name)
-            const isDisabled = !isSelected && selectedForComparison.length >= 4
+            const isDisabled = !isSelected && selectedForComparison.length >= MAX_COMPARISON_CLUSTERS
 
             return (
               <button
@@ -248,11 +256,13 @@ export function Compute() {
                       ? 'opacity-50 cursor-not-allowed'
                       : 'hover:bg-secondary/50'
                 }`}
-                aria-label={`${isSelected ? 'Deselect' : 'Select'} ${cluster.context || cluster.name} for comparison`}
+                aria-label={isSelected
+                  ? t('compute.deselectForComparison', { name: cluster.context || cluster.name })
+                  : t('compute.selectForComparison', { name: cluster.context || cluster.name })}
                 aria-pressed={isSelected}
               >
                 <div className="flex items-start gap-3">
-                  <div className="flex-shrink-0 mt-1">
+                  <div className="shrink-0 mt-1">
                     {isSelected ? (
                       <CheckSquare className="w-5 h-5 text-purple-400" />
                     ) : (
@@ -261,7 +271,7 @@ export function Compute() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
-                      <div className={`w-2 h-2 rounded-full flex-shrink-0 ${cluster.healthy ? 'bg-green-400' : 'bg-red-400'}`} />
+                      <div className={`w-2 h-2 rounded-full shrink-0 ${cluster.healthy ? 'bg-green-400' : 'bg-red-400'}`} />
                       <h4 className="font-medium text-foreground truncate" title={cluster.name}>
                         {cluster.context || cluster.name}
                       </h4>
@@ -290,7 +300,7 @@ export function Compute() {
 
       {showClusterList && filteredClusters.length === 0 && (
         <div className="glass p-8 rounded-lg text-center">
-          <p className="text-muted-foreground">No clusters available</p>
+          <p className="text-muted-foreground">{t('compute.noClustersAvailable')}</p>
         </div>
       )}
     </div>
@@ -319,7 +329,7 @@ export function Compute() {
       {/* Error Display */}
       {error && (
         <div className="mb-4 p-4 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-sm font-medium text-red-400">Error loading compute data</p>
             <p className="text-xs text-muted-foreground mt-1">{error}</p>

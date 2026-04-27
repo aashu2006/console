@@ -109,7 +109,24 @@ interface CacheComplianceReport {
 const BATCH_SIZE = 24
 const BATCH_LOAD_TIMEOUT_MS = 30_000
 const WARM_RETURN_WAIT_MS = 3_000
-const _WARM_POLL_INTERVAL_MS = 50
+/** Polling interval (ms) for the resilient warm-snapshot capture loop. */
+const WARM_POLL_INTERVAL_MS = 200
+/** Max retry attempts for page.evaluate calls that may race with navigation */
+const EVALUATE_RETRY_ATTEMPTS = 3
+/** Delay between evaluate retries (ms) */
+const EVALUATE_RETRY_DELAY_MS = 500
+/**
+ * Timeout for navigateToBatch calls (ms). Must be generous enough for CI
+ * preview servers under load. 20s default is too tight when the server is
+ * already serving other suites (#9101).
+ */
+const BATCH_NAV_TIMEOUT_MS = !!process.env.CI ? 90_000 : 45_000
+/**
+ * Overall test timeout (ms). 300s base × 2 CI multiplier = 600s, matching
+ * the suite wall-clock cap in run-all-tests.sh (#9101).
+ */
+const CACHE_TEST_TIMEOUT_MS = 300_000
+const CI_TIMEOUT_MULTIPLIER = 2
 
 
 // Mock data, setupAuth, setupLiveMocks, setLiveColdMode, navigateToBatch,
@@ -121,29 +138,53 @@ let mockControl: MockControl
 // ---------------------------------------------------------------------------
 
 async function captureColdSnapshots(page: Page, cardIds: string[]): Promise<ColdLoadSnapshot[]> {
-  return await page.evaluate((ids: string[]) => {
-    return ids.map((id) => {
-      const card = document.querySelector(`[data-card-id="${id}"]`)
-      if (!card) {
-        return {
+  // Retry page.evaluate to handle transient execution-context invalidation
+  // (e.g., a background navigation triggered by a card hook between
+  // waitForCardsToLoad and this call).
+  for (let attempt = 0; attempt < EVALUATE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await page.evaluate((ids: string[]) => {
+        return ids.map((id) => {
+          const card = document.querySelector(`[data-card-id="${id}"]`)
+          if (!card) {
+            return {
+              cardId: id, cardType: '', textLength: 0,
+              hasVisualContent: false, hasContent: false,
+              hasDemoBadge: false, dataLoading: null,
+            }
+          }
+          const textLen = (card.textContent || '').trim().length
+          const hasVisual = !!card.querySelector('canvas,svg,iframe,table,img,video,pre,code,[role="img"]')
+          return {
+            cardId: id,
+            cardType: card.getAttribute('data-card-type') || '',
+            textLength: textLen,
+            hasVisualContent: hasVisual,
+            hasContent: textLen > 10 || hasVisual,
+            hasDemoBadge: !!card.querySelector('[data-testid="demo-badge"]'),
+            dataLoading: card.getAttribute('data-loading'),
+          }
+        })
+      }, cardIds)
+    } catch (err) {
+      console.warn(`[CacheTest] captureColdSnapshots attempt ${attempt + 1}/${EVALUATE_RETRY_ATTEMPTS} failed:`, err)
+      if (attempt === EVALUATE_RETRY_ATTEMPTS - 1) {
+        // Final attempt — return empty snapshots instead of crashing
+        console.warn('[CacheTest] All captureColdSnapshots retries exhausted, returning empty snapshots')
+        return cardIds.map((id) => ({
           cardId: id, cardType: '', textLength: 0,
           hasVisualContent: false, hasContent: false,
           hasDemoBadge: false, dataLoading: null,
-        }
+        }))
       }
-      const textLen = (card.textContent || '').trim().length
-      const hasVisual = !!card.querySelector('canvas,svg,iframe,table,img,video,pre,code,[role="img"]')
-      return {
-        cardId: id,
-        cardType: card.getAttribute('data-card-type') || '',
-        textLength: textLen,
-        hasVisualContent: hasVisual,
-        hasContent: textLen > 10 || hasVisual,
-        hasDemoBadge: !!card.querySelector('[data-testid="demo-badge"]'),
-        dataLoading: card.getAttribute('data-loading'),
-      }
-    })
-  }, cardIds)
+      // Wait before retrying to let the page settle
+      await new Promise((r) => setTimeout(r, EVALUATE_RETRY_DELAY_MS))
+      // Re-wait for page to be stable
+      await page.waitForLoadState('domcontentloaded', { timeout: BATCH_LOAD_TIMEOUT_MS }).catch(() => { /* best-effort */ })
+    }
+  }
+  // TypeScript: unreachable but needed for type safety
+  return []
 }
 
 async function _captureWarmSnapshots(
@@ -226,7 +267,6 @@ async function captureWarmSnapshotsResilient(
   cardIds: string[],
   totalMs: number
 ): Promise<WarmLoadSnapshot[]> {
-  const POLL_INTERVAL = 200
   const start = Date.now()
   const firstContentTime: Record<string, number | null> = {}
   for (const id of cardIds) firstContentTime[id] = null
@@ -252,7 +292,7 @@ async function captureWarmSnapshotsResilient(
     } catch {
       // page context may have been destroyed during navigation — skip this tick
     }
-    await page.waitForTimeout(POLL_INTERVAL)
+    await page.waitForTimeout(WARM_POLL_INTERVAL_MS)
   }
 
   // Final snapshot
@@ -499,7 +539,13 @@ function writeReport(report: CacheComplianceReport, outDir: string) {
 
 test.describe.configure({ mode: 'serial' })
 
-test('card cache compliance — storage and retrieval', async ({ page }) => {
+test('card cache compliance — storage and retrieval', async ({ page }, testInfo) => {
+  // 300s base × 2 CI multiplier = 600s, matching the suite wall-clock cap in
+  // run-all-tests.sh. No testInfo.setTimeout was set before (#9101), so the
+  // test ran against the global config timeout (1200s) which meant timeout
+  // errors only surfaced as wall-clock kills.
+  testInfo.setTimeout(!!process.env.CI ? CACHE_TEST_TIMEOUT_MS * CI_TIMEOUT_MULTIPLIER : CACHE_TEST_TIMEOUT_MS)
+
   const allBatchResults: Array<{ batchIndex: number; cards: CardCacheResult[] }> = []
   const coldSnapshots: Map<string, ColdLoadSnapshot> = new Map()
   let totalCards = 0
@@ -522,6 +568,7 @@ test('card cache compliance — storage and retrieval', async ({ page }) => {
     '**/auth/**', '**/api/dashboards/**', '**/api/gpu/**', '**/api/feedback/**',
     '**/api/persistence/**', '**/api/config/**', '**/api/gitops/**',
     '**/api/nightly-e2e/**', '**/api/public/nightly-e2e/**', '**/api/rewards/**',
+    '**/api/self-upgrade/**', '**/api/admin/**', '**/api/acmm/**',
   ]
   for (const pattern of skipRoutePatterns) {
     await page.route(pattern, (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }))
@@ -559,7 +606,7 @@ test('card cache compliance — storage and retrieval', async ({ page }) => {
       localStorage.setItem('token', 'test-token')
     })
 
-    const manifest = await navigateToBatch(page, batch)
+    const manifest = await navigateToBatch(page, batch, BATCH_NAV_TIMEOUT_MS)
     const selected = manifest.selected || []
     if (selected.length === 0) continue
 
@@ -646,7 +693,7 @@ test('card cache compliance — storage and retrieval', async ({ page }) => {
         console.log(`[CacheTest] Phase 6 batch ${batch}: soft nav OK`)
       } catch {
         console.log(`[CacheTest] Phase 6 batch ${batch}: soft nav failed, falling back to page.goto`)
-        manifest = await navigateToBatch(page, batch)
+        manifest = await navigateToBatch(page, batch, BATCH_NAV_TIMEOUT_MS)
       }
       if (!manifest) {
         console.log(`[CacheTest] Phase 6 batch ${batch}: no manifest, skipping`)

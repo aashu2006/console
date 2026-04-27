@@ -3,7 +3,6 @@ import {
   usePodIssues,
   useDeployments,
   useDeploymentIssues,
-  usePVCs,
   useServices,
   useEvents,
   useWarningEvents,
@@ -12,9 +11,12 @@ import {
   useOperatorSubscriptions,
   useOperators,
   useGPUNodes } from './useMCP'
+import { useIngresses } from './mcp/networking'
+import { useCachedPVCs } from './useCachedData'
 import { useAlerts, useAlertRules } from './useAlerts'
 import { StatBlockValue } from '../components/ui/StatsOverview'
 import { useDrillDownActions } from './useDrillDown'
+import { MS_PER_HOUR } from '../lib/constants/time'
 
 // Cost estimation constants (per-month, rough cloud averages)
 const COST_PER_CPU = 30          // USD per vCPU per month
@@ -46,7 +48,7 @@ export function useUniversalStats() {
   const { issues: podIssues } = usePodIssues()
   const { deployments } = useDeployments()
   const { issues: deploymentIssues } = useDeploymentIssues()
-  const { pvcs } = usePVCs()
+  const { pvcs } = useCachedPVCs()
   const { services } = useServices()
   const { events } = useEvents(undefined, undefined, 100)
   const { events: warningEvents } = useWarningEvents(undefined, undefined, 100)
@@ -55,6 +57,7 @@ export function useUniversalStats() {
   const { subscriptions: operatorSubscriptions } = useOperatorSubscriptions()
   const { operators } = useOperators()
   const { nodes: gpuNodes } = useGPUNodes()
+  const { ingresses } = useIngresses()
   const { stats: alertStats } = useAlerts()
   const { rules: alertRules } = useAlertRules()
 
@@ -96,7 +99,7 @@ export function useUniversalStats() {
   const allWarningEvents = warningEvents || []
   const normalEvents = allEvents.filter(e => e.type === 'Normal').length
   const recentEvents = (() => {
-    const oneHourAgo = Date.now() - 60 * 60 * 1000
+    const oneHourAgo = Date.now() - MS_PER_HOUR
     return allEvents.filter(e => {
       if (!e.lastSeen) return false
       return new Date(e.lastSeen).getTime() > oneHourAgo
@@ -226,10 +229,17 @@ export function useUniversalStats() {
         return { value: npCount, sublabel: 'node-level access', onClick: () => drillToAllServices('NodePort'), isClickable: npCount > 0 }
       case 'clusterip':
         return { value: cipCount, sublabel: 'internal only', onClick: () => drillToAllServices('ClusterIP'), isClickable: cipCount > 0 }
-      case 'ingresses':
-        return { value: '-', sublabel: 'ingresses', isClickable: false }
-      case 'endpoints':
-        return { value: allServices.length, sublabel: 'endpoints', isClickable: false }
+      case 'ingresses': {
+        const allIngresses = ingresses || []
+        return { value: allIngresses.length, sublabel: 'ingresses', isClickable: false }
+      }
+      case 'endpoints': {
+        // Sum actual ready endpoints across services (#7514) — not service count
+        const totalEndpoints = allServices.reduce(
+          (sum, s) => sum + (s.endpoints ?? 0), 0
+        )
+        return { value: totalEndpoints, sublabel: 'endpoints', isClickable: false }
+      }
 
       // ══════════════════════════════════════════
       // Security stats

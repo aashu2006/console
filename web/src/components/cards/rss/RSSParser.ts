@@ -1,4 +1,5 @@
 import type { FeedItem } from './types'
+import { hostnameEndsWith } from '../../../lib/utils/urlHostname'
 
 // Filter out placeholder/generic images that aren't real article thumbnails
 export function isValidThumbnail(url: string): boolean {
@@ -32,18 +33,7 @@ export function normalizeRedditLink(url: string): string {
   return url.replace(/old\.reddit\.com/g, 'www.reddit.com')
 }
 
-// Format relative time
-export function formatTimeAgo(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000)
-  if (seconds < 60) return 'just now'
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h`
-  const days = Math.floor(hours / 24)
-  if (days < 30) return `${days}d`
-  return date.toLocaleDateString()
-}
+
 
 // Parse RSS/Atom XML into feed items
 export function parseRSSFeed(xml: string, feedUrl: string): FeedItem[] {
@@ -64,7 +54,8 @@ export function parseRSSFeed(xml: string, feedUrl: string): FeedItem[] {
 
       // Extract thumbnail from multiple sources, validating each
       let thumbnail = ''
-      const isRedditItem = feedUrl.includes('reddit.com')
+      // Use parsed hostname to detect Reddit feeds — prevents bypass via crafted URLs (CodeQL #9119)
+      const isRedditItem = hostnameEndsWith(feedUrl, 'reddit.com')
 
       // 1. media:thumbnail (try multiple selector variants for namespace issues)
       const mediaThumbnail = item.querySelector('media\\:thumbnail, thumbnail')?.getAttribute('url') || ''
@@ -105,8 +96,8 @@ export function parseRSSFeed(xml: string, feedUrl: string): FeedItem[] {
         const imgMatches = description.matchAll(/<img[^>]+src=["']([^"']+)["'][^>]*>/gi)
         for (const match of imgMatches) {
           const imgUrl = match[1]
-          // Prefer Reddit's own image hosts
-          if (isRedditItem && (imgUrl.includes('redd.it') || imgUrl.includes('redditmedia.com'))) {
+          // Prefer Reddit's own image hosts — check parsed hostname (CodeQL #9119)
+          if (isRedditItem && (hostnameEndsWith(imgUrl, 'redd.it') || hostnameEndsWith(imgUrl, 'redditmedia.com'))) {
             if (isValidThumbnail(imgUrl)) {
               thumbnail = imgUrl
               break
@@ -123,8 +114,8 @@ export function parseRSSFeed(xml: string, feedUrl: string): FeedItem[] {
         if (imgMatch && isValidThumbnail(imgMatch[1])) thumbnail = imgMatch[1]
       }
 
-      // Reddit-specific fields
-      const isReddit = feedUrl.includes('reddit.com')
+      // Reddit-specific fields — use parsed hostname (CodeQL #9119)
+      const isReddit = hostnameEndsWith(feedUrl, 'reddit.com')
       let score: number | undefined
       let subreddit: string | undefined
 

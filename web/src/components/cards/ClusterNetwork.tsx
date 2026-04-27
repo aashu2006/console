@@ -15,15 +15,19 @@ interface ClusterNetworkProps {
 
 export function ClusterNetwork({ config }: ClusterNetworkProps) {
   const { t } = useTranslation(['cards', 'common'])
-  const { deduplicatedClusters: allClusters, isLoading } = useClusters()
+  const { deduplicatedClusters: allClusters, isLoading, isRefreshing, isFailed, consecutiveFailures } = useClusters()
   const [selectedCluster, setSelectedCluster] = useState<string>(config?.cluster || '')
   const { isDemoMode } = useDemoMode()
 
   // Report state to CardWrapper for refresh animation
+  const hasData = allClusters.length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasData,
+    isRefreshing,
     hasAnyData: allClusters.length > 0,
-    isDemoData: isDemoMode })
+    isDemoData: isDemoMode,
+    isFailed,
+    consecutiveFailures })
 
   const {
     selectedClusters: globalSelectedClusters,
@@ -49,6 +53,11 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
     return result
   })()
 
+  // Detect when the selected cluster is hidden by global filters
+  const isSelectedClusterFiltered = selectedCluster !== '' &&
+    !clusters.some(c => c.name === selectedCluster) &&
+    allClusters.some(c => c.name === selectedCluster)
+
   const cluster = clusters.find(c => c.name === selectedCluster)
 
   // Parse server URL for display
@@ -68,7 +77,7 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={130} height={20} />
           <Skeleton variant="rounded" width={120} height={32} />
         </div>
@@ -87,12 +96,12 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
     )
   }
 
-  if (!selectedCluster) {
+  if (!selectedCluster || isSelectedClusterFiltered) {
     return (
       <div className="h-full flex flex-col min-h-card">
         <div className="flex items-center justify-end mb-4">
           <select
-            value={selectedCluster}
+            value={isSelectedClusterFiltered ? '' : selectedCluster}
             onChange={(e) => setSelectedCluster(e.target.value)}
             className="px-3 py-1.5 rounded-lg bg-secondary border border-border text-sm text-foreground"
           >
@@ -102,8 +111,10 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
             ))}
           </select>
         </div>
-        <div className="flex-1 flex items-center justify-center text-muted-foreground">
-          {t('cards:clusterNetwork.selectClusterToView')}
+        <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm text-center px-4">
+          {isSelectedClusterFiltered
+            ? t('cards:clusterNetwork.clusterHiddenByFilter')
+            : t('cards:clusterNetwork.selectClusterToView')}
         </div>
       </div>
     )
@@ -112,7 +123,7 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded overflow-hidden">
       {/* Controls */}
-      <div className="flex items-center justify-between mb-4 gap-2 min-w-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4 gap-2 min-w-0">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-sm font-medium text-foreground truncate">{selectedCluster}</span>
           <div className={`w-2 h-2 rounded-full ${cluster?.healthy ? 'bg-green-500' : 'bg-red-500'}`} />
@@ -140,15 +151,15 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
             <span className="text-sm font-medium text-cyan-300">{t('cards:clusterNetwork.apiServer')}</span>
           </div>
           <div className="space-y-2">
-            <div className="flex items-center justify-between gap-2 min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2 min-w-0">
               <span className="text-xs text-muted-foreground shrink-0">{t('cards:clusterNetwork.host')}</span>
               <span className="text-sm text-foreground font-mono truncate">{serverInfo.host}</span>
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-y-2">
               <span className="text-xs text-muted-foreground">{t('common:common.port')}</span>
               <span className="text-sm text-foreground font-mono">{serverInfo.port}</span>
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-y-2">
               <span className="text-xs text-muted-foreground">{t('common:common.protocol')}</span>
               <span className="text-sm text-foreground font-mono uppercase">{serverInfo.protocol}</span>
             </div>
@@ -159,7 +170,7 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
       {/* Connection Status */}
       <div className="space-y-3">
         <div className="p-3 rounded-lg bg-secondary/30">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full ${cluster?.healthy ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
               <span className="text-sm text-muted-foreground">{t('cards:clusterNetwork.connectionStatus')}</span>
@@ -171,17 +182,19 @@ export function ClusterNetwork({ config }: ClusterNetworkProps) {
         </div>
 
         <div className="p-3 rounded-lg bg-secondary/30">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <div className="flex items-center gap-2">
               <Shield className="w-4 h-4 text-purple-400" />
               <span className="text-sm text-muted-foreground">TLS</span>
             </div>
-            <span className="text-sm font-medium text-green-400">{t('common:common.enabled')}</span>
+            <span className={`text-sm font-medium ${serverInfo?.protocol === 'https' ? 'text-green-400' : 'text-red-400'}`}>
+              {serverInfo?.protocol === 'https' ? t('common:common.enabled') : t('common:common.disabled')}
+            </span>
           </div>
         </div>
 
         <div className="p-3 rounded-lg bg-secondary/30">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <div className="flex items-center gap-2">
               <Server className="w-4 h-4 text-blue-400" />
               <span className="text-sm text-muted-foreground">{t('common:common.nodes')}</span>

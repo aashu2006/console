@@ -7,11 +7,13 @@ import { useMissions } from '../../hooks/useMissions'
 import { ConfirmMissionPromptDialog } from '../missions/ConfirmMissionPromptDialog'
 import { useLocalAgent } from '../../hooks/useLocalAgent'
 import { useDemoMode } from '../../hooks/useDemoMode'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
 import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
 import { CardSearchInput, CardControlsRow, CardPaginationFooter, CardAIActions } from '../../lib/cards/CardComponents'
 import { StatusBadge } from '../ui/StatusBadge'
 import { useCardLoadingState } from './CardDataContext'
 import { LOCAL_AGENT_WS_URL } from '../../lib/constants'
+import { appendWsAuthToken } from '../../lib/utils/wsAuth'
 import { safeGetJSON, safeSetJSON } from '../../lib/safeLocalStorage'
 import { useTranslation } from 'react-i18next'
 
@@ -31,7 +33,7 @@ const SORT_OPTIONS = [
 
 // Module-level cache for cluster versions (persists across component remounts + page refreshes)
 const STORAGE_KEY = 'kc-cluster-versions'
-const VERSION_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+const VERSION_CACHE_TTL = 5 * MS_PER_MINUTE // 5 minutes
 
 // Load persisted cache from localStorage on module init
 const versionCache: Record<string, { version: string; timestamp: number }> =
@@ -141,7 +143,7 @@ function createVersionWsHandle(): VersionWsHandle {
 
     return new Promise((resolve, reject) => {
       try {
-        ws = new WebSocket(LOCAL_AGENT_WS_URL)
+        ws = new WebSocket(appendWsAuthToken(LOCAL_AGENT_WS_URL))
       } catch {
         connecting = false
         reject(new Error('Failed to create WebSocket'))
@@ -697,7 +699,7 @@ Please proceed step by step and ask for confirmation before making any changes.`
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           {pendingUpgrades > 0 && (
             <StatusBadge color="yellow">
@@ -751,7 +753,7 @@ Please proceed step by step and ask for confirmation before making any changes.`
               className="cursor-pointer"
               onClick={() => drillToCluster(cluster.name, { tab: 'upgrade', version: cluster.currentVersion, targetVersion: cluster.targetVersion })}
             >
-              <div className="flex items-center justify-between mb-2 gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 gap-2">
                 <span className="text-sm font-medium text-foreground truncate min-w-0 flex-1">{cluster.name}</span>
                 <span className="shrink-0">{getStatusIcon(cluster.status)}</span>
               </div>

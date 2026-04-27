@@ -1,15 +1,24 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore } from 'react'
 import { api } from '../lib/api'
 import { addCustomTheme, removeCustomTheme } from '../lib/themes'
 import { emitMarketplaceInstall, emitMarketplaceRemove, emitMarketplaceInstallFailed } from '../lib/analytics'
 import { FETCH_EXTERNAL_TIMEOUT_MS } from '../lib/constants/network'
+import { MS_PER_HOUR, MS_PER_DAY } from '../lib/constants/time'
 import { isCardTypeRegistered } from '../components/cards/cardRegistry'
-import { STORAGE_KEY_MAIN_DASHBOARD_CARDS } from '../lib/constants/storage'
 import { getDefaultCardSize } from '../components/dashboard/dashboardUtils'
+
+// Minimal shape needed from GET /api/dashboards to locate the target
+// dashboard for marketplace card-preset installs. The real DashboardData
+// type is defined in components/dashboard; we only need id + is_default
+// here so we keep the dependency narrow.
+interface DashboardSummary {
+  id: string
+  is_default?: boolean
+}
 
 const REGISTRY_URL = 'https://raw.githubusercontent.com/kubestellar/console-marketplace/main/registry.json'
 const CACHE_KEY = 'kc-marketplace-registry'
-const CACHE_TTL_MS = 60 * 60 * 1000 // 1 hour
+const CACHE_TTL_MS = MS_PER_HOUR // 1 hour
 const INSTALLED_KEY = 'kc-marketplace-installed'
 
 export type MarketplaceItemType = 'dashboard' | 'card-preset' | 'theme'
@@ -77,15 +86,42 @@ const MARKETPLACE_TO_CARD_TYPE: Record<string, string> = {
   'cncf-etcd': 'etcd_status',
   'cncf-fluentd': 'fluentd_status',
   'cncf-crio': 'crio_status',
+  'cncf-backstage': 'backstage_status',
+  'cncf-cloud-custodian': 'cloud_custodian_status',
+  'cncf-containerd': 'containerd_status',
+  'cncf-cortex': 'cortex_status',
+  'cncf-dragonfly': 'dragonfly_status',
   'cncf-cloudevents': 'cloudevents_status',
   'cncf-crossplane': 'crossplane_managed_resources',
   'cncf-buildpacks': 'buildpacks_status',
   'cncf-kubevirt': 'kubevirt_status',
   'cncf-kubevela': 'kubevela_status',
   'cncf-lima': 'lima_status',
+  'cncf-flux': 'flux_status',
+  'cncf-contour': 'contour_status',
+  'cncf-dapr': 'dapr_status',
+  'cncf-envoy': 'envoy_status',
+  'cncf-flatcar': 'flatcar_status',
+  'cncf-grpc': 'grpc_status',
+  'cncf-kserve': 'kserve_status',
+  'cncf-linkerd': 'linkerd_status',
+  'cncf-longhorn': 'longhorn_status',
   'cncf-openfeature': 'openfeature_status',
+  'cncf-openfga': 'openfga_status',
+  'cncf-rook': 'rook_status',
+  'cncf-spiffe': 'spiffe_status',
+  'cncf-cni': 'cni_status',
+  'cncf-spire': 'spire_status',
   'cncf-strimzi': 'strimzi_status',
-  'cncf-thanos': 'thanos_status' }
+  'cncf-thanos': 'thanos_status',
+  'cncf-opentelemetry': 'otel_status',
+  'cncf-tikv': 'tikv_status',
+  'cncf-tuf': 'tuf_status',
+  'cncf-vitess': 'vitess_status',
+  'cncf-chaos-mesh': 'chaos_mesh_status',
+  'cncf-wasmcloud': 'wasmcloud_status',
+  'cncf-volcano': 'volcano_status',
+}
 
 /**
  * Reconcile marketplace items against the local card registry.
@@ -134,6 +170,32 @@ function saveInstalled(map: InstalledMap): void {
   }
 }
 
+// ── Cross-tab sync (#7542) ────────────────────────────────────────────
+// Listeners are notified whenever the installed-items map changes so that
+// other browser tabs (or multiple useMarketplace mounts) stay in sync.
+let installedSnapshot = loadInstalled()
+const installedListeners = new Set<() => void>()
+
+function subscribeInstalled(cb: () => void) {
+  installedListeners.add(cb)
+  return () => { installedListeners.delete(cb) }
+}
+
+function getInstalledSnapshot(): InstalledMap { return installedSnapshot }
+const emptyInstalledMap: InstalledMap = {}
+
+function notifyInstalledChange() {
+  installedSnapshot = loadInstalled()
+  installedListeners.forEach(cb => cb())
+}
+
+// Listen for cross-tab localStorage changes (#7542)
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key === INSTALLED_KEY) notifyInstalledChange()
+  })
+}
+
 export interface InstallResult {
   type: MarketplaceItemType
   data?: unknown
@@ -147,7 +209,8 @@ export function useMarketplace() {
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
   const [selectedType, setSelectedType] = useState<MarketplaceItemType | null>(null)
   const [showHelpWanted, setShowHelpWanted] = useState(false)
-  const [installedItems, setInstalledItems] = useState<InstalledMap>(loadInstalled)
+  // Use cross-tab-aware external store for installed items (#7542)
+  const installedItems: InstalledMap = useSyncExternalStore(subscribeInstalled, getInstalledSnapshot, () => emptyInstalledMap)
 
   const fetchRegistry = useCallback(async (skipCache = false) => {
     setIsLoading(true)
@@ -191,32 +254,65 @@ export function useMarketplace() {
         // Cache write failed — non-critical
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load marketplace')
-      setItems([])
+      // #7543: On fetch failure, keep cached/current items with a stale indicator
+      // instead of clearing to empty which falsely implies no items exist.
+      const staleMsg = err instanceof Error ? err.message : 'Failed to load marketplace'
+      setError(staleMsg)
+      // Only fall back to empty if we truly have nothing to show
+      if (items.length === 0) {
+        try {
+          const cached = localStorage.getItem(CACHE_KEY)
+          if (cached) {
+            const parsed: CachedRegistry = JSON.parse(cached)
+            setItems(mergeRegistryItems(parsed.data))
+          }
+        } catch { /* no cached fallback available */ }
+      }
     } finally {
       setIsLoading(false)
     }
-  }, [])
+  }, [items.length])
 
   useEffect(() => {
     fetchRegistry()
   }, [fetchRegistry])
 
+  // #7539: Reconcile installed-dashboard state against the backend so items
+  // deleted outside the marketplace are no longer shown as "installed".
+  const reconcileRef = useRef(false)
+  useEffect(() => {
+    if (reconcileRef.current) return
+    reconcileRef.current = true
+
+    const dashboardEntries = (Object.entries(installedItems) as [string, InstalledEntry][]).filter(
+      ([, entry]) => entry.type === 'dashboard' && entry.dashboardId
+    )
+    if (dashboardEntries.length === 0) return
+
+    api.get<{ id: string }[]>('/api/dashboards').then(({ data: dashboards }) => {
+      const ids = new Set((dashboards || []).map(d => d.id))
+      let changed = false
+      for (const [itemId, entry] of dashboardEntries) {
+        if (entry.dashboardId && !ids.has(entry.dashboardId)) {
+          markUninstalled(itemId)
+          changed = true
+        }
+      }
+      if (changed) notifyInstalledChange()
+    }).catch(() => { /* reconciliation is best-effort */ })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   const markInstalled = (itemId: string, entry: InstalledEntry) => {
-    setInstalledItems(prev => {
-      const next = { ...prev, [itemId]: entry }
-      saveInstalled(next)
-      return next
-    })
+    const next = { ...installedSnapshot, [itemId]: entry }
+    saveInstalled(next)
+    notifyInstalledChange()
   }
 
   const markUninstalled = (itemId: string) => {
-    setInstalledItems(prev => {
-      const next = { ...prev }
-      delete next[itemId]
-      saveInstalled(next)
-      return next
-    })
+    const next = { ...installedSnapshot }
+    delete next[itemId]
+    saveInstalled(next)
+    notifyInstalledChange()
   }
 
   const isInstalled = (itemId: string): boolean => {
@@ -244,27 +340,53 @@ export function useMarketplace() {
     const json = await response.json()
 
     if (item.type === 'card-preset') {
-      // Persist card directly to the main dashboard localStorage so it
-      // survives navigation. Previously this only dispatched a CustomEvent
-      // that was lost if the Dashboard component wasn't mounted (#4780).
-      const { card_type, config, title } = json as { card_type?: string; config?: Record<string, unknown>; title?: string }
-      if (card_type) {
-        const size = getDefaultCardSize(card_type)
-        const newCard = {
-          id: `mp-${Date.now()}`,
-          card_type,
-          config: config || {},
-          title,
-          position: { x: 0, y: 0, ...size } }
-        try {
-          const raw = localStorage.getItem(STORAGE_KEY_MAIN_DASHBOARD_CARDS)
-          const existing = raw ? JSON.parse(raw) : []
-          const cards = Array.isArray(existing) ? existing : []
-          cards.unshift(newCard)
-          localStorage.setItem(STORAGE_KEY_MAIN_DASHBOARD_CARDS, JSON.stringify(cards))
-        } catch { /* localStorage unavailable — card will appear on next dashboard load */ }
+      // Persist the card to the backend so it survives a hard refresh.
+      // Previously this mutated localStorage directly, which worked only
+      // until the Dashboard rehydrated from GET /api/dashboards — at that
+      // point the installed card disappeared because the backend never
+      // heard about it (#6620, reported by @AAdIprog; supersedes the
+      // localStorage workaround from #4780).
+      const { card_type, config, title } = json as {
+        card_type?: string
+        config?: Record<string, unknown>
+        title?: string
       }
-      // Also dispatch event so a mounted Dashboard picks up changes immediately
+      if (!card_type) {
+        const msg = 'card-preset payload missing card_type'
+        emitMarketplaceInstallFailed(item.type, item.name, msg)
+        throw new Error(msg)
+      }
+
+      const size = getDefaultCardSize(card_type)
+      const newCard = {
+        id: `mp-${Date.now()}`,
+        card_type,
+        config: config || {},
+        title,
+        position: { x: 0, y: 0, ...size } }
+
+      // Resolve the target dashboard the same way Dashboard.tsx does in
+      // loadDashboard(): prefer the default dashboard, fall back to the
+      // first one returned. Matching Dashboard's canonical path here is
+      // important so that installed cards land on the same surface the
+      // user sees on the home page.
+      try {
+        const { data: dashboards } = await api.get<DashboardSummary[]>('/api/dashboards')
+        const target = (dashboards || []).find(d => d.is_default) || (dashboards || [])[0]
+        if (!target?.id) {
+          throw new Error('no dashboard available to install card-preset into')
+        }
+        await api.post(`/api/dashboards/${target.id}/cards`, newCard)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'backend persist failed'
+        emitMarketplaceInstallFailed(item.type, item.name, msg)
+        throw e
+      }
+
+      // Notify a mounted Dashboard so it can append the card to its
+      // in-memory state without waiting for the next loadDashboard().
+      // This is fired AFTER the POST succeeds so the dispatched event
+      // always reflects a durable write.
       window.dispatchEvent(new CustomEvent('kc-add-card-from-marketplace', { detail: json }))
       markInstalled(item.id, { installedAt: new Date().toISOString(), type: 'card-preset' })
       emitMarketplaceInstall(item.type, item.name)
@@ -294,7 +416,14 @@ export function useMarketplace() {
     if (!entry) return
 
     if (entry.type === 'dashboard' && entry.dashboardId) {
-      await api.delete(`/api/dashboards/${entry.dashboardId}`)
+      // #7540: Gracefully handle already-deleted resources — treat 404 as success
+      try {
+        await api.delete(`/api/dashboards/${entry.dashboardId}`)
+      } catch (e: unknown) {
+        const is404 = e instanceof Error && e.message.includes('404')
+        if (!is404) throw e
+        // Resource already gone — proceed with local cleanup
+      }
     }
 
     if (entry.type === 'theme') {
@@ -302,6 +431,7 @@ export function useMarketplace() {
       window.dispatchEvent(new Event('kc-custom-themes-changed'))
     }
 
+    // #7541: Always clear local state regardless of dashboardId presence
     markUninstalled(item.id)
     emitMarketplaceRemove(item.type)
   }
@@ -374,7 +504,7 @@ export function useMarketplace() {
 // --- Author Profile Hook ---
 
 const AUTHOR_CACHE_PREFIX = 'kc-author-'
-const AUTHOR_CACHE_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+const AUTHOR_CACHE_TTL_MS = MS_PER_DAY // 24 hours
 
 interface AuthorProfile {
   consolePRs: number

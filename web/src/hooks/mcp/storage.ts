@@ -7,7 +7,7 @@ import { kubectlProxy } from '../../lib/kubectlProxy'
 import { REFRESH_INTERVAL_MS, getEffectiveInterval, LOCAL_AGENT_URL, agentFetch, clusterCacheRef } from './shared'
 import { subscribePolling } from './pollingManager'
 import { settledWithConcurrency } from '../../lib/utils/concurrency'
-import { MCP_HOOK_TIMEOUT_MS } from '../../lib/constants/network'
+import { MCP_HOOK_TIMEOUT_MS, LOCAL_AGENT_HTTP_URL } from '../../lib/constants/network'
 import type { PVC, PV, ResourceQuota, LimitRange, ResourceQuotaSpec } from './types'
 
 // ---------------------------------------------------------------------------
@@ -266,7 +266,7 @@ export function usePVCs(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ pvcs: PVC[] }>(`/api/mcp/pvcs?${params}`)
+      const { data } = await api.get<{ pvcs: PVC[] }>(`${LOCAL_AGENT_HTTP_URL}/pvcs?${params}`)
       const newData = data.pvcs || []
       const now = new Date()
 
@@ -280,15 +280,13 @@ export function usePVCs(cluster?: string, namespace?: string) {
       setLastUpdated(now)
       setConsecutiveFailures(0)
       setLastRefresh(now)
-    } catch {
+    } catch (err: unknown) {
       if (!isMountedRef.current) return
-      // Keep stale data on error
+      const message = err instanceof Error ? err.message : 'Failed to fetch PVCs'
       setConsecutiveFailures(prev => prev + 1)
       setLastRefresh(new Date())
       if (!silent && !pvcsCache) {
-        // Don't show error - PVCs are optional, some clusters may have none
-        setError(null)
-        setPVCs([])
+        setError(message)
       }
     } finally {
       if (isMountedRef.current) {
@@ -379,17 +377,16 @@ export function usePVs(cluster?: string) {
     try {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
-      const { data } = await api.get<{ pvs: PV[] }>(`/api/mcp/pvs?${params}`)
+      const { data } = await api.get<{ pvs: PV[] }>(`${LOCAL_AGENT_HTTP_URL}/pvs?${params}`)
       if (!isMountedRef.current) return
       setPVs(data.pvs || [])
       setError(null)
       setConsecutiveFailures(0)
-    } catch {
+    } catch (err: unknown) {
       if (isMountedRef.current) {
-        // Don't show error - PVs are optional
-        setError(null)
+        const message = err instanceof Error ? err.message : 'Failed to fetch PVs'
+        setError(message)
         setConsecutiveFailures(prev => prev + 1)
-        setPVs([])
       }
     } finally {
       if (isMountedRef.current) {
@@ -425,10 +422,13 @@ export function usePVs(cluster?: string) {
 // Hook to get ResourceQuotas
 // When forceLive is true, skip demo mode fallback and always query the real API.
 // Used by GPU Reservations to show live data when running in-cluster with OAuth.
+// Returns `isDemoFallback: true` when the hook is serving demo data so callers
+// can render the Demo badge only for true demo output. See Issue 9356.
 export function useResourceQuotas(cluster?: string, namespace?: string, forceLive = false) {
   const [resourceQuotas, setResourceQuotas] = useState<ResourceQuota[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [isDemoFallback, setIsDemoFallback] = useState(false)
 
   const refetch = useCallback(async () => {
     // If demo mode is enabled, use demo data (unless forceLive overrides)
@@ -437,6 +437,7 @@ export function useResourceQuotas(cluster?: string, namespace?: string, forceLiv
         (!cluster || q.cluster === cluster) && (!namespace || q.namespace === namespace)
       )
       setResourceQuotas(demoQuotas)
+      setIsDemoFallback(true)
       setIsLoading(false)
       setError(null)
       return
@@ -446,14 +447,16 @@ export function useResourceQuotas(cluster?: string, namespace?: string, forceLiv
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ resourceQuotas: ResourceQuota[] }>(`/api/mcp/resourcequotas?${params}`)
+      const { data } = await api.get<{ resourceQuotas: ResourceQuota[] }>(`${LOCAL_AGENT_HTTP_URL}/resourcequotas?${params}`)
       setResourceQuotas(data.resourceQuotas || [])
+      setIsDemoFallback(false)
       setError(null)
     } catch {
       // Don't show error - ResourceQuotas are optional
       setError(null)
       // Don't fall back to demo data - show empty instead
       setResourceQuotas([])
+      setIsDemoFallback(false)
     } finally {
       setIsLoading(false)
     }
@@ -479,7 +482,7 @@ export function useResourceQuotas(cluster?: string, namespace?: string, forceLiv
     }
   }, [refetch, cluster, namespace])
 
-  return { resourceQuotas, isLoading, error, refetch }
+  return { resourceQuotas, isLoading, error, refetch, isDemoFallback }
 }
 
 // Hook to get LimitRanges
@@ -504,7 +507,7 @@ export function useLimitRanges(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       if (cluster) params.append('cluster', cluster)
       if (namespace) params.append('namespace', namespace)
-      const { data } = await api.get<{ limitRanges: LimitRange[] }>(`/api/mcp/limitranges?${params}`)
+      const { data } = await api.get<{ limitRanges: LimitRange[] }>(`${LOCAL_AGENT_HTTP_URL}/limitranges?${params}`)
       setLimitRanges(data.limitRanges || [])
       setError(null)
     } catch {
@@ -542,13 +545,13 @@ export function useLimitRanges(cluster?: string, namespace?: string) {
 
 // Create or update a ResourceQuota
 export async function createOrUpdateResourceQuota(spec: ResourceQuotaSpec): Promise<ResourceQuota> {
-  const { data } = await api.post<{ resourceQuota: ResourceQuota }>('/api/mcp/resourcequotas', spec)
+  const { data } = await api.post<{ resourceQuota: ResourceQuota }>(`${LOCAL_AGENT_HTTP_URL}/resourcequotas`, spec)
   return data.resourceQuota
 }
 
 // Delete a ResourceQuota
 export async function deleteResourceQuota(cluster: string, namespace: string, name: string): Promise<void> {
-  await api.delete(`/api/mcp/resourcequotas?cluster=${cluster}&namespace=${namespace}&name=${name}`)
+  await api.delete(`${LOCAL_AGENT_HTTP_URL}/resourcequotas?cluster=${cluster}&namespace=${namespace}&name=${name}`)
 }
 
 // Common GPU resource types for quotas

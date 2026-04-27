@@ -11,6 +11,9 @@ import { useTranslation } from 'react-i18next'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { DynamicCardErrorBoundary } from './DynamicCardErrorBoundary'
 
+/** Maximum number of clusters that can be compared side-by-side */
+const MAX_COMPARED_CLUSTERS = 4
+
 interface ClusterComparisonProps {
   config?: {
     clusters?: string[]
@@ -21,7 +24,7 @@ interface ClusterComparisonProps {
 // a runtime error in the 254-line component doesn't crash the dashboard.
 function ClusterComparisonInternal({ config }: ClusterComparisonProps) {
   const { t } = useTranslation(['cards', 'common'])
-  const { deduplicatedClusters: rawClusters, isLoading: clustersLoading } = useClusters()
+  const { deduplicatedClusters: rawClusters, isLoading: clustersLoading, isFailed, consecutiveFailures } = useClusters()
   const { nodes: gpuNodes, isDemoFallback, isRefreshing, lastRefresh } = useCachedGPUNodes()
   const [selectedClusters, setSelectedClusters] = useState<string[]>(config?.clusters || [])
   const { isDemoMode } = useDemoMode()
@@ -33,6 +36,8 @@ function ClusterComparisonInternal({ config }: ClusterComparisonProps) {
     isRefreshing,
     hasAnyData: hasData,
     isDemoData: isDemoMode || isDemoFallback,
+    isFailed,
+    consecutiveFailures,
     lastRefresh })
   const {
     selectedClusters: globalSelectedClusters,
@@ -100,7 +105,7 @@ function ClusterComparisonInternal({ config }: ClusterComparisonProps) {
       if (prev.includes(name)) {
         return prev.filter(c => c !== name)
       }
-      if (prev.length >= 4) return prev // Max 4 clusters
+      if (prev.length >= MAX_COMPARED_CLUSTERS) return prev
       return [...prev, name]
     })
   }
@@ -108,11 +113,11 @@ function ClusterComparisonInternal({ config }: ClusterComparisonProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={150} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 @md:grid-cols-3 gap-2">
           <Skeleton variant="rounded" height={150} />
           <Skeleton variant="rounded" height={150} />
           <Skeleton variant="rounded" height={150} />
@@ -167,6 +172,8 @@ function ClusterComparisonInternal({ config }: ClusterComparisonProps) {
                 : 'bg-secondary/50 text-muted-foreground hover:text-foreground'
             }`}
             title={c.name}
+            aria-label={`Toggle cluster ${c.name}`}
+            aria-pressed={selectedClusters.includes(c.name)}
           >
             {c.name}
           </button>
@@ -230,7 +237,7 @@ function ClusterComparisonInternal({ config }: ClusterComparisonProps) {
       <div className="mt-4 pt-3 border-t border-border/50 space-y-2">
         {metrics.slice(0, 2).map(m => (
           <div key={m.key}>
-            <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground mb-1">
               <span>{m.label}</span>
             </div>
             <div className="flex gap-1">

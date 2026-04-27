@@ -144,7 +144,7 @@ export function PodIssues() {
   return (
     <div className="h-full flex flex-col content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <StatusBadge color="red" title={`${rawIssues.length} pods with issues`}>
             {rawIssues.length} issues
@@ -204,13 +204,13 @@ export function PodIssues() {
               title={`Click to view details for ${issue.name}`}
             >
               <div className="flex items-start gap-3 group">
-                <div className={`p-2 rounded-lg ${colors.iconBg} flex-shrink-0`} title={iconTooltip}>
+                <div className={`p-2 rounded-lg ${colors.iconBg} shrink-0`} title={iconTooltip}>
                   <Icon className={`w-4 h-4 ${colors.text}`} />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <ClusterBadge cluster={issue.cluster || 'unknown'} />
-                    <span className="text-xs text-muted-foreground" title={`Namespace: ${issue.namespace}`}>{issue.namespace}</span>
+                  <div className="flex items-center gap-2 mb-1 min-w-0">
+                    <ClusterBadge cluster={issue.cluster || 'unknown'} className="shrink min-w-0" />
+                    <span className="text-xs text-muted-foreground truncate" title={`Namespace: ${issue.namespace}`}>{issue.namespace}</span>
                   </div>
                   <p className="text-sm font-medium text-foreground truncate" title={issue.name}>{issue.name}</p>
                   <div className="flex items-center gap-2 mt-2 flex-wrap">

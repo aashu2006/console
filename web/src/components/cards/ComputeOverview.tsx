@@ -45,10 +45,16 @@ export function ComputeOverview() {
   const filteredGPUNodes = useMemo(() => {
     let result = gpuNodes
     if (!isAllClustersSelected) {
-      result = result.filter(n => selectedClusters.some(c => (n.cluster ?? '').startsWith(c)))
+      result = result.filter(n => {
+        const clusterName = (n.cluster ?? '').split('/')[0]
+        return selectedClusters.includes(clusterName)
+      })
     }
     if (localClusterFilter.length > 0) {
-      result = result.filter(n => localClusterFilter.some(c => (n.cluster ?? '').startsWith(c)))
+      result = result.filter(n => {
+        const clusterName = (n.cluster ?? '').split('/')[0]
+        return localClusterFilter.includes(clusterName)
+      })
     }
     return result
   }, [gpuNodes, isAllClustersSelected, selectedClusters, localClusterFilter])
@@ -94,8 +100,10 @@ export function ComputeOverview() {
   }, [filteredClusters, filteredGPUNodes])
 
   // Check if we have real data from reachable clusters
+  // A cluster counts as having data as soon as nodeCount is reported — even 0
+  // is a valid value for a newly provisioned cluster (#7354)
   const hasRealData = !isLoading && filteredClusters.length > 0 &&
-    filteredClusters.some(c => c.reachable !== false && c.cpuCores !== undefined && c.nodeCount !== undefined && c.nodeCount > 0)
+    filteredClusters.some(c => c.reachable !== false && c.cpuCores !== undefined && c.nodeCount !== undefined)
 
   // Report state to CardWrapper for refresh animation
   const hasData = clusters.length > 0
@@ -247,7 +255,7 @@ export function ComputeOverview() {
         onClick={() => stats.totalGPUs > 0 && drillToResources()}
         title={stats.totalGPUs > 0 ? t('computeOverview.gpuAllocatedTitle', { allocated: stats.allocatedGPUs, total: stats.totalGPUs, percent: stats.gpuUtilization }) : t('computeOverview.noGPUsInClusters')}
       >
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
           <div className="flex items-center gap-2">
             <Zap className="w-4 h-4 text-purple-400" />
             <span className="text-xs text-purple-400">{t('computeOverview.gpus')}</span>
@@ -278,7 +286,7 @@ export function ComputeOverview() {
             {stats.gpuTypes.length > 0 && (
               <div className="space-y-1">
                 {stats.gpuTypes.slice(0, 3).map(([type, count]) => (
-                  <div key={type} className="flex items-center justify-between text-xs cursor-default" title={t('computeOverview.gpuTypeCountTitle', { count, type })}>
+                  <div key={type} className="flex flex-wrap items-center justify-between gap-y-2 text-xs cursor-default" title={t('computeOverview.gpuTypeCountTitle', { count, type })}>
                     <span className="text-muted-foreground truncate" title={type}>{type}</span>
                     <span className="text-foreground">{count}</span>
                   </div>

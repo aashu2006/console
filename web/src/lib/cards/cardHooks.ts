@@ -342,17 +342,15 @@ export function useCardSort<T, S extends string>(
     setSortDirection(prev => (prev === 'asc' ? 'desc' : 'asc'))
   }
 
-  const sorted = (() => {
+  const sorted = useMemo(() => {
     const comparator = comparators?.[sortBy]
-    if (!comparator) return items
+    if (!comparator) return [...(items || [])]
 
-    const sortedItems = [...items].sort((a, b) => {
+    return [...(items || [])].sort((a, b) => {
       const result = comparator(a, b)
       return sortDirection === 'asc' ? result : -result
     })
-
-    return sortedItems
-  })()
+  }, [items, comparators, sortBy, sortDirection])
 
   return {
     sorted,
@@ -470,13 +468,16 @@ export function useCardData<T, S extends string = string>(
   }, [filterResult.search, filterResult.localClusterFilter])
 
   // Ensure current page is valid when total pages shrinks (e.g., data errors).
-  // Only depend on totalPages — including currentPage causes an infinite loop
-  // when totalPages=0 because Math.max(1,0)=1 and 1>0 is always true (#5762).
+  // Uses functional setState to read the latest `currentPage` without including
+  // it in the dep array — including it caused a feedback loop (#5762).
+  // Previously the stale closure also meant a Next-click mid-refresh could
+  // read a pre-click `currentPage` and clamp an in-flight page update back
+  // down to `totalPages`, which looked like the page snapped back to 1 (#8381).
+  // Functional setState + a totalPages ref (below) eliminate both stale reads.
+  // `totalPages` is `Math.ceil(...) || 1`, so it is always >= 1 — no zero guard.
   useEffect(() => {
-    if (totalPages > 0 && currentPage > totalPages) {
-      setCurrentPage(totalPages)
-    }
-  }, [totalPages]) // eslint-disable-line react-hooks/exhaustive-deps
+    setCurrentPage((prev) => (prev > totalPages ? totalPages : prev))
+  }, [totalPages])
 
   // Paginate
   const paginatedItems = (() => {
@@ -485,8 +486,21 @@ export function useCardData<T, S extends string = string>(
     return sorted.slice(start, start + effectivePerPage)
   })()
 
+  // #8381: `goToPage` previously read `totalPages` from its render closure, so
+  // a Next click dispatched while a background refresh was producing a new
+  // `totalPages` could clamp against the *pre-render* value (e.g. 1) and
+  // silently snap the user back to page 1. Reading from a ref guarantees
+  // `goToPage` always clamps against the most recent totalPages. The ref is
+  // synced in an effect (not during render) to satisfy React's
+  // no-mutation-during-render rule.
+  const totalPagesRef = useRef(totalPages)
+  useEffect(() => {
+    totalPagesRef.current = totalPages
+  }, [totalPages])
+
   const goToPage = (page: number) => {
-    setCurrentPage(Math.max(1, Math.min(page, totalPages)))
+    const limit = totalPagesRef.current
+    setCurrentPage(Math.max(1, Math.min(page, limit)))
   }
 
   // Stable height for paginated container
@@ -711,10 +725,17 @@ export const commonComparators = {
     return (order[aStatus] ?? 999) - (order[bStatus] ?? 999)
   },
 
-  /** Compare dates (ISO strings or Date objects) */
+  /** Compare dates (ISO strings or Date objects).
+   * Invalid dates (NaN) are sorted to the END of the list in ascending order
+   * so valid, chronological data stays front-loaded. We use
+   * Number.MAX_SAFE_INTEGER as the sentinel rather than 0 so that legitimate
+   * epoch-zero timestamps still sort before invalid values. */
   date: <T>(field: keyof T) => (a: T, b: T) => {
-    const aDate = new Date(a[field] as string | Date).getTime()
-    const bDate = new Date(b[field] as string | Date).getTime()
+    const INVALID_DATE_SENTINEL = Number.MAX_SAFE_INTEGER
+    const aRaw = new Date(a[field] as string | Date).getTime()
+    const bRaw = new Date(b[field] as string | Date).getTime()
+    const aDate = Number.isNaN(aRaw) ? INVALID_DATE_SENTINEL : aRaw
+    const bDate = Number.isNaN(bRaw) ? INVALID_DATE_SENTINEL : bRaw
     return aDate - bDate
   } }
 

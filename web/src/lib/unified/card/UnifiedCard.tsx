@@ -10,10 +10,10 @@
  *   <UnifiedCard config={clusterHealthConfig} title="Custom Title" />
  */
 
-import { ReactNode } from 'react'
-import { 
-  AlertTriangle, 
-  Info, 
+import { ReactNode, useMemo, lazy, Suspense } from 'react'
+import {
+  AlertTriangle,
+  Info,
   RefreshCw,
   CheckCircle,
   AlertCircle,
@@ -29,7 +29,11 @@ import { useDataSource } from './hooks/useDataSource'
 import { useCardFiltering } from './hooks/useCardFiltering'
 import { ListVisualization } from './visualizations/ListVisualization'
 import { TableVisualization } from './visualizations/TableVisualization'
-import { ChartVisualization } from './visualizations/ChartVisualization'
+// Lazy-load ChartVisualization to defer the echarts vendor chunk from the
+// critical loading path — it is only needed for cards with chartType content.
+const LazyChartVisualization = lazy(() =>
+  import('./visualizations/ChartVisualization').then(m => ({ default: m.ChartVisualization }))
+)
 import { StatusGridVisualization } from './visualizations/StatusGridVisualization'
 import { useDrillDownActions } from '../../../hooks/useDrillDown'
 import { useReportCardDataState } from '../../../components/cards/CardDataContext'
@@ -47,17 +51,21 @@ export function UnifiedCard({
   // Check if mode is switching (show skeleton during transition)
   const isModeSwitching = useIsModeSwitching()
 
-  // Merge instance config with base config
-  const mergedConfig = (() => {
+  // Merge instance config with base config.
+  // MUST be memoized: the merged object is passed to useDataSource,
+  // useCardFiltering, and InlineStats — if those (or any downstream
+  // hook) read `mergedConfig.dataSource`/`.filters`/`.stats` in a
+  // useEffect dep, a fresh object every render becomes a setState loop
+  // that trips React error #185. Seen today in GA4 on pv_status /
+  // /storage. Memoizing against `config` and `instanceConfig` identity
+  // is safe: both come from static modules or stable parent state.
+  const mergedConfig = useMemo<UnifiedCardConfig>(() => {
     if (!instanceConfig) return config
-    return {
-      ...config,
-      // Instance config can override certain fields
-      ...instanceConfig } as UnifiedCardConfig
-  })()
+    return { ...config, ...instanceConfig } as UnifiedCardConfig
+  }, [config, instanceConfig])
 
   // Fetch data using the configured data source (skipped if overrideData provided)
-  const { data: fetchedData, isLoading: isDataLoading, error, refetch } = useDataSource(
+  const { data: fetchedData, isLoading: isDataLoading, error, refetch, isDemoData: hookIsDemoData } = useDataSource(
     mergedConfig.dataSource,
     { skip: !!overrideData }
   )
@@ -71,6 +79,15 @@ export function UnifiedCard({
   // Determine if we have any data
   const hasAnyData = Array.isArray(data) ? data.length > 0 : !!data
 
+  // Prefer hook-reported demo state over static config metadata:
+  // - Static `config.isDemoData: true` is a false-positive source because
+  //   it stays `true` even when the hook is serving real live data.
+  // - When the hook explicitly reports demo state (`true` or `false`), use
+  //   it directly. When the hook does not report demo state
+  //   (`hookIsDemoData === undefined`), fall back to the config metadata.
+  // See Issues 9356 and 9357 for the regression this fixes.
+  const effectiveIsDemoData = hookIsDemoData !== undefined ? hookIsDemoData : mergedConfig.isDemoData
+
   // Report loading state to CardWrapper for refresh icon animation and skeleton coordination
   // This enables the refresh icon to spin while data is loading or mode is switching
   useReportCardDataState({
@@ -80,7 +97,7 @@ export function UnifiedCard({
     isLoading: isLoading && !hasAnyData,      // Initial load or mode switch - show skeleton
     isRefreshing: isLoading && hasAnyData,     // Refresh - spin refresh icon
     hasData: !isLoading || hasAnyData,         // True once loading completes or has cached data
-    isDemoData: mergedConfig.isDemoData,       // From card config
+    isDemoData: effectiveIsDemoData,           // Hook-reported when available, else config
   })
 
   // Apply filtering if configured
@@ -138,7 +155,7 @@ export function UnifiedCard({
     }
 
     // Empty state
-    if (!filteredData || filteredData.length === 0) {
+    if (!filteredData || (Array.isArray(filteredData) && filteredData.length === 0)) {
       return <EmptyState config={mergedConfig.emptyState} />
     }
 
@@ -172,7 +189,7 @@ export function UnifiedCard({
  */
 function renderContent(
   content: CardContent,
-  data: unknown[],
+  data: unknown[] | unknown,
   config: UnifiedCardConfig,
   onDrillDown?: (item: Record<string, unknown>) => void
 ): ReactNode {
@@ -181,7 +198,7 @@ function renderContent(
       return (
         <ListVisualization
           content={content}
-          data={data}
+          data={data as unknown[]}
           drillDown={config.drillDown}
           onDrillDown={onDrillDown}
         />
@@ -191,7 +208,7 @@ function renderContent(
       return (
         <TableVisualization
           content={content}
-          data={data}
+          data={data as unknown[]}
           drillDown={config.drillDown}
           onDrillDown={onDrillDown}
         />
@@ -199,10 +216,12 @@ function renderContent(
 
     case 'chart':
       return (
-        <ChartVisualization
-          content={content}
-          data={data}
-        />
+        <Suspense fallback={<div className="animate-pulse bg-secondary/30 rounded" style={{ height: content.height ?? 200 }} />}>
+          <LazyChartVisualization
+            content={content}
+            data={data as unknown[]}
+          />
+        </Suspense>
       )
 
     case 'status-grid':
@@ -218,7 +237,7 @@ function renderContent(
       return (
         <PlaceholderVisualization
           type={`custom: ${content.componentName}`}
-          itemCount={data.length}
+          itemCount={Array.isArray(data) ? data.length : data ? 1 : 0}
         />
       )
 
@@ -386,7 +405,7 @@ function InlineStats({
   stats,
   data: _data }: {
   stats: NonNullable<UnifiedCardConfig['stats']>
-  data: unknown[] | undefined
+  data: unknown[] | unknown | undefined
 }) {
   return (
     <div className="flex items-center gap-3 px-2 py-1.5 border-b border-border">
@@ -408,12 +427,12 @@ function CardFooter({
   config,
   data }: {
   config: NonNullable<UnifiedCardConfig['footer']>
-  data: unknown[] | undefined
+  data: unknown[] | unknown | undefined
 }) {
   return (
     <div className="flex items-center justify-between px-2 py-1.5 text-xs text-muted-foreground border-t border-border">
-      {config.showTotal && data && (
-        <span>{data.length} items</span>
+      {config.showTotal && !!data && (
+        <span>{Array.isArray(data) ? data.length : 1} items</span>
       )}
       {config.text && <span>{config.text}</span>}
       {config.pagination && (

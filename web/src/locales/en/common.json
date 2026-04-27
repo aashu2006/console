@@ -1,4 +1,11 @@
 {
+  "help": {
+    "sidebarNavItem": "Click to navigate. Hover a collapsed icon to see its name and what it opens.",
+    "themeToggle": "Switch between dark, light, and system themes. Your choice is saved across sessions.",
+    "aiMissions": "AI Missions are assistant-driven tasks that monitor your clusters and propose fixes.",
+    "viewDocs": "Open the KubeStellar docs site in a new tab for guides, tutorials, and reference.",
+    "globalClusterFilter": "Filter every card on this dashboard to a subset of your clusters, severities, or statuses."
+  },
   "navigation": {
     "dashboard": "Dashboard",
     "clusters": "My Clusters",
@@ -16,6 +23,7 @@
     "save": "Save",
     "cancel": "Cancel",
     "close": "Close",
+    "clear": "Clear",
     "refresh": "Refresh",
     "configure": "Configure",
     "replace": "Replace",
@@ -34,7 +42,10 @@
     "getYourOwn": "Get Your Own Console",
     "viewDetails": "View Details",
     "copied": "Copied!",
-    "dismiss": "Dismiss"
+    "dismiss": "Dismiss",
+    "viewNamespaceCostAria": "View cost details for namespace {{namespace}}",
+    "viewOperatorAria": "View operator {{name}}",
+    "toggleGPUNodeAria": "Toggle details for GPU node {{node}}"
   },
   "buttons": {
     "addCard": "Add Card",
@@ -46,7 +57,8 @@
     "replaceCard": "Replace Card",
     "askAI": "Ask AI about this card",
     "installConsole": "Install your own console",
-    "exitDemoMode": "Exit demo mode"
+    "exitDemoMode": "Exit demo mode",
+    "dismissBanner": "Dismiss banner"
   },
   "labels": {
     "loading": "Loading...",
@@ -220,7 +232,7 @@
     },
     "apiKeys": {
       "title": "AI Provider Keys",
-      "subtitle": "Configure API keys for Claude, OpenAI, and Gemini",
+      "subtitle": "Configure API keys for Claude, OpenAI, Gemini, OpenRouter, and Groq",
       "securityNote": "API keys are stored securely on your local machine in ~/.kc/config.yaml and are never sent to our servers.",
       "manageKeys": "Manage API Keys"
     },
@@ -258,7 +270,20 @@
       "warningAt": "Warning at (%)",
       "criticalAt": "Critical at (%)",
       "saved": "Saved!",
-      "saveSettings": "Save Token Settings"
+      "saveSettings": "Save Token Settings",
+      "demoBadge": "Demo Data",
+      "demoBadgeAriaLabel": "Demo mode active",
+      "demoModeLabel": "Demo Mode:",
+      "demoModeMessage": "Showing simulated token usage data. To see live token consumption from your AI operations, ensure the kc-agent is running and connected.",
+      "percentUsed": "{{percent}}% used",
+      "remaining": "{{count}} remaining",
+      "monthlyLimitHint": "Maximum tokens per month",
+      "warningAtHint": "Warning at {{percent}}% usage",
+      "criticalAtHint": "Critical at {{percent}}% usage",
+      "validation": {
+        "warningMustBeLower": "Warning threshold must be lower than critical threshold.",
+        "limitZeroConfirm": "Setting limit to 0 disables all AI operations. Continue?"
+      }
     },
     "github": {
       "title": "GitHub Integration",
@@ -336,12 +361,31 @@
       "refreshing": "Refreshing...",
       "saving": "Saving...",
       "saved": "Saved!",
-      "saveProfile": "Save Profile"
+      "saveProfile": "Save Profile",
+      "saveFailed": "Failed to save profile",
+      "invalidEmail": "Enter a valid email address.",
+      "affiliateTitle": "Your Affiliate Link",
+      "affiliateSubtitle": "Share this link to earn credits on the contributor leaderboard",
+      "affiliateChannelLabel": "Channel",
+      "affiliateChannelHint": "Pick the channel you're sharing on — helps us attribute traffic",
+      "affiliateCopy": "Copy link",
+      "affiliateCopied": "Copied!",
+      "affiliateLoginMissing": "Sign in with GitHub to generate your affiliate link.",
+      "affiliateFootnote": "Counts update within 24–48h (Google Analytics attribution lag). Chat apps like WhatsApp and Discord strip query strings from link previews — prefer email, SMS, GitHub comments, or plain-text shares."
     },
     "notifications": {
       "title": "Alert Notifications",
       "subtitle": "Configure notification channels",
       "description": "Configure notification channels for alert delivery. Alerts will be sent to all enabled channels.",
+      "signalTypes": {
+        "state": "Persistent State",
+        "stateDescription": "Ongoing system condition — stays until resolved",
+        "notification": "Transient Notification",
+        "notificationDescription": "One-time user-facing event (toast or browser push)",
+        "acknowledged": "Acknowledged",
+        "acknowledgedDescription": "User has seen and dismissed this signal"
+      },
+      "dedupSuppressed": "Notification suppressed (duplicate within cooldown window)",
       "slack": {
         "title": "Slack Integration",
         "webhookUrl": "Webhook URL *",
@@ -352,7 +396,8 @@
         "testNotification": "Test Slack Notification",
         "configureFirst": "Please configure Slack webhook URL first",
         "testSuccess": "Test notification sent successfully!",
-        "testFailed": "Failed to send test notification"
+        "testFailed": "Failed to send test notification",
+        "invalidWebhookUrl": "Enter a valid Slack webhook URL (https://hooks.slack.com/services/...)."
       },
       "email": {
         "title": "Email Integration",
@@ -367,7 +412,8 @@
         "testNotification": "Test Email Notification",
         "configureFirst": "Please configure all required email fields first",
         "testSuccess": "Test email sent successfully!",
-        "testFailed": "Failed to send test email"
+        "testFailed": "Failed to send test email",
+        "invalidSmtpPort": "SMTP port must be a number between 1 and 65535."
       },
       "tip": "Configure notification channels here, then add them to specific alert rules in the Alert Rules editor. Each rule can have multiple notification channels with different configurations.",
       "browser": {
@@ -380,9 +426,39 @@
         "no": "No",
         "verified": "Browser notifications verified and working.",
         "enableInstructions": "Make sure notifications are enabled: System Settings → Notifications → Google Chrome → Allow Notifications",
+        "enableInstructionsChrome": "Make sure notifications are enabled: System Settings → Notifications → Google Chrome → Allow Notifications.",
+        "enableInstructionsFirefox": "Make sure notifications are enabled: System Settings → Notifications → Firefox → Allow Notifications, and check Firefox's site permissions for this page.",
+        "enableInstructionsSafari": "Make sure notifications are enabled: System Settings → Notifications → Safari → Allow Notifications, and Safari → Settings → Websites → Notifications.",
+        "enableInstructionsEdge": "Make sure notifications are enabled: System Settings → Notifications → Microsoft Edge → Allow Notifications.",
+        "enableInstructionsGeneric": "Make sure notifications are enabled in your operating system's notification settings for this browser, and in the browser's site permissions for this page.",
+        "dndHint": "Also check that Do Not Disturb / Focus mode is off — the OS suppresses notifications while it's on.",
         "tryAgain": "Try Again",
         "blocked": "Browser notifications are blocked. Enable them in your browser's site settings for this page, then reload.",
-        "requestPermission": "Request Permission"
+        "requestPermission": "Request Permission",
+        "quietHoursTitle": "Quiet Hours",
+        "quietHoursDesc": "Suppress desktop notifications during a recurring daily window.",
+        "quietHoursDontNotifyBetween": "Don't notify between",
+        "quietHoursAnd": "and"
+      },
+      "pagerduty": {
+        "title": "PagerDuty",
+        "routingKey": "Integration / Routing Key",
+        "routingKeyHint": "Find this under Services > Integrations > Events API v2 in PagerDuty",
+        "routingKeyRequired": "PagerDuty routing key is required",
+        "testing": "Testing...",
+        "testNotification": "Test PagerDuty",
+        "testSuccess": "Test notification sent and resolved successfully",
+        "testFailed": "Failed to send test notification"
+      },
+      "opsgenie": {
+        "title": "OpsGenie",
+        "apiKey": "API Key",
+        "apiKeyHint": "Find this under Settings > API key management in OpsGenie",
+        "apiKeyRequired": "OpsGenie API key is required",
+        "testing": "Testing...",
+        "testNotification": "Test OpsGenie",
+        "testSuccess": "Test alert created and closed successfully",
+        "testFailed": "Failed to send test notification"
       }
     },
     "persistence": {
@@ -471,6 +547,8 @@
       "backendOffline": "Backend offline",
       "never": "Never",
       "justNow": "Just now",
+      "secondsAgo": "{{count}}s ago",
+      "minutesAgo": "{{count}}m ago",
       "lastSaved": "Last saved: {{time}}",
       "encrypted": "AES-256 encrypted",
       "fileLocation": "File location",
@@ -622,13 +700,14 @@
       "prereqGitCleanFail": "Uncommitted changes",
       "allPrereqsMet": "All prerequisites met — update notifications active",
       "prereqsMissing": "{{count}} prerequisite(s) not met — some features unavailable",
+      "errorHint": "Try clicking \"Check Now\" to retry, or verify that kc-agent is running and network is available.",
       "scopeInfoToggle": "What do these settings control?",
-      "scopeSystemTitle": "System Updates",
-      "scopeSystemDesc": "Updates the entire console application to a new version. Controlled by the Update Channel and Auto-Update settings on this page.",
-      "scopeReloadTitle": "Auto-Reload",
-      "scopeReloadDesc": "When a new build is deployed, your browser automatically detects the change and prompts you to reload. This happens independently of System Updates.",
-      "scopeCardDataTitle": "Card Data",
-      "scopeCardDataDesc": "Individual dashboard cards refresh their data on their own schedules. Card refreshes are not controlled by System Updates."
+      "scopeSystemTitle": "Console Version Updates",
+      "scopeSystemDesc": "Checks for new console releases on the selected Update Channel and lets you apply them. For self-hosted installs with kc-agent, enabling Automatic Updates will pull and apply new versions in the background. Without kc-agent, you will see a notification with manual upgrade instructions (Helm command, brew command, or git pull).",
+      "scopeReloadTitle": "Post-Deploy Page Reload",
+      "scopeReloadDesc": "After a new version is deployed (whether via auto-update or manual upgrade), the browser detects the updated build and shows a banner prompting you to reload the page. This happens automatically and has no settings on this page.",
+      "scopeCardDataTitle": "Dashboard Card Data",
+      "scopeCardDataDesc": "Dashboard cards fetch live data (cluster health, pod status, metrics) on their own schedules, independent of console version updates. Card refresh intervals are not controlled by these settings."
     },
     "theme": {
       "title": "Appearance",
@@ -871,8 +950,13 @@
       "preConfiguredCards_one": "{{count}} pre-configured card",
       "preConfiguredCards_other": "{{count}} pre-configured cards",
       "selectByCategory": "Select a template by category:",
+      "selectByCategoryCollection": "Select a collection by category:",
+      "startWithCollection": "Start with a Card Collection",
+      "chooseFromCollections": "Choose from pre-built card sets",
       "cards": "cards",
-      "creating": "Creating..."
+      "creating": "Creating...",
+      "nameRequired": "Dashboard name is required",
+      "descriptionCollection": "Name your dashboard and optionally start with a card collection."
     },
     "templates": {
       "title": "Dashboard Templates",
@@ -1078,7 +1162,8 @@
       "blocksCount_other": "{{count}} blocks",
       "deleteStatBlock": "Delete stat block",
       "addAtLeastOne": "Add at least one stat block.",
-      "changeIcon": "Change icon"
+      "changeIcon": "Change icon",
+      "moveBlockUp": "Move stat block up"
     },
     "aiAssist": {
       "describeWhatYouWant": "AI Assist — describe what you want",
@@ -1291,6 +1376,7 @@
     "loadingResources": "Loading resources...",
     "viewClusterDetails": "View cluster details →",
     "noClustersMatch": "No clusters match the current filter",
+    "noIssuesFound": "No resources with issues in this cluster",
     "nodesCount": "{{count}} nodes",
     "nodesCount_one": "{{count}} node",
     "nodesCount_other": "{{count}} nodes",
@@ -1337,7 +1423,8 @@
     "cookiesEnabled": "Cookies Enabled",
     "yes": "Yes",
     "no": "No",
-    "diagnosticsNote": "Full network diagnostics (traceroute, DNS lookup, port scanning) require backend API support due to browser security restrictions."
+    "diagnosticsNote": "Full network diagnostics (traceroute, DNS lookup, port scanning) require backend API support due to browser security restrictions.",
+    "noHostsWarning": "Add at least one host before starting"
   },
   "cardFactory": {
     "formatText": "Text",
@@ -1346,7 +1433,71 @@
   },
   "events": {
     "allNamespaces": "All Namespaces",
-    "allReasons": "All Reasons"
+    "allReasons": "All Reasons",
+    "subtitle": "Cluster events and activity across your infrastructure",
+    "dashboardTitle": "Events Dashboard",
+    "dashboardDescription": "Add cards to monitor Kubernetes events, warnings, and activity across your clusters.",
+    "tabs": {
+      "overview": "Overview",
+      "timeline": "Timeline",
+      "allEvents": "All Events"
+    },
+    "stats": {
+      "total": "Total Events",
+      "totalSublabel": "events",
+      "warnings": "Warnings",
+      "warningsSublabel": "warning events",
+      "normal": "Normal",
+      "normalSublabel": "normal events",
+      "lastHour": "Last Hour",
+      "lastHourSublabel": "in last hour",
+      "errorsSublabel": "error events"
+    },
+    "sections": {
+      "eventTypes": "Event Types",
+      "topReasons": "Top Reasons",
+      "byCluster": "By Cluster",
+      "recentWarnings": "Recent Warnings",
+      "eventTimeline": "Event Timeline",
+      "activityLast24h": "Event Activity (Last 24 Hours)"
+    },
+    "groups": {
+      "lastHour": "Last Hour",
+      "today": "Today",
+      "older": "Older",
+      "unknownTime": "Unknown time"
+    },
+    "empty": {
+      "noEvents": "No events",
+      "noEventsToDisplay": "No events to display",
+      "noEventsFound": "No events found",
+      "noClusterData": "No cluster data",
+      "noWarnings": "No warnings",
+      "showingFrom": "Showing events from: {{clusters}}",
+      "clearFilters": "Clear filters"
+    },
+    "search": "Search",
+    "clearFiltersButton": "Clear Filters",
+    "viewAll": "View all",
+    "viewMore_one": "View {{count}} more event...",
+    "viewMore_other": "View {{count}} more events...",
+    "groupCount_one": "({{count}} event)",
+    "groupCount_other": "({{count}} events)",
+    "groupHeading": "{{group}} ({{count}})",
+    "showingFiltered": "Showing {{filtered}} of {{total}} events",
+    "repeatCount": "×{{count}}",
+    "timeAgo": {
+      "unknown": "Unknown",
+      "justNow": "Just now",
+      "minutes": "{{count}}m ago",
+      "hours": "{{count}}h ago",
+      "days": "{{count}}d ago"
+    },
+    "loadError": {
+      "title": "Failed to load events",
+      "fallback": "The backend is unavailable or the request timed out. Check your connection and try again.",
+      "retry": "Retry"
+    }
   },
   "alerts": {
     "title": "Alerts",
@@ -1356,6 +1507,8 @@
     "resource": "Resource:",
     "fired": "Fired:",
     "acknowledged": "Acknowledged:",
+    "acknowledgedBy": "by {{user}}",
+    "diagnosisFailed": "AI diagnosis failed — please try again",
     "showDetails": "Show Details",
     "hideDetails": "Hide Details",
     "runDiagnosis": "Run Diagnosis",
@@ -1402,6 +1555,7 @@
     "restartCountMin": "Restart count must be at least {{min}}",
     "temperatureRange": "Temperature must be between {{min}} and {{max}}",
     "windSpeedRange": "Wind speed must be between {{min}} and {{max}}",
+    "atLeastOneChannelRequired": "Enable at least one notification channel, or no one will be notified when this rule fires.",
     "ruleNamePlaceholder": "e.g., High GPU Usage Alert",
     "descriptionPlaceholder": "Optional description of what this alert monitors",
     "thresholdPercent": "Threshold (%)",
@@ -1413,8 +1567,15 @@
     "durationHint": "seconds (0 = immediate)",
     "clustersHint": "Clusters (leave empty for all)",
     "slackWebhookUrl": "Slack Webhook URL",
-    "slackChannel": "#channel (optional)",
+    "slackWebhookUrlPlaceholder": "Slack Webhook URL",
+    "slackChannel": "Slack Channel",
+    "slackChannelPlaceholder": "#channel (optional)",
     "webhookUrl": "Webhook URL",
+    "webhookUrlPlaceholder": "Webhook URL",
+    "pagerdutyRoutingKey": "PagerDuty Routing Key",
+    "pagerdutyRoutingKeyPlaceholder": "PagerDuty Routing Key",
+    "opsgenieApiKey": "OpsGenie API Key",
+    "opsgenieApiKeyPlaceholder": "OpsGenie API Key",
     "on": "On",
     "off": "Off",
     "restarts": "restarts",
@@ -1478,7 +1639,103 @@
     "binding": "Binding",
     "clusterRole": "Cluster Role",
     "roleBinding": "Role Binding",
-    "clusterRoleBinding": "Cluster Role Binding"
+    "clusterRoleBinding": "Cluster Role Binding",
+    "selectCommonGroups": "Select common groups...",
+    "addCustomGroupPlaceholder": "Add custom group...",
+    "removeGroup": "Remove group {{group}}",
+    "commonApiGroupsTitle": "Common API Groups:",
+    "apiGroupCoreDesc": "Core API (pods, services, secrets, configmaps, namespaces)",
+    "apiGroupAppsDesc": "Deployments, StatefulSets, DaemonSets, ReplicaSets",
+    "apiGroupRbacDesc": "Roles, ClusterRoles, Bindings",
+    "apiGroupBatchDesc": "Jobs, CronJobs",
+    "apiGroupNetworkingDesc": "Ingresses, NetworkPolicies",
+    "failedToLoad": "Failed to load RBAC data",
+    "retry": "Retry",
+    "noFindings": "No RBAC findings",
+    "connectClusterHint": "Connect a cluster to analyze RBAC bindings",
+    "noMatchingFindings": "No findings match your filters",
+    "findingDescription": {
+      "clusterAdminBinding": "cluster-admin binding — full cluster access",
+      "wildcardSecretsViaRole": "Wildcard verb on secrets via {{role}}",
+      "wildcardSecrets": "Wildcard verb on secrets — can read all secrets",
+      "defaultServiceAccountElevated": "Default ServiceAccount has elevated privileges via {{role}}",
+      "wideListWatchViaRole": "Wide list/watch access on all resources via {{role}}",
+      "wideListWatch": "Wide list/watch on all namespaces",
+      "elevatedRoleInNamespace": "{{role}} role in namespace {{namespace}}",
+      "pvPvcAccess": "PV and PVC access across namespaces"
+    }
+  },
+  "compute": {
+    "clusterComparison": "Cluster Comparison",
+    "countSelected": "{{count}} selected",
+    "compareWithCount": "Compare ({{count}})",
+    "selectForComparison": "Select {{name}} for comparison",
+    "deselectForComparison": "Deselect {{name}} for comparison",
+    "noClustersAvailable": "No clusters available",
+    "maxClustersReached": "Maximum {{max}} clusters can be compared at once"
+  },
+  "warningEvents": {
+    "noWarnings": "No Warnings",
+    "noWarningsHint": "Warning events will appear here when detected",
+    "noMatchingWarnings": "No warnings match the current filters",
+    "count_one": "{{count}} warning",
+    "count_other": "{{count}} warnings",
+    "errorLoading": "Error loading events",
+    "errorFetchAttempts_one": "Failed to fetch event data ({{count}} attempt)",
+    "errorFetchAttempts_other": "Failed to fetch event data ({{count}} attempts)",
+    "repeatCount": "×{{count}}"
+  },
+  "drasi": {
+    "configureSource": "Configure Source",
+    "configureContinuousQuery": "Configure Continuous Query",
+    "createSource": "Create Source",
+    "createContinuousQuery": "Create Continuous Query",
+    "nameLabel": "Name",
+    "sourceTypeLabel": "Source Type",
+    "queryTypeLabel": "Query Type",
+    "queryLabel": "Query",
+    "queryPlaceholder": "MATCH (n) RETURN n",
+    "idLabel": "ID:",
+    "sourceKindLabel": "Source · {{kind}}",
+    "queryLanguageLabel": "Query · {{language}}",
+    "newSourceSubtitle": "New source",
+    "newQuerySubtitle": "New continuous query",
+    "downloadYaml": "Download YAML",
+    "addSource": "Add Source",
+    "addQuery": "Add Query",
+    "addReaction": "Add Reaction",
+    "deleteConfirmTitle": "Delete resource",
+    "deleteConfirm": "Delete \"{{name}}\"? This cannot be undone.",
+    "deleteConnectionTitle": "Delete Drasi connection",
+    "installDrasiTitle": "No live Drasi install detected",
+    "installDrasiDescription": "Showing demo data. Install Drasi to visualize your reactive pipelines live.",
+    "installDrasiButton": "Install Drasi",
+    "rowDetailTitle": "Row Detail",
+    "enableLiveResults": "Enable live results",
+    "enableLiveResultsHint": "Create a Result reaction to stream query deltas",
+    "demoResultsLabel": "Demo Results",
+    "liveResultsLabel": "Live Results",
+    "connectionsTitle": "Drasi Connections",
+    "connectionsSubtitle": "Manage your Drasi servers",
+    "connectionNamePlaceholder": "production cluster",
+    "connectionModeLabel": "Mode",
+    "serverUrlLabel": "Server URL",
+    "clusterContextLabel": "Cluster context",
+    "clusterLabel": "cluster",
+    "noConnections": "No Drasi connections configured yet.",
+    "addConnection": "Add Connection",
+    "selectConnection": "Select {{name}}",
+    "deleteConnectionConfirm": "Delete Drasi connection \"{{name}}\"?",
+    "noActiveConnection": "No connection",
+    "manageConnections": "Manage connections",
+    "consumeStream": "Consume stream",
+    "consumeStreamTitle": "Consume this stream",
+    "streamDemoHint": "Demo mode — replace the URL with your own Drasi reaction endpoint.",
+    "copySnippet": "Copy snippet",
+    "copy": "Copy",
+    "copied": "Copied",
+    "flowLabel": "Flow",
+    "flowAllResources": "All resources"
   },
   "missionChat": {
     "saveTranscript": "Save transcript",
@@ -1527,7 +1784,7 @@
     "degradedTitle": "Local Agent degraded ({{count}} errors)",
     "degradedTitle_one": "Local Agent degraded ({{count}} error)",
     "degradedTitle_other": "Local Agent degraded ({{count}} errors)",
-    "aiLabel": "AI",
+    "aiLabel": "Agent",
     "liveLabel": "Live",
     "liveMode": "Live mode — agent connected, AI disabled",
     "noneAgent": "None",
@@ -1536,10 +1793,10 @@
     "aiAgentOnDesc": "AI processing enabled",
     "aiPausedBanner": "AI is paused — select an agent to enable AI features",
     "backendUnavailable": "Backend API unavailable",
-    "localAgentConnected": "Local Agent connected",
-    "connecting": "Connecting to agent...",
+    "localAgentConnected": "kc-agent connected — bridging Console to your local kubeconfig",
+    "connecting": "Connecting to kc-agent...",
     "offline": "Offline",
-    "localAgentDisconnected": "Local Agent disconnected",
+    "localAgentDisconnected": "kc-agent offline — run ./startup-oauth.sh to start it",
     "cluster": "Cluster",
     "inClusterModeTitle": "In-cluster mode - using ServiceAccount",
     "localAgentBypassed": "Local Agent: Bypassed",
@@ -1684,6 +1941,7 @@
     "loginWithGitHub": "Login with GitHub",
     "loginExplanation": "Please login with GitHub to submit feedback, request updates, or close requests.",
     "loginDemoExplanation": "This is a public demo — GitHub login requires your own KubeStellar Console instance. Install locally to submit feedback and unlock all features.",
+    "demoDataBanner": "Demo mode: the items below are sample data, not your submissions. Install your own console or log in via GitHub OAuth to see real feature requests.",
     "getYourOwn": "Get Your Own Console",
     "oauthRequired": "GitHub Login Required",
     "oauthExplanation": "To submit feedback and earn coins through the console, you need a GitHub OAuth app configured for your installation.",
@@ -1699,8 +1957,12 @@
     "submitFailed": "Unable to submit — GitHub login may be required.",
     "submitFailedGuidance": "You can open issues directly on GitHub. Coins will be accumulated and available in your console once you install a GitHub OAuth app.",
     "submitInfo": "Your request will be reviewed by a maintainer before being analyzed by our AI. Once approved, the AI will attempt to create a fix automatically and you'll receive a notification when ready.",
+    "submitShortcutHint": "Press Cmd/Ctrl+Enter to submit.",
     "loginBannerDemo": "Login with GitHub to submit feedback and manage requests",
     "loginBannerLocal": "Set up GitHub OAuth to submit feedback, earn coins, and track requests",
+    "authGateTitle": "Login required to submit feedback",
+    "authGateBodyDemo": "This is a public demo — GitHub login requires your own KubeStellar Console instance. Log in or install locally before filling out the form so your draft is not lost.",
+    "authGateBodyLocal": "Set up a GitHub OAuth app (or log in if already configured) before filling out the form so your draft is not lost.",
     "requestSubmitted": "Request Submitted!",
     "status": {
       "open": "Open",
@@ -1731,7 +1993,8 @@
     "submit": "Submit",
     "dismiss": "Not now",
     "thankYou": "Thank you for your feedback!",
-    "thankYouDetail": "Your input helps us improve KubeStellar Console."
+    "thankYouDetail": "Your input helps us improve KubeStellar Console.",
+    "submitError": "Couldn't send your feedback. Please try again."
   },
   "orbit": {
     "title": "Orbital Maintenance",
@@ -1765,6 +2028,9 @@
     "viewDashboard": "View Dashboard",
     "cardRequest": "No monitoring card for {{project}} yet",
     "cardRequestAction": "Request Card",
+    "cardRequestRequested": "Requested",
+    "cardRequestRetry": "Retry",
+    "cardRequestSending": "Sending…",
     "reminderTitle": "Orbital maintenance due",
     "reminderDismiss": "Dismiss",
     "standaloneTitle": "New Orbit Mission",
@@ -1776,11 +2042,17 @@
     "standaloneSelectAll": "Select all",
     "standaloneDeselectAll": "Deselect all",
     "standaloneCreate": "Create Orbit",
-    "addOrbit": "Add Orbit"
+    "addOrbit": "Add Orbit",
+    "confirmAllClustersTitle": "No clusters selected",
+    "confirmAllClustersMessage": "This orbit will run against all {{count}} connected cluster(s). Do you want to continue?",
+    "confirmAllClustersContinue": "Run on all clusters"
   },
   "update": {
     "available": "Update Available",
-    "availableTag": "Update available: {{tag}}"
+    "availableTag": "Update available: {{tag}}",
+    "upgrading": "Upgrading...",
+    "upgradeComplete": "Upgrade complete — reloading...",
+    "upgradeFailed": "Upgrade failed"
   },
   "drilldown": {
     "goBack": "Go back",
@@ -1835,7 +2107,8 @@
       "more": "+{{count}} more",
       "more_one": "+{{count}} more",
       "more_other": "+{{count}} more",
-      "manifest": "Manifest"
+      "manifest": "Manifest",
+      "issues": "Issues"
     },
     "ai": {
       "title": "AI Analysis",
@@ -2046,7 +2319,20 @@
       "noStorage": "No storage configured",
       "noNetwork": "No network configuration",
       "noIssuesDetected": "No issues detected",
-      "noRelatedResourcesDiscovered": "No related resources discovered"
+      "noRelatedResourcesDiscovered": "No related resources discovered",
+      "noBindingsFound": "No bindings found"
+    },
+    "rbac": {
+      "bindingsTab": "Bindings ({{count}})",
+      "describeTab": "Describe",
+      "yamlTab": "YAML",
+      "loadingBindings": "Loading RBAC bindings...",
+      "noBindingsForSubject": "No role bindings found for {{type}} \"{{subject}}\"",
+      "clusterRoleBindingsHeader": "ClusterRoleBindings ({{count}})",
+      "roleBindingsHeader": "RoleBindings ({{count}})",
+      "clusterWide": "cluster-wide",
+      "inNamespace": "in",
+      "truncationNotice": "Showing output for {{shown}} of {{total}} bindings ({{hidden}} not shown)"
     },
     "tooltips": {
       "copyCommand": "Copy command",
@@ -2059,7 +2345,31 @@
       "alreadyAtMinimum": "Already at minimum (0 replicas)",
       "maximumReplicas": "Maximum is 10 replicas",
       "noPermission": "No permission to scale deployments in this namespace",
-      "scaleHint": "Click +/- to scale (0-10 replicas)"
+      "scaleHint": "Click +/- to scale (0-10 replicas)",
+      "failedGeneric": "Unable to scale deployment",
+      "failedForbidden": "You don't have permission to scale this deployment",
+      "failedNotFound": "Deployment not found — it may have been deleted",
+      "failedInvalid": "Invalid replica count",
+      "failedConflict": "Deployment was changed by someone else — please retry",
+      "failedTimeout": "The cluster didn't respond in time — please retry"
+    },
+    "logs": {
+      "followLogs": "Follow logs",
+      "download": "Download",
+      "refresh": "Refresh",
+      "loadingLogs": "Loading logs...",
+      "failedToLoad": "Failed to load logs",
+      "tailLinesLabel": "Tail lines",
+      "tailLinesOption": "Last {{count}} lines",
+      "tailLinesOption_one": "Last {{count}} line",
+      "tailLinesOption_other": "Last {{count}} lines",
+      "showing": "Showing {{lines}} of last {{tail}} lines",
+      "generatedAt": "Generated at {{time}}",
+      "mockNotice": "Live log streaming is not yet available — showing placeholder content. Connect the local agent to stream real logs when available."
+    },
+    "deployment": {
+      "refresh": "Refresh",
+      "refreshAll": "Refresh all tabs"
     },
     "node": {
       "nodeIssueDetected": "Node Issue Detected",
@@ -2151,6 +2461,19 @@
       "optimizationRecommendations": "Optimization recommendations",
       "clickAnalyze": "Click \"Analyze Buildpack\" to get AI-powered insights",
       "analyzeHint": "AI will analyze the buildpack and suggest improvements"
+    },
+    "namespace": {
+      "deploymentIssues": "Deployment Issues",
+      "podIssues": "Pod Issues",
+      "deploymentsWithIssues": "Deployments with Issues",
+      "podsWithIssues": "Pods with Issues"
+    },
+    "events": {
+      "failedToLoad": "Failed to load events",
+      "noEventsFound": "No events found",
+      "totalEvents": "Total Events",
+      "noEventsFoundFor": "No events found for {{name}}",
+      "eventsExpiredHint": "Events may have expired or require authentication"
     }
   },
   "pagination": {
@@ -2404,6 +2727,7 @@
     "itemCount_other": "{{count}} {{item}}",
     "errorLoading": "Error loading data",
     "failedToFetch": "Failed to fetch {{resource}}",
+    "failedToLoadWorkloads": "Failed to load workloads",
     "connectToCluster": "Connect to a cluster to view data",
     "demoData": "Demo data",
     "liveData": "Live data",
@@ -2509,6 +2833,7 @@
     "contributorGuide": "Contributor Guide",
     "generatingAISummary": "Generating AI Summary...",
     "searchPolicies": "Search policies...",
+    "searchLayouts": "Search layouts...",
     "searchViolations": "Search violations...",
     "searchUsers": "Search users...",
     "searchAgents": "Search agents...",
@@ -2805,6 +3130,7 @@
     "clickToViewWorkloads": "Click to view workloads by namespace",
     "deleteGroup": "Delete group",
     "addCluster": "Add Cluster",
+    "createClusterWithAI": "Create Cluster with AI",
     "addClusterTitle": "Add a Cluster",
     "addClusterCommandLine": "Command Line",
     "addClusterImport": "Import Kubeconfig",
@@ -2816,6 +3142,7 @@
     "addClusterConnectDesc": "Add a cluster by entering connection details manually.",
     "importPaste": "Paste your kubeconfig YAML below, or upload a file:",
     "importUpload": "Upload file",
+    "importOverwriteConfirm": "This will replace the kubeconfig YAML you've already pasted. Continue?",
     "importPreview": "Preview",
     "importPreviewDesc": "The following contexts were found:",
     "importButton": "Import {{count}} Cluster(s)",
@@ -2851,6 +3178,7 @@
     "connectTestSuccess": "Connected",
     "connectTestFailed": "Connection failed",
     "connectAddButton": "Add Cluster",
+    "connectAddDisabledAfterTestFail": "Connection test failed. Edit connection settings or re-run the test before adding.",
     "connectAdding": "Adding...",
     "connectSuccess": "Cluster added successfully",
     "connectNext": "Next",
@@ -2883,7 +3211,28 @@
     "removeClusterSuccess": "Removed cluster \"{{name}}\" from kubeconfig",
     "removeClusterError": "Failed to remove cluster from kubeconfig",
     "removeClusterNoAgent": "Local agent not connected",
-    "removeClusterAgentTooOld": "Your local kc-agent is out of date and doesn't support removing clusters from the kubeconfig. Please upgrade kc-agent to the latest release and try again."
+    "removeClusterAgentTooOld": "Your local kc-agent is out of date and doesn't support removing clusters from the kubeconfig. Please upgrade kc-agent to the latest release and try again.",
+    "renameNoAgent": "Local agent not connected",
+    "sortPreferencesCorrupted": "Cluster sort preferences were corrupted and have been reset to defaults.",
+    "connectTestSuccessKubernetes": "Connected — Kubernetes {{version}}",
+    "renameContext": {
+      "title": "Rename Context",
+      "currentLabel": "Current:",
+      "newNameLabel": "New name",
+      "updatesKubeconfigHint": "This updates your kubeconfig via the local agent.",
+      "cancel": "Cancel",
+      "rename": "Rename",
+      "renaming": "Renaming...",
+      "renamed": "Renamed",
+      "errorEmpty": "Name cannot be empty",
+      "errorSpaces": "Name cannot contain spaces",
+      "errorUnchanged": "Name is unchanged",
+      "errorFailed": "Failed to rename context"
+    },
+    "diagnoseMissionTitle": "Diagnose {{cluster}}",
+    "diagnoseMissionDescription": "Analyzing cluster health and identifying issues",
+    "repairMissionTitle": "Repair {{cluster}}",
+    "repairMissionDescription": "Automatically fixing cluster issues"
   },
   "remediation": {
     "title": "AI Remediation Console",
@@ -3115,7 +3464,15 @@
     "welcomeBack": "Welcome back",
     "signInDescription": "Sign in to manage your multi-cluster deployments",
     "continueWithGitHub": "Continue with GitHub",
-    "termsOfService": "By signing in, you agree to our Terms of Service"
+    "setupGitHubSignIn": "Set up GitHub Sign-In",
+    "continueInDemoMode": "Continue in Demo Mode",
+    "oauthNotConfigured": "GitHub sign-in is not configured",
+    "oauthNotConfiguredDescription": "Set up a GitHub OAuth App to sign in with your GitHub identity. This takes about 2 minutes. You can also explore in demo mode first.",
+    "showSetupSteps": "Show setup instructions",
+    "openGitHubSettings": "GitHub OAuth Settings",
+    "fullSetupGuide": "Full Setup Guide",
+    "termsOfServicePrefix": "By signing in, you agree to our",
+    "termsOfServiceLink": "Terms of Service"
   },
   "authCallback": {
     "signingIn": "Signing you in...",
@@ -3212,8 +3569,26 @@
     "groups": {
       "deleteTitle": "Delete Cluster Group",
       "deleteMessage": "Are you sure you want to delete this cluster group? This action cannot be undone.",
-      "title": "Cluster Groups ({{count}})"
+      "deleteConfirm": "Delete cluster group \"{{name}}\"? This cannot be undone.",
+      "title": "Cluster Groups ({{count}})",
+      "newGroup": "New Group",
+      "namePlaceholder": "Group name...",
+      "selectClustersLabel": "Select clusters for this group:",
+      "cancel": "Cancel",
+      "create": "Create",
+      "deleteTooltip": "Delete group"
     }
+  },
+  "clusterAdmin": {
+    "title": "Cluster Admin",
+    "subtitle": "Multi-cluster operations, health, and infrastructure management",
+    "emptyTitle": "Cluster Admin Dashboard",
+    "emptyDescription": "Add cards to manage cluster health, node operations, upgrades, and security across your infrastructure.",
+    "errorLoadingData": "Error loading cluster data",
+    "statTotal": "total",
+    "statHealthy": "healthy",
+    "statDegraded": "degraded",
+    "statOffline": "offline"
   },
   "discardUnsavedChanges": "Discard unsaved changes?",
   "discardUnsavedChangesMessage": "You have unsaved changes that will be lost.",
@@ -3239,12 +3614,14 @@
     "switchTo": "Switch to",
     "demo": "Demo",
     "connectionLost": "Connection lost",
-    "restarting": "Restarting\u2026",
-    "restartedWaiting": "Restarted, waiting for connection\u2026",
+    "connectionLostHint": "Could not reach the backend — restart the server to reconnect",
+    "copiedRestartCommand": "Copied — run this in your project root terminal",
+    "restarting": "Restarting…",
+    "restartedWaiting": "Restarted, waiting for connection…",
     "restartBackendServer": "Restart the backend server",
     "restart": "Restart",
     "reconnected": "Reconnected",
-    "startingUp": "Starting up\u2026",
+    "startingUp": "Starting up…",
     "newVersionAvailable": "A new version is available",
     "reload": "Reload",
     "sidebar": {
@@ -3309,6 +3686,8 @@
       "deleteMissionConfirm": "Are you sure you want to delete this mission? This action cannot be undone.",
       "cancelling": "Cancelling...",
       "terminateSession": "Terminate Session",
+      "rollbackMission": "Rollback Mission",
+      "rollbackMissionConfirm": "This will start a new AI mission to analyze and reverse changes made by the interrupted mission. The AI will check the current cluster state and ask before making any destructive changes.",
       "browseCommunityMissions": "Browse Community Missions",
       "missionControlTitle": "Mission Control — Multi-Cluster Solutions Orchestrator",
       "missionControl": "Mission Control",
@@ -3325,7 +3704,11 @@
       "noActiveMissionsHint": "No active missions. Click Run on a saved mission to start it.",
       "commandsExecuted": "Commands executed",
       "saveTranscript": "Save transcript",
-      "expandToFullScreen": "Expand to full screen"
+      "expandToFullScreen": "Expand to full screen",
+      "useInMissionControl": "Use in Mission Control",
+      "useInMissionControlDescription": "Add this Kubara chart as a project in Mission Control Phase 1",
+      "kubaraBadge": "Kubara",
+      "kubaraBadgeTooltip": "Imported from Kubara Platform Catalog"
     }
   },
   "shared": {
@@ -3353,7 +3736,9 @@
         "upgrade": "Update / Upgrade",
         "upgradeEmpty": "Upgrade steps not yet available for this mission.",
         "troubleshooting": "Troubleshooting",
-        "troubleshootingEmpty": "Troubleshooting steps not yet available for this mission."
+        "troubleshootingEmpty": "Troubleshooting steps not yet available for this mission.",
+        "security": "Security",
+        "securityEmpty": "Security notes not yet available for this mission."
       }
     }
   },
@@ -3364,5 +3749,64 @@
     "emptyPromptError": "Prompt cannot be empty.",
     "cancel": "Cancel",
     "confirm": "Run mission"
+  },
+  "embed": {
+    "getEmbedCode": "Get embed code",
+    "unknownCard": "Unknown card type",
+    "supportedCards": "Supported card types",
+    "repoLabel": "Repository (owner/repo)",
+    "repoHint": "Leave blank to show all configured repos, or enter a specific owner/repo.",
+    "invalidRepo": "Must be in owner/repo format (e.g. kubestellar/console).",
+    "embedUrl": "Embed URL",
+    "iframeSnippet": "HTML iframe",
+    "markdownBadge": "Markdown badge",
+    "copied": "Copied!",
+    "copy": "Copy to clipboard"
+  },
+  "acmmIntro": {
+    "title": "Welcome to the AI Codebase Maturity Model",
+    "description": "Score any GitHub repo on a 6-level framework for AI-assisted engineering",
+    "whatIsTitle": "What is ACMM?",
+    "whatIsBody": "A 6-level framework scoring how ready a repo is for AI-assisted engineering. It detects concrete signals — instruction files, measurement workflows, feedback loops, gating policies — from L1 (ad-hoc completions) to L6 (fully autonomous). No source code is uploaded; only public file paths are read.",
+    "levelsTitle": "The 6 levels",
+    "levelL1": "Assisted / Ad Hoc",
+    "levelL1Desc": "AI suggests completions, no persistent rules",
+    "levelL2": "Instructed",
+    "levelL2Desc": "Judgment encoded in CLAUDE.md / AGENTS.md / Copilot instructions",
+    "levelL3": "Measured / Enforced",
+    "levelL3Desc": "Rules mechanically enforced; metrics instrument the loop",
+    "levelL4": "Adaptive / Structured",
+    "levelL4Desc": "Metrics feed back into instructions; workflows are structured",
+    "levelL5": "Semi-Automated",
+    "levelL5Desc": "System detects + proposes — humans still approve",
+    "levelL6": "Fully Autonomous",
+    "levelL6Desc": "System acts — generates issues, merges PRs, rolls back; humans set policy",
+    "levelsNote": "L5 vs L6: at L5 the system proposes and humans approve. At L6 the system acts and humans audit after the fact.",
+    "learningTitle": "Learning",
+    "learningBody": "Each level maps to a skill your team acquires. Progressing from L1 to L6 teaches teams to encode judgment, measure outcomes, and close feedback loops — building lasting AI-development fluency.",
+    "practiceTitle": "Practice",
+    "practiceBody": "ACMM isn't a one-time audit. It tracks the progression from ad-hoc AI usage to structured, repeatable workflows. The criteria make best practices visible so teams can adopt them incrementally.",
+    "traceabilityTitle": "Traceability",
+    "traceabilityBody": "Every criterion links back to its source framework, and every detected signal is tied to a concrete file or workflow in your repo. This citation trail lets you trace any score to evidence and any feedback loop to its origin.",
+    "sourcesTitle": "Assessment criteria sources",
+    "sourcesBody": "The ACMM score draws on criteria from four open-source plugin registries. Each criterion is tagged with its source so you can trace any score back to the framework that defined it.",
+    "sourceACMM": "the core 6-level maturity model (L1-L6 levels + prerequisite checks)",
+    "sourceFullsend": "adds criteria for deployment readiness and autonomy (test coverage, CI/CD pipelines, auto-merge policies)",
+    "sourceAEF": "adds governance criteria for agentic workflows (task traceability, structural gates)",
+    "sourceReflect": "adds self-tuning criteria for agent learning loops (correction capture, CLAUDE.md auto-sync)",
+    "actionsTitle": "What you can do here",
+    "actionScan": "Type any {{ownerRepo}} in the picker to scan it.",
+    "actionRole": "See your role and the next transition trigger on the Your Role card.",
+    "actionInventory": "Browse detected vs missing criteria on the Feedback Loops Inventory card.",
+    "actionAgent": "Click Ask agent for help on any missing criterion to launch an agent that adds it.",
+    "actionBadge": "Generate a shields.io badge for your README — it updates as your score changes.",
+    "docsLink": "Read the full ACMM documentation",
+    "dontShowAgain": "Don't show this again",
+    "gotIt": "Got it — let's go"
+  },
+  "resourceBadges": {
+    "viewClusterAria": "View cluster {{cluster}}",
+    "viewNamespaceAria": "View namespace {{namespace}}",
+    "viewResourceAria": "View {{kind}} resources"
   }
 }

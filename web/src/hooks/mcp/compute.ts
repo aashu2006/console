@@ -6,10 +6,25 @@ import { isDemoMode } from '../../lib/demoMode'
 import { useDemoMode } from '../useDemoMode'
 import { registerCacheReset, registerRefetch } from '../../lib/modeTransition'
 import { STORAGE_KEY_TOKEN } from '../../lib/constants'
-import { GPU_POLL_INTERVAL_MS, getEffectiveInterval, LOCAL_AGENT_URL, agentFetch, clusterCacheRef } from './shared'
+import { GPU_POLL_INTERVAL_MS, getEffectiveInterval, LOCAL_AGENT_URL, agentFetch } from './shared'
 import { subscribePolling } from './pollingManager'
-import { MCP_EXTENDED_TIMEOUT_MS, MCP_HOOK_TIMEOUT_MS } from '../../lib/constants/network'
+import { MCP_EXTENDED_TIMEOUT_MS, MCP_HOOK_TIMEOUT_MS, LOCAL_AGENT_HTTP_URL } from '../../lib/constants/network'
+import { classifyError, type ClusterErrorType } from '../../lib/errorClassifier'
 import type { GPUNode, NodeInfo, NVIDIAOperatorStatus } from './types'
+
+/**
+ * Per-cluster error surfaced by {@link useNodes} when the backend emits a
+ * `cluster_error` SSE event for a particular cluster (Issue 9355). Lets
+ * consumers distinguish an RBAC denial ({@link ClusterErrorType} === 'auth')
+ * from a transient 5xx/timeout failure so the UI can render a specific
+ * "lacks list-nodes RBAC" explanation instead of a generic "detailed list
+ * is empty" warning.
+ */
+export interface NodeClusterError {
+  cluster: string
+  errorType: ClusterErrorType
+  message: string
+}
 
 // Module-level cache for GPU nodes (persists across navigation)
 interface GPUNodeCache {
@@ -178,7 +193,7 @@ async function fetchGPUNodes(cluster?: string, _source?: string) {
       try {
         // Try SSE streaming first for progressive rendering
         const sseResult = await fetchSSE<GPUNode>({
-          url: '/api/mcp/gpu-nodes/stream',
+          url: `${LOCAL_AGENT_HTTP_URL}/gpu-nodes/stream`,
           params: Object.fromEntries(params.entries()),
           itemsKey: 'nodes',
           onClusterData: (_cluster, items) => {
@@ -197,7 +212,7 @@ async function fetchGPUNodes(cluster?: string, _source?: string) {
       } catch {
         // SSE failed, try REST fallback
         try {
-          const { data } = await api.get<{ nodes: GPUNode[] }>(`/api/mcp/gpu-nodes?${params}`)
+          const { data } = await api.get<{ nodes: GPUNode[] }>(`${LOCAL_AGENT_HTTP_URL}/gpu-nodes?${params}`)
           newNodes = data.nodes || []
           fetchSucceeded = true
         } catch {
@@ -429,6 +444,12 @@ export function useNodes(cluster?: string) {
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Per-cluster errors from the SSE `cluster_error` event (Issue 9355). Lets
+  // consumers (drill-downs) distinguish an RBAC denial on one or more
+  // clusters from a globally-transient failure so the UI can show a
+  // specific "lacks list-nodes RBAC on cluster X" message instead of a
+  // generic "detailed list is empty" warning.
+  const [clusterErrors, setClusterErrors] = useState<NodeClusterError[]>([])
   const { isDemoMode: demoMode } = useDemoMode()
 
   // Track previous cluster to detect actual changes (not just initial mount)
@@ -441,6 +462,7 @@ export function useNodes(cluster?: string) {
       setNodes([])
       setIsLoading(true)
       setError(null)
+      setClusterErrors([])
       prevClusterRef.current = cluster
     }
   }, [cluster])
@@ -452,6 +474,7 @@ export function useNodes(cluster?: string) {
       setNodes(demoNodes)
       setIsLoading(false)
       setError(null)
+      setClusterErrors([])
       return
     }
     setIsLoading(true)
@@ -486,6 +509,7 @@ export function useNodes(cluster?: string) {
             }))
             setNodes(mappedNodes)
             setError(null)
+            setClusterErrors([])
             setIsLoading(false)
             reportAgentDataSuccess()
             return
@@ -496,45 +520,52 @@ export function useNodes(cluster?: string) {
       }
     }
 
+    // Collect per-cluster error events during this refetch. We replace the
+    // previous snapshot atomically when the stream settles so a transient
+    // flash of "cluster X failed" isn't left stale after a retry succeeds
+    // (Issue 9355).
+    const collectedErrors: NodeClusterError[] = []
+
     // Use SSE streaming for progressive multi-cluster data
     try {
       const sseParams: Record<string, string> = {}
       if (cluster) sseParams.cluster = cluster
 
       const allNodes = await fetchSSE<NodeInfo>({
-        url: '/api/mcp/nodes/stream',
+        url: `${LOCAL_AGENT_HTTP_URL}/nodes/stream`,
         params: sseParams,
         itemsKey: 'nodes',
         onClusterData: (_clusterName, items) => {
           setNodes(prev => [...prev, ...items])
           setIsLoading(false)
         },
+        onClusterError: (clusterName, errorMessage) => {
+          // Classify the raw backend error so consumers can render an
+          // RBAC-specific message (auth) instead of "transient failure"
+          // (timeout/network/unknown). Backend error strings already
+          // contain enough context ("nodes is forbidden", "401",
+          // "unauthorized", etc.) for the classifier to match.
+          const classified = classifyError(errorMessage)
+          collectedErrors.push({
+            cluster: clusterName,
+            errorType: classified.type,
+            message: errorMessage,
+          })
+        },
       })
 
       setNodes(allNodes)
       setError(null)
+      setClusterErrors(collectedErrors)
     } catch {
-      // On error, try cluster cache as fallback
-      const cachedCluster = clusterCacheRef.clusters.find(c => c.name === cluster)
-      if (cachedCluster && cachedCluster.nodeCount && cachedCluster.nodeCount > 0) {
-        const placeholderNodes: NodeInfo[] = [{
-          name: `${cluster}-nodes`,
-          cluster: cluster || '',
-          status: 'Ready',
-          roles: ['worker'],
-          kubeletVersion: '',
-          cpuCapacity: cachedCluster.cpuCores ? `${cachedCluster.cpuCores}` : '0',
-          memoryCapacity: cachedCluster.memoryGB ? `${cachedCluster.memoryGB}Gi` : '0',
-          podCapacity: '110',
-          conditions: [],
-          unschedulable: false,
-        }]
-        setNodes(placeholderNodes)
-        setError(null)
-      } else {
-        setError(null)
-        setNodes([])
-      }
+      // On error, show empty state instead of fabricating placeholder nodes
+      // that would masquerade as real Ready nodes (#7351).  Even on
+      // catastrophic failure, surface any per-cluster errors we collected
+      // before the stream aborted so the UI can still explain the partial
+      // state (Issue 9355).
+      setError(null)
+      setNodes([])
+      setClusterErrors(collectedErrors)
     } finally {
       setIsLoading(false)
     }
@@ -562,7 +593,10 @@ export function useNodes(cluster?: string) {
     refetch()
   }, [demoMode, refetch])
 
-  return { nodes, isLoading, error, refetch }
+  // Per-cluster errors surfaced from the SSE stream (Issue 9355) so the
+  // multi-cluster drill-down can explain an empty list with "lacks
+  // list-nodes RBAC on cluster X" rather than a generic warning.
+  return { nodes, isLoading, error, clusterErrors, refetch }
 }
 
 // Hook to get NVIDIA operator status
@@ -583,7 +617,7 @@ export function useNVIDIAOperators(cluster?: string) {
         try {
           const accumulated: NVIDIAOperatorStatus[] = []
           const result = await fetchSSE<NVIDIAOperatorStatus>({
-            url: '/api/mcp/nvidia-operators/stream',
+            url: `${LOCAL_AGENT_HTTP_URL}/nvidia-operators/stream`,
             params,
             itemsKey: 'operators',
             onClusterData: (_clusterName, items) => {
@@ -604,7 +638,7 @@ export function useNVIDIAOperators(cluster?: string) {
       // REST fallback
       const urlParams = new URLSearchParams()
       if (cluster) urlParams.append('cluster', cluster)
-      const { data } = await api.get<{ operators?: NVIDIAOperatorStatus[], operator?: NVIDIAOperatorStatus }>(`/api/mcp/nvidia-operators?${urlParams}`)
+      const { data } = await api.get<{ operators?: NVIDIAOperatorStatus[], operator?: NVIDIAOperatorStatus }>(`${LOCAL_AGENT_HTTP_URL}/nvidia-operators?${urlParams}`)
       if (data.operators) {
         setOperators(data.operators)
       } else if (data.operator) {

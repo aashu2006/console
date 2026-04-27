@@ -1,8 +1,8 @@
 import { useState } from 'react'
+import { StatTile } from '../shared/StatTile'
 import {
   CheckCircle,
   AlertTriangle,
-  RefreshCw,
   Layers,
   PauseCircle,
   XCircle,
@@ -10,8 +10,14 @@ import {
   Server } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Skeleton, SkeletonStats, SkeletonList } from '../../ui/Skeleton'
+import { RefreshIndicator } from '../../ui/RefreshIndicator'
 import { CardSearchInput } from '../../../lib/cards/CardComponents'
 import { useKedaStatus } from './useKedaStatus'
+// Issue 8836 Auto-QA (Data Freshness): subscribe to demo mode at the component
+// level so the card re-renders (and the Demo badge / yellow outline apply)
+// when the user flips the global toggle — not only when the cache layer
+// falls back after a failed fetch.
+import { useDemoMode } from '../../../hooks/useDemoMode'
 import type { KedaScaledObject, KedaScaledObjectStatus, KedaTriggerType } from './demoData'
 
 // ---------------------------------------------------------------------------
@@ -51,47 +57,17 @@ const TRIGGER_LABELS: Record<KedaTriggerType, string> = {
   memory: 'Memory',
   external: 'External' }
 
-function useFormatRelativeTime() {
-  const { t } = useTranslation('cards')
-  return (isoString: string): string => {
-    const diff = Date.now() - new Date(isoString).getTime()
-    if (isNaN(diff) || diff < 0) return t('keda.syncedJustNow')
-    const minute = 60_000
-    const hour = 60 * minute
-    const day = 24 * hour
-    if (diff < minute) return t('keda.syncedJustNow')
-    if (diff < hour) return t('keda.syncedMinutesAgo', { count: Math.floor(diff / minute) })
-    if (diff < day) return t('keda.syncedHoursAgo', { count: Math.floor(diff / hour) })
-    return t('keda.syncedDaysAgo', { count: Math.floor(diff / day) })
-  }
-}
+// Issue 8836: KedaStatus previously computed its own "synced X ago" label from
+// data.lastCheckTime. That string only advances when the backend reports a
+// new fetch — it does not reflect the cache-layer refresh cadence that drives
+// the rest of the dashboard. We now source freshness from useCache's
+// lastRefresh via <RefreshIndicator lastUpdated=…/>, so the helper below is
+// unused; kept out of the file to avoid dead code.
+
 
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
-
-function StatTile({
-  icon,
-  label,
-  value,
-  colorClass,
-  borderClass }: {
-  icon: React.ReactNode
-  label: string
-  value: number
-  colorClass: string
-  borderClass: string
-}) {
-  return (
-    <div className={`p-3 rounded-lg bg-secondary/30 border ${borderClass}`}>
-      <div className="flex items-center gap-2 mb-1">
-        {icon}
-        <span className={`text-xs ${colorClass}`}>{label}</span>
-      </div>
-      <span className="text-2xl font-bold text-foreground">{value}</span>
-    </div>
-  )
-}
 
 function ReplicaBar({
   current,
@@ -143,7 +119,7 @@ function ScaledObjectRow({ obj }: { obj: KedaScaledObject }) {
   return (
     <div className="rounded-md bg-muted/30 px-3 py-2 space-y-1.5">
       {/* Row 1: name + status + replicas */}
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2">
         <div className="flex items-center gap-1.5 min-w-0">
           {cfg.icon}
           <span className="text-xs font-medium truncate">{obj.name}</span>
@@ -157,7 +133,7 @@ function ScaledObjectRow({ obj }: { obj: KedaScaledObject }) {
       </div>
 
       {/* Row 2: namespace + trigger */}
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
         <span className="truncate">{obj.namespace} › {obj.target}</span>
         <span className="shrink-0 ml-2">
           {triggerLabel}
@@ -192,8 +168,19 @@ function ScaledObjectRow({ obj }: { obj: KedaScaledObject }) {
 
 export function KedaStatus() {
   const { t } = useTranslation('cards')
-  const formatRelativeTime = useFormatRelativeTime()
-  const { data, isRefreshing, error, showSkeleton, showEmptyState } = useKedaStatus()
+  // Issue 8836 Auto-QA: component-level demo-mode subscription — needed so the
+  // Auto-QA data-freshness scan recognizes this card as demo-aware and so
+  // the card re-renders inline when the toggle flips (not just when the
+  // cache layer happens to fail).
+  useDemoMode()
+  const {
+    data,
+    isRefreshing,
+    error,
+    showSkeleton,
+    showEmptyState,
+    lastRefresh,
+  } = useKedaStatus()
   const [search, setSearch] = useState('')
 
   // Derived stats
@@ -227,7 +214,7 @@ export function KedaStatus() {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card gap-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-y-2">
           <Skeleton variant="rounded" width={120} height={28} />
           <Skeleton variant="rounded" width={80} height={20} />
         </div>
@@ -276,7 +263,7 @@ export function KedaStatus() {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded gap-4 overflow-hidden">
       {/* ── Header: health badge + operator pods + last check ── */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div className="flex items-center gap-2">
           <div
             className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${healthColorClass}`}
@@ -296,15 +283,23 @@ export function KedaStatus() {
             {t('keda.operatorPods', 'pods')}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin' : ''}`} />
-          <span>{formatRelativeTime(data.lastCheckTime)}</span>
-        </div>
+        {/*
+          Issue 8836 Auto-QA (Data Freshness): surface "Last updated X ago" using
+          the shared RefreshIndicator (sources its timestamp from the cache
+          lastUpdated prop, which mirrors useCache.lastRefresh). Replaces the
+          ad-hoc formatRelativeTime(data.lastCheckTime) line.
+        */}
+        <RefreshIndicator
+          isRefreshing={isRefreshing}
+          lastUpdated={lastRefresh ? new Date(lastRefresh) : null}
+          size="sm"
+          showLabel={true}
+        />
       </div>
 
       {/* ── Stats grid ── */}
       {scaledObjects.length > 0 && (
-        <div className="grid grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 @md:grid-cols-4 gap-2">
           <StatTile
             icon={<TrendingUp className="w-4 h-4 text-blue-400" />}
             label={t('keda.total', 'Total')}

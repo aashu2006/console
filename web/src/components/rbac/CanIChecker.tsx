@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useReducer } from 'react'
 import { Shield, Check, X, Loader2, AlertCircle, ChevronDown } from 'lucide-react'
 import { useCanI } from '../../hooks/usePermissions'
 import { useClusters, useNamespaces } from '../../hooks/useMCP'
@@ -87,23 +87,94 @@ const COMMON_RESOURCES = [
   'daemonsets',
 ]
 
+/**
+ * Snapshot of the inputs that were used for the most recent Check call.
+ * Rendered in the result banner so the banner text stays stable even if the
+ * user edits the verb/resource dropdowns after the result arrives
+ * (Issue 9268).
+ */
+interface CheckedSnapshot {
+  verb: string
+  resource: string
+  namespace: string | undefined
+}
+
+/** Form state managed by useReducer to batch updates (e.g. handleReset)
+ *  and prevent intermediate re-renders / UI flicker. */
+interface FormState {
+  cluster: string
+  verb: string
+  resource: string
+  namespace: string
+  customVerb: string
+  customResource: string
+  apiGroup: string
+  customApiGroup: string
+  selectedUserGroups: string[]
+  customUserGroup: string
+  showAdvanced: boolean
+  checkedSnapshot: CheckedSnapshot | null
+}
+
+const INITIAL_FORM_STATE: FormState = {
+  cluster: '',
+  verb: 'get',
+  resource: 'pods',
+  namespace: '',
+  customVerb: '',
+  customResource: '',
+  apiGroup: '',
+  customApiGroup: '',
+  selectedUserGroups: [],
+  customUserGroup: '',
+  showAdvanced: false,
+  checkedSnapshot: null,
+}
+
+type FormAction =
+  | { type: 'SET_FIELD'; field: keyof FormState; value: FormState[keyof FormState] }
+  | { type: 'TOGGLE_USER_GROUP'; group: string }
+  | { type: 'ADD_CUSTOM_USER_GROUP' }
+  | { type: 'RESET' }
+
+function formReducer(state: FormState, action: FormAction): FormState {
+  switch (action.type) {
+    case 'SET_FIELD':
+      return { ...state, [action.field]: action.value }
+    case 'TOGGLE_USER_GROUP': {
+      const groups = state.selectedUserGroups.includes(action.group)
+        ? state.selectedUserGroups.filter(g => g !== action.group)
+        : [...state.selectedUserGroups, action.group]
+      return { ...state, selectedUserGroups: groups }
+    }
+    case 'ADD_CUSTOM_USER_GROUP': {
+      const trimmed = state.customUserGroup.trim()
+      if (!trimmed || state.selectedUserGroups.includes(trimmed)) return state
+      return {
+        ...state,
+        selectedUserGroups: [...state.selectedUserGroups, trimmed],
+        customUserGroup: '',
+      }
+    }
+    case 'RESET':
+      return INITIAL_FORM_STATE
+    default:
+      return state
+  }
+}
+
 export function CanIChecker() {
   const { t } = useTranslation('common')
   const { clusters: rawClusters } = useClusters()
   const clusters = rawClusters.map(c => c.name)
   const { checkPermission, checking, result, error, reset } = useCanI()
 
-  const [cluster, setCluster] = useState('')
-  const [verb, setVerb] = useState('get')
-  const [resource, setResource] = useState('pods')
-  const [namespace, setNamespace] = useState('')
-  const [customVerb, setCustomVerb] = useState('')
-  const [customResource, setCustomResource] = useState('')
-  const [apiGroup, setApiGroup] = useState('')
-  const [customApiGroup, setCustomApiGroup] = useState('')
-  const [selectedUserGroups, setSelectedUserGroups] = useState<string[]>([])
-  const [customUserGroup, setCustomUserGroup] = useState('')
-  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [form, dispatch] = useReducer(formReducer, INITIAL_FORM_STATE)
+  const {
+    cluster, verb, resource, namespace,
+    customVerb, customResource, apiGroup, customApiGroup,
+    selectedUserGroups, customUserGroup, showAdvanced, checkedSnapshot,
+  } = form
 
   // Get selected cluster for namespace fetching
   const selectedCluster = cluster || clusters[0] || ''
@@ -114,19 +185,12 @@ export function CanIChecker() {
 
   // Toggle user group selection
   const toggleUserGroup = (group: string) => {
-    setSelectedUserGroups(prev =>
-      prev.includes(group)
-        ? prev.filter(g => g !== group)
-        : [...prev, group]
-    )
+    dispatch({ type: 'TOGGLE_USER_GROUP', group })
   }
 
   // Add custom user group
   const addCustomUserGroup = () => {
-    if (customUserGroup.trim() && !selectedUserGroups.includes(customUserGroup.trim())) {
-      setSelectedUserGroups(prev => [...prev, customUserGroup.trim()])
-      setCustomUserGroup('')
-    }
+    dispatch({ type: 'ADD_CUSTOM_USER_GROUP' })
   }
 
   const handleCheck = async () => {
@@ -146,6 +210,20 @@ export function CanIChecker() {
     // User groups for permission check
     const groups = selectedUserGroups.length > 0 ? selectedUserGroups : undefined
 
+    // Issue 9268: freeze the values used for this check so the result banner
+    // text stays stable if the user edits the dropdowns after the result
+    // arrives. Snapshot is set *before* the async call so a late-arriving
+    // result doesn't render with pre-snapshot dropdown state.
+    dispatch({
+      type: 'SET_FIELD',
+      field: 'checkedSnapshot',
+      value: {
+        verb: selectedVerb,
+        resource: selectedResource,
+        namespace: namespace || undefined,
+      },
+    })
+
     await checkPermission({
       cluster: targetCluster,
       verb: selectedVerb,
@@ -157,15 +235,7 @@ export function CanIChecker() {
 
   const handleReset = () => {
     reset()
-    setVerb('get')
-    setResource('pods')
-    setNamespace('')
-    setCustomVerb('')
-    setCustomResource('')
-    setApiGroup('')
-    setCustomApiGroup('')
-    setSelectedUserGroups([])
-    setCustomUserGroup('')
+    dispatch({ type: 'RESET' })
   }
 
   return (
@@ -190,8 +260,8 @@ export function CanIChecker() {
             <select
               id="cluster-select"
               value={cluster || clusters[0] || ''}
-              onChange={(e) => setCluster(e.target.value)}
-              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'cluster', value: e.target.value })}
+              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
               data-testid="can-i-cluster"
             >
               {clusters.map((c) => (
@@ -211,8 +281,8 @@ export function CanIChecker() {
             <select
               id="verb-select"
               value={verb}
-              onChange={(e) => setVerb(e.target.value)}
-              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'verb', value: e.target.value })}
+              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
               data-testid="can-i-verb"
             >
               {COMMON_VERBS.map((v) => (
@@ -226,9 +296,9 @@ export function CanIChecker() {
             <input
               type="text"
               value={customVerb}
-              onChange={(e) => setCustomVerb(e.target.value)}
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'customVerb', value: e.target.value })}
               placeholder={t('rbac.enterCustomVerb')}
-              className="mt-2 w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="mt-2 w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500"
               data-testid="can-i-custom-verb"
             />
           )}
@@ -243,8 +313,8 @@ export function CanIChecker() {
             <select
               id="resource-select"
               value={resource}
-              onChange={(e) => setResource(e.target.value)}
-              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'resource', value: e.target.value })}
+              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
               data-testid="can-i-resource"
             >
               {COMMON_RESOURCES.map((r) => (
@@ -258,9 +328,9 @@ export function CanIChecker() {
             <input
               type="text"
               value={customResource}
-              onChange={(e) => setCustomResource(e.target.value)}
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'customResource', value: e.target.value })}
               placeholder={t('rbac.enterCustomResource')}
-              className="mt-2 w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="mt-2 w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500"
               data-testid="can-i-custom-resource"
             />
           )}
@@ -275,8 +345,8 @@ export function CanIChecker() {
             <select
               id="namespace-select"
               value={namespace}
-              onChange={(e) => setNamespace(e.target.value)}
-              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'namespace', value: e.target.value })}
+              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
               data-testid="can-i-namespace"
             >
               <option value="">{t('rbac.allNamespacesClusterScoped')}</option>
@@ -300,8 +370,8 @@ export function CanIChecker() {
             <select
               id="api-group-select"
               value={apiGroup}
-              onChange={(e) => setApiGroup(e.target.value)}
-              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'apiGroup', value: e.target.value })}
+              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
               data-testid="can-i-api-group"
             >
               <option value="">
@@ -321,9 +391,9 @@ export function CanIChecker() {
             <input
               type="text"
               value={customApiGroup}
-              onChange={(e) => setCustomApiGroup(e.target.value)}
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'customApiGroup', value: e.target.value })}
               placeholder={t('rbac.enterCustomApiGroup')}
-              className="mt-2 w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="mt-2 w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500"
               data-testid="can-i-custom-api-group"
             />
           )}
@@ -347,6 +417,7 @@ export function CanIChecker() {
                   <button
                     onClick={() => toggleUserGroup(group)}
                     className="hover:text-blue-200"
+                    aria-label={t('rbac.removeGroup', { group })}
                   >
                     <X className="w-3 h-3" />
                   </button>
@@ -364,10 +435,10 @@ export function CanIChecker() {
                   toggleUserGroup(e.target.value)
                 }
               }}
-              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
+              className="w-full p-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500 appearance-none pr-8"
               data-testid="can-i-user-groups"
             >
-              <option value="">Select common groups...</option>
+              <option value="">{t('rbac.selectCommonGroups')}</option>
               {COMMON_USER_GROUPS.filter(g => !selectedUserGroups.includes(g.value)).map((group) => (
                 <option key={group.value} value={group.value}>{group.label}</option>
               ))}
@@ -380,15 +451,15 @@ export function CanIChecker() {
             <input
               type="text"
               value={customUserGroup}
-              onChange={(e) => setCustomUserGroup(e.target.value)}
+              onChange={(e) => dispatch({ type: 'SET_FIELD', field: 'customUserGroup', value: e.target.value })}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   e.preventDefault()
                   addCustomUserGroup()
                 }
               }}
-              placeholder="Add custom group..."
-              className="flex-1 p-2 rounded-lg bg-secondary border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder={t('rbac.addCustomGroupPlaceholder')}
+              className="flex-1 p-2 rounded-lg bg-secondary border border-border text-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500"
             />
             <Button
               variant="primary"
@@ -407,21 +478,22 @@ export function CanIChecker() {
         {/* Advanced Options */}
         <button
           type="button"
-          onClick={() => setShowAdvanced(!showAdvanced)}
+          onClick={() => dispatch({ type: 'SET_FIELD', field: 'showAdvanced', value: !showAdvanced })}
           className="text-sm text-muted-foreground hover:text-foreground"
+          aria-expanded={showAdvanced}
         >
           {showAdvanced ? t('rbac.hideAdvanced') : t('rbac.showAdvanced')}
         </button>
 
         {showAdvanced && (
           <div className="text-xs text-muted-foreground p-3 bg-secondary/30 rounded-lg">
-            <p className="font-medium mb-2">Common API Groups:</p>
+            <p className="font-medium mb-2">{t('rbac.commonApiGroupsTitle')}</p>
             <ul className="space-y-1">
-              <li><code className="text-blue-400">""</code> - Core API (pods, services, secrets, configmaps, namespaces)</li>
-              <li><code className="text-blue-400">apps</code> - Deployments, StatefulSets, DaemonSets, ReplicaSets</li>
-              <li><code className="text-blue-400">rbac.authorization.k8s.io</code> - Roles, ClusterRoles, Bindings</li>
-              <li><code className="text-blue-400">batch</code> - Jobs, CronJobs</li>
-              <li><code className="text-blue-400">networking.k8s.io</code> - Ingresses, NetworkPolicies</li>
+              <li><code className="text-blue-400">""</code> - {t('rbac.apiGroupCoreDesc')}</li>
+              <li><code className="text-blue-400">apps</code> - {t('rbac.apiGroupAppsDesc')}</li>
+              <li><code className="text-blue-400">rbac.authorization.k8s.io</code> - {t('rbac.apiGroupRbacDesc')}</li>
+              <li><code className="text-blue-400">batch</code> - {t('rbac.apiGroupBatchDesc')}</li>
+              <li><code className="text-blue-400">networking.k8s.io</code> - {t('rbac.apiGroupNetworkingDesc')}</li>
             </ul>
           </div>
         )}
@@ -451,8 +523,10 @@ export function CanIChecker() {
           )}
         </div>
 
-        {/* Result */}
-        {result && (
+        {/* Result — uses the frozen snapshot captured at Check time so the
+            displayed verb/resource/namespace match what was actually checked
+            (Issue 9268). */}
+        {result && checkedSnapshot && (
           <div
             className={`p-4 rounded-lg border ${
               result.allowed
@@ -476,11 +550,11 @@ export function CanIChecker() {
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
               {t(result.allowed ? 'rbac.youCan' : 'rbac.youCannot')}{' '}
-              <code className="px-1 py-0.5 rounded bg-secondary">{verb === 'custom' ? customVerb : verb}</code>{' '}
-              <code className="px-1 py-0.5 rounded bg-secondary">{resource === 'custom' ? customResource : resource}</code>
-              {namespace && (
+              <code className="px-1 py-0.5 rounded bg-secondary">{checkedSnapshot.verb}</code>{' '}
+              <code className="px-1 py-0.5 rounded bg-secondary">{checkedSnapshot.resource}</code>
+              {checkedSnapshot.namespace && (
                 <>
-                  {' '}{t('rbac.inNamespace')} <code className="px-1 py-0.5 rounded bg-secondary">{namespace}</code>
+                  {' '}{t('rbac.inNamespace')} <code className="px-1 py-0.5 rounded bg-secondary">{checkedSnapshot.namespace}</code>
                 </>
               )}
             </p>

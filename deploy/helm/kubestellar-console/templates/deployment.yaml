@@ -21,6 +21,7 @@ spec:
       {{- end }}
       labels:
         {{- include "kubestellar-console.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -30,6 +31,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "kubestellar-console.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- if and .Values.backup.enabled .Values.backup.autoRestore }}
@@ -43,6 +45,8 @@ spec:
           # on clusters enforcing PodSecurity restricted.
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.backup.resources | nindent 12 }}
           command:
             - /bin/sh
             - -c
@@ -83,7 +87,7 @@ spec:
 
               echo "Restoring from backup: $LATEST (${BACKUP_SIZE} bytes)"
               mkdir -p "$(dirname "$DB_PATH")"
-              cp "$LATEST" "$DB_PATH"
+              cp "$LATEST" "${DB_PATH}.tmp" && mv "${DB_PATH}.tmp" "$DB_PATH"
               echo "Restore complete"
           volumeMounts:
             - name: data
@@ -120,12 +124,14 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: {{ if .Values.watchdog.enabled }}/watchdog/ready{{ else }}/healthz{{ end }}
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 5
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           env:
@@ -137,10 +143,10 @@ spec:
             {{- end }}
             - name: DATABASE_PATH
               value: {{ .Values.database.sqlitePath | quote }}
-            {{- if .Values.route.enabled }}
+            {{- if and .Values.route.enabled .Values.route.host }}
             - name: FRONTEND_URL
               value: "https://{{ .Values.route.host }}"
-            {{- else if .Values.ingress.enabled }}
+            {{- else if and .Values.ingress.enabled .Values.ingress.hosts }}
             - name: FRONTEND_URL
               value: "https://{{ (index .Values.ingress.hosts 0).host }}"
             {{- end }}
@@ -261,15 +267,66 @@ spec:
             - name: CLUSTER_NAME
               value: {{ .Values.clusterName | quote }}
             {{- end }}
+            # Suppress local kc-agent connections — in-cluster deployments
+            # accessed via port-forward or ingress have no local kc-agent
+            # on the user's machine. Without this, the frontend sends
+            # WebSocket/HTTP requests to 127.0.0.1:8585 that always fail,
+            # causing console errors and 429 cascades. (#10267)
+            - name: NO_LOCAL_AGENT
+              value: "true"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: HELM_RELEASE_NAME
               value: {{ .Release.Name | quote }}
+            {{- if .Values.ai.defaultMode }}
+            - name: AI_DEFAULT_MODE
+              value: {{ .Values.ai.defaultMode | quote }}
+            {{- end }}
+            {{- if .Values.ai.tokenLimits.enabled }}
+            - name: AI_TOKEN_LIMITS_ENABLED
+              value: "true"
+            - name: AI_MONTHLY_TOKEN_LIMIT
+              value: {{ .Values.ai.tokenLimits.monthlyLimit | quote }}
+            - name: AI_TOKEN_WARNING_THRESHOLD
+              value: {{ .Values.ai.tokenLimits.warningThreshold | quote }}
+            - name: AI_TOKEN_CRITICAL_THRESHOLD
+              value: {{ .Values.ai.tokenLimits.criticalThreshold | quote }}
+            {{- end }}
             {{- if .Values.selfUpgrade.enabled }}
             - name: SELF_UPGRADE_ENABLED
               value: "true"
+            {{- end }}
+            {{- if .Values.kagenti.enabled }}
+            {{- if .Values.kagenti.forceDefaultAgent }}
+            - name: DEFAULT_AGENT
+              value: "kagenti"
+            {{- end }}
+            {{- if .Values.kagenti.controllerUrl }}
+            - name: KAGENTI_CONTROLLER_URL
+              value: {{ .Values.kagenti.controllerUrl | quote }}
+            {{- end }}
+            - name: KAGENTI_NAMESPACE
+              value: {{ .Values.kagenti.namespace | quote }}
+            - name: KAGENTI_SERVICE_NAME
+              value: {{ .Values.kagenti.serviceName | quote }}
+            - name: KAGENTI_SERVICE_PORT
+              value: {{ .Values.kagenti.servicePort | quote }}
+            - name: KAGENTI_SERVICE_PROTOCOL
+              value: {{ .Values.kagenti.serviceProtocol | quote }}
+            {{- if .Values.kagenti.directAgentUrl }}
+            - name: KAGENTI_AGENT_URL
+              value: {{ .Values.kagenti.directAgentUrl | quote }}
+            {{- end }}
+            {{- if .Values.kagenti.directAgentName }}
+            - name: KAGENTI_AGENT_NAME
+              value: {{ .Values.kagenti.directAgentName | quote }}
+            {{- end }}
+            {{- if .Values.kagenti.directAgentNamespace }}
+            - name: KAGENTI_AGENT_NAMESPACE
+              value: {{ .Values.kagenti.directAgentNamespace | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

@@ -38,7 +38,7 @@
  * ```
  */
 
-import { ReactNode, useRef } from 'react'
+import { ReactNode, createContext, useContext, useId, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { X, ChevronLeft } from 'lucide-react'
 import { useModalNavigation, useModalFocusTrap } from './useModalNavigation'
@@ -71,6 +71,21 @@ const HEIGHT_CLASSES: Record<ModalSize, string> = {
   full: 'min-h-[95vh] max-h-[calc(100vh-2rem)]',
 }
 
+// React Context so ModalHeader can receive the generated title ID
+const ModalTitleIdContext = createContext<string | undefined>(undefined)
+
+// React Context so ModalHeader can read whether Escape-to-close is enabled,
+// which drives the close button's tooltip + aria-label keyboard hint.
+// Defaults to true to preserve behavior for any ModalHeader rendered outside
+// a BaseModal provider (none today, but defensive).
+const ModalEscapeContext = createContext<{ escapeEnabled: boolean }>({ escapeEnabled: true })
+
+// Tooltip/aria-label text for the close button, varying with escape enablement.
+const CLOSE_WITH_ESC_LABEL = 'Close (Esc)'
+const CLOSE_LABEL = 'Close'
+const CLOSE_WITH_ESC_ARIA = 'Close modal (Esc)'
+const CLOSE_ARIA = 'Close modal'
+
 // ============================================================================
 // BaseModal Component
 // ============================================================================
@@ -84,9 +99,18 @@ export function BaseModal({
   closeOnBackdrop = true,
   closeOnEscape = true,
   enableBackspace = true,
+  testId,
 }: BaseModalProps) {
   const backdropRef = useRef<HTMLDivElement>(null)
   const modalRef = useRef<HTMLDivElement>(null)
+  // #9165 — Track where mousedown started so we don't treat
+  // "press inside the modal, drag out, release on backdrop" as an
+  // outside-click. Without this, a click that began on a sidebar
+  // item near the modal edge can fire its `click` event on the
+  // backdrop (because click target is the deepest common ancestor
+  // of mousedown+mouseup) and unexpectedly close the modal.
+  const mouseDownOnBackdropRef = useRef(false)
+  const titleId = useId()
 
   // Set up keyboard navigation (ESC and Space/Backspace to close)
   useModalNavigation({
@@ -102,11 +126,43 @@ export function BaseModal({
 
   if (!isOpen) return null
 
+  // #9165 — Outside-click detection.
+  //
+  // A click is treated as an outside-click ONLY when:
+  //   1. closeOnBackdrop is enabled, AND
+  //   2. the mousedown started on the backdrop (not on modal content
+  //      that the user later dragged out of), AND
+  //   3. the mouseup target is NOT contained within the modal content.
+  //
+  // The previous implementation used `e.target === e.currentTarget`,
+  // which failed in two ways:
+  //   - mousedown-inside-then-mouseup-on-backdrop fires `click` on the
+  //     backdrop with `target === currentTarget`, closing the modal
+  //     even though the user's intent was to interact with internal
+  //     content (the "click near sidebar edge" symptom in #9165).
+  //   - clicks that bubble through nested wrappers may not satisfy the
+  //     strict `target === currentTarget` equality even when they are
+  //     genuinely on the backdrop.
+  //
+  // Using a ref-based `contains()` check on the modal element, plus
+  // mousedown tracking, eliminates both failure modes.
+  const handleBackdropMouseDown = (e: React.MouseEvent) => {
+    // Only register as a backdrop-mousedown if the press is NOT on
+    // the modal content. modalRef.current can be null briefly during
+    // unmount; treat that as not-on-modal so we still gate on (3).
+    const target = e.target as Node
+    mouseDownOnBackdropRef.current = !modalRef.current || !modalRef.current.contains(target)
+  }
+
   const handleBackdropClick = (e: React.MouseEvent) => {
-    // Close if clicking on backdrop or centering wrapper (not on modal content)
-    if (closeOnBackdrop && e.target === e.currentTarget) {
-      onClose()
-    }
+    if (!closeOnBackdrop) return
+    const startedOnBackdrop = mouseDownOnBackdropRef.current
+    // Reset for the next gesture so a stale value can't leak across clicks.
+    mouseDownOnBackdropRef.current = false
+    if (!startedOnBackdrop) return
+    const target = e.target as Node
+    if (modalRef.current && modalRef.current.contains(target)) return
+    onClose()
   }
 
   // Use React Portal to render modal at document.body level
@@ -114,21 +170,30 @@ export function BaseModal({
   return createPortal(
     <div
       ref={backdropRef}
-      className="fixed inset-0 bg-black/60 backdrop-blur-sm z-modal isolate p-4 overflow-y-auto overscroll-contain"
+      className="fixed inset-0 bg-black/60 backdrop-blur-xs z-modal isolate p-4 overflow-y-auto overscroll-contain"
+      onMouseDown={handleBackdropMouseDown}
       onClick={handleBackdropClick}
     >
       <div
         className="min-h-full flex items-center justify-center"
+        onMouseDown={handleBackdropMouseDown}
         onClick={handleBackdropClick}
       >
         <div
           ref={modalRef}
           role="dialog"
           aria-modal="true"
+          aria-labelledby={titleId}
+          data-testid={testId}
           className={`glass w-full ${SIZE_CLASSES[size]} ${HEIGHT_CLASSES[size]} rounded-xl flex flex-col overflow-hidden ${className}`}
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
         >
-          {children}
+          <ModalTitleIdContext.Provider value={titleId}>
+            <ModalEscapeContext.Provider value={{ escapeEnabled: closeOnEscape }}>
+              {children}
+            </ModalEscapeContext.Provider>
+          </ModalTitleIdContext.Provider>
         </div>
       </div>
     </div>,
@@ -150,7 +215,13 @@ function ModalHeader({
   showBack = true,
   extra,
   children,
+  closeTestId,
 }: ModalHeaderProps) {
+  const titleId = useContext(ModalTitleIdContext)
+  const { escapeEnabled } = useContext(ModalEscapeContext)
+  const closeTitle = escapeEnabled ? CLOSE_WITH_ESC_LABEL : CLOSE_LABEL
+  const closeAriaLabel = escapeEnabled ? CLOSE_WITH_ESC_ARIA : CLOSE_ARIA
+
   return (
     <div className="flex flex-col border-b border-border">
       {/* Main header row */}
@@ -160,7 +231,7 @@ function ModalHeader({
           {showBack && onBack && (
             <button
               onClick={onBack}
-              className="p-2 rounded-lg hover:bg-card/50 text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
+              className="p-2 rounded-lg hover:bg-card/50 text-muted-foreground hover:text-foreground transition-colors shrink-0"
               title="Go back (Backspace)"
               aria-label="Go back"
             >
@@ -170,14 +241,14 @@ function ModalHeader({
 
           {/* Icon */}
           {Icon && (
-            <div className="flex-shrink-0">
+            <div className="shrink-0">
               <Icon className="w-6 h-6 text-purple-400" />
             </div>
           )}
 
           {/* Title and description */}
           <div className="min-w-0 flex-1">
-            <h2 className="text-lg font-semibold text-foreground truncate">
+            <h2 id={titleId} className="text-lg font-semibold text-foreground truncate">
               {title}
             </h2>
             {description && (
@@ -189,7 +260,7 @@ function ModalHeader({
 
           {/* Badges */}
           {badges && (
-            <div className="flex items-center gap-2 flex-shrink-0">
+            <div className="flex items-center gap-2 shrink-0">
               {badges}
             </div>
           )}
@@ -204,8 +275,9 @@ function ModalHeader({
             <button
               onClick={onClose}
               className="p-2 rounded-lg hover:bg-card/50 text-muted-foreground hover:text-foreground transition-colors"
-              title="Close (Esc)"
-              aria-label="Close modal"
+              title={closeTitle}
+              aria-label={closeAriaLabel}
+              data-testid={closeTestId}
             >
               <X className="w-5 h-5" aria-hidden="true" />
             </button>

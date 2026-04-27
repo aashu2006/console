@@ -4,11 +4,15 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"golang.org/x/time/rate"
 
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/settings"
 	"github.com/kubestellar/console/pkg/store"
@@ -21,6 +25,24 @@ const (
 	githubProxyAPIBaseDefault = "https://api.github.com"
 	// maxGitHubProxyPathLen is the maximum allowed path length to prevent abuse.
 	maxGitHubProxyPathLen = 512
+	// githubProxyMaxRequestsPerMinute caps outbound GitHub API calls to protect
+	// the shared server-side PAT from being exhausted by runaway clients.
+	githubProxyMaxRequestsPerMinute = 60
+	// githubProxyBurstSize allows short bursts above the steady-state rate.
+	// GitHub Activity card fans out ~7 parallel requests on initial load
+	// (repo, open PRs, closed PRs, open issues, closed issues, contributors,
+	// releases). Burst=5 was rejecting 2+ of those immediately and surfacing
+	// as "Too many requests" even when the user's PAT had plenty of quota
+	// left (#8299). 20 comfortably absorbs one card's load.
+	githubProxyBurstSize = 20
+	// githubProxyRetryAfterSeconds is the value advertised in the Retry-After
+	// header when we reject a request with 429 (#8307). 60 matches the bucket
+	// refill window so clients back off for a full cycle.
+	githubProxyRetryAfterSeconds = 60
+	// maxGitHubResponseBytes caps the size of GitHub API response bodies that
+	// the proxy will buffer, preventing memory exhaustion from large list
+	// endpoints or crafted query parameters (#7035).
+	maxGitHubResponseBytes = 10 * 1024 * 1024 // 10 MB
 )
 
 // githubProxyAPIBase is the base URL for proxied GitHub API requests.
@@ -29,11 +51,39 @@ var githubProxyAPIBase = getEnvOrDefault("GITHUB_API_BASE_URL", githubProxyAPIBa
 
 var githubProxyClient = &http.Client{Timeout: githubProxyTimeout}
 
+// githubProxyLimiters enforces a per-user rate limit on outbound GitHub API
+// calls so that one user cannot exhaust the shared PAT quota for everyone
+// (#7034). Each user (identified by JWT user ID) gets their own bucket.
+var githubProxyLimiters struct {
+	sync.Mutex
+	m map[string]*rate.Limiter
+}
+
+func init() {
+	githubProxyLimiters.m = make(map[string]*rate.Limiter)
+}
+
+// getGitHubProxyLimiter returns or creates a per-user rate limiter.
+func getGitHubProxyLimiter(userID string) *rate.Limiter {
+	githubProxyLimiters.Lock()
+	defer githubProxyLimiters.Unlock()
+	if lim, ok := githubProxyLimiters.m[userID]; ok {
+		return lim
+	}
+	lim := rate.NewLimiter(
+		rate.Every(time.Minute/githubProxyMaxRequestsPerMinute),
+		githubProxyBurstSize,
+	)
+	githubProxyLimiters.m[userID] = lim
+	return lim
+}
+
 // allowedGitHubPrefixes restricts which GitHub API paths can be proxied.
 // Only read-only endpoints actually needed by the frontend are permitted.
 // Any path not matching one of these prefixes is rejected with 403 Forbidden.
 var allowedGitHubPrefixes = []string{
 	"/repos/",        // repo info, PRs, issues, releases, contributors, actions, git refs, compare
+	"/search/",       // issue/PR search for contributions list
 	"/rate_limit",    // rate-limit check / token validation
 	"/user",          // token validation (GET /user returns the authenticated user)
 	"/notifications", // notification badge (if used by frontend)
@@ -99,6 +149,22 @@ func (h *GitHubProxyHandler) resolveToken() string {
 // Proxy handles GET /api/github/* by forwarding to api.github.com/*.
 // Only GET requests are allowed (read-only proxy).
 func (h *GitHubProxyHandler) Proxy(c *fiber.Ctx) error {
+	// Rate-limit outbound GitHub API calls per user to protect the shared PAT
+	// quota (#7034). See githubProxyMaxRequestsPerMinute / githubProxyBurstSize
+	// for the current bucket size.
+	uid := middleware.GetUserID(c)
+	limiterKey := uid.String()
+	if limiterKey == "00000000-0000-0000-0000-000000000000" {
+		limiterKey = c.IP() // fallback — should not happen behind JWTAuth
+	}
+	if !getGitHubProxyLimiter(limiterKey).Allow() {
+		slog.Warn("[GitHubProxy] rate limit exceeded, rejecting request", "user", limiterKey)
+		c.Set("Retry-After", strconv.Itoa(githubProxyRetryAfterSeconds))
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"error": "Console proxy rate limit exceeded (not GitHub). Please wait a moment and retry.",
+		})
+	}
+
 	// Only allow GET — this is a read-only proxy
 	if c.Method() != fiber.MethodGet {
 		return c.Status(fiber.StatusMethodNotAllowed).JSON(fiber.Map{
@@ -175,7 +241,7 @@ func (h *GitHubProxyHandler) Proxy(c *fiber.Ctx) error {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGitHubResponseBytes))
 	if err != nil {
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
 			"error": "Failed to read GitHub API response",
@@ -210,7 +276,7 @@ func (h *GitHubProxyHandler) Proxy(c *fiber.Ctx) error {
 func (h *GitHubProxyHandler) SaveToken(c *fiber.Ctx) error {
 	// Global token management requires console admin role
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != "admin" {
 		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
 	}
@@ -253,7 +319,7 @@ func (h *GitHubProxyHandler) SaveToken(c *fiber.Ctx) error {
 func (h *GitHubProxyHandler) DeleteToken(c *fiber.Ctx) error {
 	// Global token management requires console admin role
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != "admin" {
 		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
 	}
@@ -276,6 +342,8 @@ func (h *GitHubProxyHandler) DeleteToken(c *fiber.Ctx) error {
 			"error": "Failed to clear token",
 		})
 	}
+
+	audit.Log(c, audit.ActionDeleteToken, "token", "github")
 
 	return c.JSON(fiber.Map{"success": true})
 }

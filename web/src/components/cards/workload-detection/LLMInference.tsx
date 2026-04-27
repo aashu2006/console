@@ -162,9 +162,9 @@ export function LLMInference({ config: _config }: LLMInferenceProps) {
 
   return (
     <div className="h-full flex flex-col min-h-card">
-      {/* Header controls */}
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
+      {/* Header controls — @container responsive */}
+      <div className="flex flex-wrap @lg:flex-nowrap items-center justify-between gap-y-2 mb-4">
+        <div className="flex items-center gap-2 @xs:flex-wrap">
           <RefreshIndicator
             isRefreshing={isRefreshing}
             lastUpdated={lastRefresh ? new Date(lastRefresh) : null}
@@ -188,7 +188,7 @@ export function LLMInference({ config: _config }: LLMInferenceProps) {
             {items.filter(s => s.status === 'running').length} running
           </StatusBadge>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 @xs:flex-wrap">
           {/* Component type filter */}
           <div ref={componentFilterRef} className="relative">
             <button
@@ -267,7 +267,7 @@ export function LLMInference({ config: _config }: LLMInferenceProps) {
 
       {/* Integration notice */}
       <div className="flex items-start gap-2 p-2 rounded-lg bg-purple-500/10 border border-purple-500/20 text-xs mb-4">
-        <AlertCircle className="w-4 h-4 text-purple-400 flex-shrink-0 mt-0.5" />
+        <AlertCircle className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
         <div>
           <p className="text-purple-400 font-medium">llm-d Inference Detection</p>
           <p className="text-muted-foreground">
@@ -298,22 +298,22 @@ export function LLMInference({ config: _config }: LLMInferenceProps) {
           const compBadge = getComponentBadge(server.componentType)
           return (
             <div key={server.id} className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
-              <div className="flex items-center justify-between mb-1">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className="text-sm font-medium text-foreground truncate" title={server.name}>{server.name}</span>
                   {/* Component type badge */}
-                  <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${compBadge.bg} ${compBadge.text}`}>
+                  <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${compBadge.bg} ${compBadge.text}`}>
                     {compBadge.label}
                   </span>
                   {/* Server type badge (vLLM, TGI, etc.) for model components */}
                   {server.componentType === 'model' && server.type !== 'unknown' && (
-                    <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${getTypeBadge(server.type)}`}>
+                    <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${getTypeBadge(server.type)}`}>
                       {getTypeLabel(server.type)}
                     </span>
                   )}
                   {/* Autoscaler badge */}
                   {server.hasAutoscaler && (
-                    <StatusBadge color="orange" className="flex-shrink-0" title={server.autoscalerType === 'va' ? 'VariantAutoscaling' : server.autoscalerType === 'both' ? 'HPA + VariantAutoscaling' : 'HorizontalPodAutoscaler'}>
+                    <StatusBadge color="orange" className="shrink-0" title={server.autoscalerType === 'va' ? 'VariantAutoscaling' : server.autoscalerType === 'both' ? 'HPA + VariantAutoscaling' : 'HorizontalPodAutoscaler'}>
                       {server.autoscalerType === 'va' ? 'VA' : server.autoscalerType === 'both' ? 'HPA+VA' : 'HPA'}
                     </StatusBadge>
                   )}
@@ -352,7 +352,7 @@ export function LLMInference({ config: _config }: LLMInferenceProps) {
                   </span>
                 )}
               </div>
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
                 <div className="flex items-center gap-3">
                   {server.componentType === 'model' && (
                     <span className="flex items-center gap-1"><Layers className="w-3 h-3" /> {server.model}</span>

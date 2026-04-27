@@ -6,28 +6,12 @@
  * Extracted from useCachedData.ts for maintainability.
  */
 
-import { useCache, type RefreshCategory } from '../lib/cache'
+import { useCache, type RefreshCategory, type CachedHookResult } from '../lib/cache'
 import { kubectlProxy } from '../lib/kubectlProxy'
 import { KUBECTL_EXTENDED_TIMEOUT_MS } from '../lib/constants/network'
 import { clusterCacheRef } from './mcp/shared'
 import { isAgentUnavailable } from './useLocalAgent'
 import { settledWithConcurrency } from '../lib/utils/concurrency'
-
-// ============================================================================
-// Shared Types
-// ============================================================================
-
-interface CachedHookResult<T> {
-  data: T
-  isLoading: boolean
-  isRefreshing: boolean
-  isDemoFallback: boolean
-  error: string | null
-  isFailed: boolean
-  consecutiveFailures: number
-  lastRefresh: number | null
-  refetch: () => Promise<void>
-}
 
 // ============================================================================
 // ISO 27001 Audit Types
@@ -265,28 +249,29 @@ async function fetchISO27001AuditViaKubectl(
   const clusters = getAgentClusters()
   if (clusters.length === 0) return []
 
-  // Each task returns its own findings array to avoid shared-state mutation.
-  // Progressive updates are built by collecting all fulfilled results so far.
-  const completed: ISO27001Finding[][] = []
-
+  // (#6857) Each callback returns its own findings; aggregation happens
+  // after all tasks settle to avoid mutating a shared accumulator.
   const tasks = clusters
     .filter(c => !cluster || c.name === cluster)
     .map(({ name, context }) => async () => {
       try {
-        const clusterFindings = await runISO27001ChecksForCluster(name, context || name)
-        completed.push(clusterFindings)
-        onProgress?.(completed.flat())
-        return clusterFindings
+        return await runISO27001ChecksForCluster(name, context || name)
       } catch (err) {
         console.error(`[ISO27001] Audit failed for cluster ${name}:`, err)
         return []
       }
     })
 
-  const results = await settledWithConcurrency(tasks)
-  return results
-    .filter((r): r is PromiseFulfilledResult<ISO27001Finding[]> => r.status === 'fulfilled')
-    .flatMap(r => r.value)
+  // Report progress as each cluster settles instead of waiting for all
+  const allFindings: ISO27001Finding[] = []
+  function handleSettled(result: PromiseSettledResult<ISO27001Finding[]>) {
+    if (result.status === 'fulfilled') {
+      allFindings.push(...result.value)
+      onProgress?.([...allFindings])
+    }
+  }
+  await settledWithConcurrency(tasks, undefined, handleSettled)
+  return allFindings
 }
 
 /**

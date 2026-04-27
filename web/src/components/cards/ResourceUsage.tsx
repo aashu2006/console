@@ -20,7 +20,7 @@ function ResourceUsageInternal() {
   // #6217: destructure lastRefresh so the card can render a freshness
   // indicator instead of leaving users guessing how stale the data is.
   // #6271: useClusters returns Date|null; normalize to numeric epoch.
-  const { isLoading: clustersLoading, isRefreshing: clustersRefreshing, lastRefresh: clustersLastRefreshDate } = useClusters()
+  const { isLoading: clustersLoading, isRefreshing: clustersRefreshing, lastRefresh: clustersLastRefreshDate, isFailed, consecutiveFailures } = useClusters()
   const clustersLastRefresh: number | null = clustersLastRefreshDate instanceof Date
     ? clustersLastRefreshDate.getTime()
     : (typeof clustersLastRefreshDate === 'number' ? clustersLastRefreshDate : null)
@@ -98,12 +98,14 @@ function ResourceUsageInternal() {
     isLoading: clustersLoading && !hasData,
     isRefreshing: clustersRefreshing || gpuRefreshing,
     hasAnyData: hasData,
-    isDemoData: isDemoMode || isDemoFallback })
+    isDemoData: isDemoMode || isDemoFallback,
+    isFailed,
+    consecutiveFailures })
 
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-[200px]">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={80} height={16} />
           <Skeleton variant="rounded" width={60} height={24} />
         </div>
@@ -155,7 +157,7 @@ function ResourceUsageInternal() {
   return (
     <div className="h-full flex flex-col">
       {/* Controls - single row: Cluster count → Cluster Filter → Refresh */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           {localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -207,8 +209,17 @@ function ResourceUsageInternal() {
       </div>
 
       <div
-        className="flex-1 flex items-center justify-around cursor-pointer hover:opacity-80 transition-opacity flex-wrap gap-2"
+        role="button"
+        tabIndex={0}
+        className="flex-1 flex items-center justify-around cursor-pointer hover:opacity-80 transition-opacity flex-wrap gap-2 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-400"
+        aria-label={t('cards:resourceUsage.viewDetailsAria')}
         onClick={handleDrillDown}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            handleDrillDown()
+          }
+        }}
       >
         <div className="flex flex-col items-center">
           <Gauge

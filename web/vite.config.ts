@@ -169,6 +169,11 @@ export default defineConfig(({ mode }) => ({
           if (id.includes('/sucrase/')) {
             return 'sucrase-vendor'
           }
+          // Code editor — only used by Drasi stream samples drawer;
+          // isolate so the CodeMirror editor never loads on normal pages.
+          if (id.includes('/@codemirror/') || id.includes('/@uiw/react-codemirror/') || id.includes('/codemirror/') || id.includes('/@lezer/')) {
+            return 'codemirror-vendor'
+          }
           // Internationalization
           if (id.includes('/i18next') || id.includes('/react-i18next/')) {
             return 'i18n-vendor'
@@ -255,7 +260,7 @@ export default defineConfig(({ mode }) => ({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     css: true,
-    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    include: ['src/**/*.{test,spec}.{ts,tsx}', 'netlify/functions/__tests__/*.{test,spec}.{ts,tsx}'],
     exclude: ['node_modules', 'e2e/**/*'],
     teardownTimeout: process.env.CI ? 60_000 : 10_000, // CI runners need more time to terminate workers
     // CI runners (2-core, 7GB) OOM with 600+ test files at full concurrency
@@ -283,6 +288,7 @@ export default defineConfig(({ mode }) => ({
         '**/*.test.{ts,tsx}',
         '**/*.spec.{ts,tsx}',
         '**/*.d.ts',
+        '**/*.md',
         '**/demo*Data*.{ts,tsx}',
         '**/icons.{ts,tsx}',
       ],

@@ -8,12 +8,14 @@ import type {
   AlertStats,
   AlertChannel } from '../types/alerts'
 import type { GPUHealthCheckResult } from '../hooks/mcp/types'
+import { MS_PER_MINUTE, MS_PER_HOUR } from '../lib/constants/time'
 import type { NightlyGuideStatus } from '../lib/llmd/nightlyE2EDemoData'
 import type { AlertsMCPData } from './AlertsDataFetcher'
 import { STORAGE_KEY_AUTH_TOKEN, FETCH_DEFAULT_TIMEOUT_MS, STORAGE_KEY_NOTIFIED_ALERT_KEYS } from '../lib/constants'
+import { safeGet, safeSet, safeRemove, safeGetJSON } from '../lib/safeLocalStorage'
 import { INITIAL_FETCH_DELAY_MS, POLL_INTERVAL_SLOW_MS, SECONDARY_FETCH_DELAY_MS, NIGHTLY_E2E_POLL_INTERVAL_MS } from '../lib/constants/network'
 import { PRESET_ALERT_RULES } from '../types/alerts'
-import { sendNotificationWithDeepLink } from '../hooks/useDeepLink'
+import { sendNotificationWithDeepLink, type DeepLinkParams } from '../hooks/useDeepLink'
 import { findRunbookForCondition } from '../lib/runbooks/builtins'
 import { executeRunbook } from '../lib/runbooks/executor'
 
@@ -87,12 +89,13 @@ function shallowEqualRecords(
 }
 
 // Build the dedup key for an alert.
-// pod_crash alerts use (ruleId, cluster, resource) so that each crashing pod on the
-// same cluster gets its own entry. All aggregate/cluster-level alert types use
-// (ruleId, cluster) only, preventing dynamic resource strings from creating duplicates.
-function alertDedupKey(ruleId: string, conditionType: string, cluster?: string, resource?: string): string {
+// pod_crash alerts use (ruleId, cluster, namespace, resource) so that pods with the
+// same name in different namespaces get separate entries (#7328/#7338).
+// All aggregate/cluster-level alert types use (ruleId, cluster) only, preventing
+// dynamic resource strings from creating duplicates.
+function alertDedupKey(ruleId: string, conditionType: string, cluster?: string, resource?: string, namespace?: string): string {
   if (conditionType === 'pod_crash') {
-    return `${ruleId}::${cluster ?? ''}::${resource ?? ''}`
+    return `${ruleId}::${cluster ?? ''}::${namespace ?? ''}::${resource ?? ''}`
   }
   return `${ruleId}::${cluster ?? ''}`
 }
@@ -104,7 +107,7 @@ function deduplicateAlerts(alerts: Alert[], rules: AlertRule[]): Alert[] {
   const dedupMap = new Map<string, Alert>()
   for (const alert of alerts) {
     const condType = ruleTypeMap.get(alert.ruleId) ?? ''
-    const key = alertDedupKey(alert.ruleId, condType, alert.cluster, alert.resource)
+    const key = alertDedupKey(alert.ruleId, condType, alert.cluster, alert.resource, alert.namespace)
     const existing = dedupMap.get(key)
     if (!existing || new Date(alert.firedAt) > new Date(existing.firedAt)) {
       dedupMap.set(key, alert)
@@ -135,7 +138,7 @@ function applyMutations(
     const a = result[i]
     if (a.status !== 'firing') continue
     const condType = ruleTypeMap.get(a.ruleId) ?? ''
-    const key = alertDedupKey(a.ruleId, condType, a.cluster, a.resource)
+    const key = alertDedupKey(a.ruleId, condType, a.cluster, a.resource, a.namespace)
     // Keep the last (most recent) index for each key
     dedupIndex.set(key, i)
   }
@@ -144,7 +147,7 @@ function applyMutations(
     switch (mut.type) {
       case 'create': {
         const condType = ruleTypeMap.get(mut.alert.ruleId) ?? ''
-        const key = alertDedupKey(mut.alert.ruleId, condType, mut.alert.cluster, mut.alert.resource)
+        const key = alertDedupKey(mut.alert.ruleId, condType, mut.alert.cluster, mut.alert.resource, mut.alert.namespace)
         const existingIdx = dedupIndex.get(key)
         if (existingIdx !== undefined) {
           // Alert already exists — skip (dedup handled by update mutations)
@@ -238,13 +241,107 @@ const MAX_ALERTS = 500
 /** Maximum number of resolved alerts to keep after a quota-exceeded prune. */
 const MAX_RESOLVED_ALERTS_AFTER_PRUNE = 50
 
-/** Minimum time (ms) between repeat notifications for the same alert */
-const NOTIFICATION_COOLDOWN_MS = 300_000 // 5 minutes
+/** Default temperature threshold for extreme-heat weather alerts (°F). */
+const DEFAULT_TEMPERATURE_THRESHOLD_F = 100
+/** Default wind-speed threshold for high-wind weather alerts (mph). */
+const DEFAULT_WIND_SPEED_THRESHOLD_MPH = 40
+
+/** Minimum time (ms) between repeat notifications for the same alert,
+ *  tiered by severity so critical alerts re-notify quickly while
+ *  lower-severity alerts don't spam the desktop. */
+const NOTIFICATION_COOLDOWN_BY_SEVERITY: Record<string, number> = {
+  critical: 5 * MS_PER_MINUTE,    // 5 min — urgent, re-notify quickly
+  warning: 30 * MS_PER_MINUTE,    // 30 min — important but not urgent
+  info: 4 * MS_PER_HOUR,   // 4 hours — informational, minimal interruption
+}
+/** Fallback cooldown when severity is unknown */
+const DEFAULT_NOTIFICATION_COOLDOWN_MS = 30 * MS_PER_MINUTE // 30 min
+
+/** Get the notification cooldown for a given severity level */
+function getNotificationCooldown(severity: string): number {
+  return NOTIFICATION_COOLDOWN_BY_SEVERITY[severity] ?? DEFAULT_NOTIFICATION_COOLDOWN_MS
+}
 
 /** Condition types that represent persistent cluster-level errors.
  *  These fire only once and suppress until the cluster recovers —
  *  no 5-minute cooldown repeat for ongoing connectivity failures. */
 const PERSISTENT_CLUSTER_CONDITIONS = new Set(['certificate_error', 'cluster_unreachable'])
+
+// ── Centralized Browser Notification Dispatcher (#8750, #8751, #8752) ───
+//
+// All evaluators previously had inline dedup-check + sendNotificationWithDeepLink
+// logic with subtle inconsistencies:
+//   - Some used cooldown-based repeat, others used one-shot "fire once"
+//   - Persistent condition detection was duplicated in each evaluator
+//   - The dedup key format varied per evaluator
+//
+// This centralized helper unifies the rules:
+//   1. Check if the rule has a `browser` channel enabled
+//   2. Compute the dedup key using the standard `alertDedupKey`
+//   3. For persistent conditions: notify once, suppress until recovery
+//   4. For transient conditions: notify once per cooldown window (severity-tiered)
+//   5. Record the dedup key + timestamp for future checks
+
+/** Parameters for the centralized browser notification dispatcher */
+interface BrowserNotificationParams {
+  /** The alert rule that triggered this notification */
+  rule: AlertRule
+  /** The notification dedup key (from alertDedupKey or custom) */
+  dedupKey: string
+  /** The notification title */
+  title: string
+  /** The notification body text */
+  body: string
+  /** Deep link parameters for click-through navigation */
+  deepLinkParams: DeepLinkParams
+}
+
+/**
+ * Dispatch a browser notification with centralized dedup rules.
+ *
+ * This replaces the 6 inline dedup-check patterns that were scattered
+ * across individual evaluators, each with slightly different logic.
+ *
+ * @returns true if the notification was sent, false if suppressed by dedup
+ */
+function shouldDispatchBrowserNotification(
+  rule: AlertRule,
+  dedupKey: string,
+  notifiedKeys: Map<string, number>
+): boolean {
+  // Gate: rule must have an enabled browser channel
+  const hasBrowserChannel = (rule.channels || []).some(
+    ch => ch.type === 'browser' && ch.enabled
+  )
+  if (!hasBrowserChannel) return false
+
+  const isPersistent = PERSISTENT_CLUSTER_CONDITIONS.has(rule.condition.type)
+  const alreadyNotified = notifiedKeys.has(dedupKey)
+
+  if (isPersistent) {
+    // Persistent conditions: notify exactly once, suppress until recovery
+    // clears the dedup key (see evaluateCertificateError/evaluateClusterUnreachable)
+    return !alreadyNotified
+  }
+
+  // Transient conditions: use severity-tiered cooldown
+  if (!alreadyNotified) return true
+  const lastNotified = notifiedKeys.get(dedupKey) ?? 0
+  return (Date.now() - lastNotified) > getNotificationCooldown(rule.severity)
+}
+
+/**
+ * When a cluster is unreachable we cannot observe its node / disk / memory
+ * state — any cached values are stale, last-known-good at best. Firing
+ * per-node alerts ("Node Not Ready", "Disk Pressure", "Memory Pressure")
+ * for such clusters produces misleading noise on top of the single
+ * authoritative "Cluster Unreachable" alert. This helper centralizes the
+ * reachability check so every node / cluster-health evaluator can skip
+ * unreachable clusters uniformly. See upstream bug report for the real-world
+ * "20 unreachable clusters → 40 spurious alerts" scenario. */
+function isClusterUnreachable(cluster: { reachable?: boolean }): boolean {
+  return cluster.reachable === false
+}
 
 /** Maximum age (ms) for dedup entries — evict stale entries older than this */
 const NOTIFICATION_DEDUP_MAX_AGE_MS = 86_400_000 // 24 hours
@@ -252,7 +349,7 @@ const NOTIFICATION_DEDUP_MAX_AGE_MS = 86_400_000 // 24 hours
 /** Load persisted notification dedup map from localStorage (key → timestamp) */
 function loadNotifiedAlertKeys(): Map<string, number> {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY_NOTIFIED_ALERT_KEYS)
+    const stored = safeGet(STORAGE_KEY_NOTIFIED_ALERT_KEYS)
     if (stored) {
       return new Map(JSON.parse(stored) as [string, number][])
     }
@@ -269,7 +366,7 @@ function saveNotifiedAlertKeys(keys: Map<string, number>): void {
     for (const [key, ts] of keys) {
       if (now - ts > NOTIFICATION_DEDUP_MAX_AGE_MS) keys.delete(key)
     }
-    localStorage.setItem(STORAGE_KEY_NOTIFIED_ALERT_KEYS, JSON.stringify([...keys.entries()]))
+    safeSet(STORAGE_KEY_NOTIFIED_ALERT_KEYS, JSON.stringify([...keys.entries()]))
   } catch {
     // localStorage full or unavailable
   }
@@ -277,18 +374,12 @@ function saveNotifiedAlertKeys(keys: Map<string, number>): void {
 
 // Load from localStorage
 function loadFromStorage<T>(key: string, defaultValue: T): T {
-  try {
-    const stored = localStorage.getItem(key)
-    if (stored) {
-      return JSON.parse(stored)
-    }
-  } catch (e) {
-    console.error(`Failed to load ${key} from localStorage:`, e)
-  }
-  return defaultValue
+  return safeGetJSON(key, defaultValue)
 }
 
-// Save to localStorage
+// Save to localStorage with error logging (#7576).
+// Uses localStorage directly instead of safeSetJSON so errors are
+// observable rather than silently swallowed.
 function saveToStorage<T>(key: string, value: T): void {
   try {
     localStorage.setItem(key, JSON.stringify(value))
@@ -311,6 +402,8 @@ function saveAlerts(alerts: Alert[]): void {
     toSave = [...firing, ...resolved]
   }
 
+  // Use localStorage.setItem directly instead of safeSet so that
+  // QuotaExceededError propagates to our own catch block (#7576).
   try {
     localStorage.setItem(ALERTS_KEY, JSON.stringify(toSave))
   } catch (e) {
@@ -331,7 +424,7 @@ function saveAlerts(alerts: Alert[]): void {
         localStorage.setItem(ALERTS_KEY, JSON.stringify(pruned))
       } catch (retryError) {
         console.error('[Alerts] localStorage still full after pruning, clearing alerts', retryError)
-        localStorage.removeItem(ALERTS_KEY)
+        safeRemove(ALERTS_KEY)
       }
     } else {
       console.error(`Failed to save ${ALERTS_KEY} to localStorage:`, e)
@@ -352,7 +445,7 @@ interface AlertsContextValue {
   acknowledgeAlerts: (alertIds: string[], acknowledgedBy?: string) => void
   resolveAlert: (alertId: string) => void
   deleteAlert: (alertId: string) => void
-  runAIDiagnosis: (alertId: string) => string | null
+  runAIDiagnosis: (alertId: string) => Promise<string | null> | string | null
   evaluateConditions: () => void
   createRule: (rule: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt'>) => AlertRule
   updateRule: (id: string, updates: Partial<AlertRule>) => void
@@ -395,7 +488,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     isLoading: true,
     error: null })
 
-  const { startMission } = useMissions()
+  const { startMission, missions: allMissions } = useMissions()
   const { isDemoMode } = useDemoMode()
   const previousDemoMode = useRef(isDemoMode)
 
@@ -413,6 +506,10 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   // Stable ref for current alerts — lets evaluate* functions read without closure capture
   const alertsRef = useRef(alerts)
   alertsRef.current = alerts
+
+  // Stable ref for startMission — keeps runAIDiagnosis identity stable
+  const startMissionRef = useRef(startMission)
+  startMissionRef.current = startMission
 
   // Mutation accumulator — populated by evaluate* functions during an evaluation
   // cycle, then flushed in a single setAlerts call at the end of evaluateConditions.
@@ -453,15 +550,15 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let unmounted = false
     const fetchCronJobResults = async () => {
-      const token = localStorage.getItem(STORAGE_KEY_AUTH_TOKEN)
+      const token = safeGet(STORAGE_KEY_AUTH_TOKEN)
       if (!token || unmounted) return
       const currentClusters = clustersRef.current
       if (!currentClusters.length) return
 
+      // (#6857) Return { cluster, data } from each callback to avoid shared mutation.
       const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
-      const results: Record<string, GPUHealthCheckResult[]> = {}
 
-      await settledWithConcurrency(
+      const settled = await settledWithConcurrency(
         currentClusters.map((cluster) => async () => {
           try {
             const resp = await fetch(
@@ -471,14 +568,22 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
             if (resp.ok) {
               const data = await resp.json().catch(() => null)
               if (data?.results && data.results.length > 0) {
-                results[cluster.name] = data.results
+                return { cluster: cluster.name, data: data.results as GPUHealthCheckResult[] }
               }
             }
           } catch {
             // Silent — CronJob may not be installed on this cluster
           }
+          return null
         })
       )
+
+      const results: Record<string, GPUHealthCheckResult[]> = {}
+      for (const result of settled) {
+        if (result.status === 'fulfilled' && result.value) {
+          results[result.value.cluster] = result.value.data
+        }
+      }
 
       if (!unmounted) cronJobResultsRef.current = results
     }
@@ -590,7 +695,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   }, [isDemoMode])
 
   // Rule management
-  const createRule = (rule: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt'>) => {
+  const createRule = useCallback((rule: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt'>) => {
     const now = new Date().toISOString()
     const newRule: AlertRule = {
       ...rule,
@@ -599,9 +704,9 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
       updatedAt: now }
     setRules(prev => [...prev, newRule])
     return newRule
-  }
+  }, [])
 
-  const updateRule = (id: string, updates: Partial<AlertRule>) => {
+  const updateRule = useCallback((id: string, updates: Partial<AlertRule>) => {
     setRules(prev =>
       prev.map(rule =>
         rule.id === id
@@ -609,13 +714,13 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           : rule
       )
     )
-  }
+  }, [])
 
-  const deleteRule = (id: string) => {
+  const deleteRule = useCallback((id: string) => {
     setRules(prev => prev.filter(rule => rule.id !== id))
-  }
+  }, [])
 
-  const toggleRule = (id: string) => {
+  const toggleRule = useCallback((id: string) => {
     setRules(prev =>
       prev.map(rule =>
         rule.id === id
@@ -623,20 +728,23 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           : rule
       )
     )
-  }
+  }, [])
 
   // Calculate alert statistics — memoize to prevent unstable references in context consumers
+  // #7336 — Compute stats from deduplicated alerts so counters match
+  // the displayed alert list (which uses deduplicateAlerts).
   const stats: AlertStats = useMemo(() => {
-    const unacknowledgedFiring = alerts.filter(a => a.status === 'firing' && !a.acknowledgedAt)
+    const deduped = deduplicateAlerts(alerts, rules)
+    const unacknowledgedFiring = deduped.filter(a => a.status === 'firing' && !a.acknowledgedAt)
     return {
-      total: alerts.length,
+      total: deduped.length,
       firing: unacknowledgedFiring.length,
-      resolved: alerts.filter(a => a.status === 'resolved').length,
+      resolved: deduped.filter(a => a.status === 'resolved').length,
       critical: unacknowledgedFiring.filter(a => a.severity === 'critical').length,
       warning: unacknowledgedFiring.filter(a => a.severity === 'warning').length,
       info: unacknowledgedFiring.filter(a => a.severity === 'info').length,
-      acknowledged: alerts.filter(a => a.acknowledgedAt && a.status === 'firing').length }
-  }, [alerts])
+      acknowledged: deduped.filter(a => a.acknowledgedAt && a.status === 'firing').length }
+  }, [alerts, rules])
 
   // Get active (firing) alerts - exclude acknowledged alerts. Deduplicated via shared helper.
   const activeAlerts = useMemo(() => {
@@ -650,31 +758,31 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     return deduplicateAlerts(acked, rules)
   }, [alerts, rules])
 
-  // Acknowledge an alert
-  const acknowledgeAlert = (alertId: string, acknowledgedBy?: string) => {
+  // Acknowledge an alert — transitions signalType from 'state' to 'acknowledged' (#8750)
+  const acknowledgeAlert = useCallback((alertId: string, acknowledgedBy?: string) => {
     setAlerts(prev =>
       prev.map(alert =>
         alert.id === alertId
-          ? { ...alert, acknowledgedAt: new Date().toISOString(), acknowledgedBy }
+          ? { ...alert, acknowledgedAt: new Date().toISOString(), acknowledgedBy, signalType: 'acknowledged' as const }
           : alert
       )
     )
-  }
+  }, [])
 
-  // Acknowledge multiple alerts at once
-  const acknowledgeAlerts = (alertIds: string[], acknowledgedBy?: string) => {
+  // Acknowledge multiple alerts at once — transitions signalType to 'acknowledged' (#8750)
+  const acknowledgeAlerts = useCallback((alertIds: string[], acknowledgedBy?: string) => {
     const now = new Date().toISOString()
     setAlerts(prev =>
       prev.map(alert =>
         alertIds.includes(alert.id)
-          ? { ...alert, acknowledgedAt: now, acknowledgedBy }
+          ? { ...alert, acknowledgedAt: now, acknowledgedBy, signalType: 'acknowledged' as const }
           : alert
       )
     )
-  }
+  }, [])
 
   // Resolve an alert
-  const resolveAlert = (alertId: string) => {
+  const resolveAlert = useCallback((alertId: string) => {
     const resolvedAt = new Date().toISOString()
     // Find the alert BEFORE the state updater to avoid capturing mutable
     // variables inside the updater (which React may replay in Strict Mode /
@@ -690,23 +798,28 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     // Send resolution notifications outside the state updater.
     // Because we read alertToResolve from the ref before the updater,
     // this is safe even if React replays the updater function.
+    // Snapshot rule from ref before microtask to avoid stale closure.
     if (alertToResolve) {
+      const rule = rulesRef.current.find(r => r.id === alertToResolve.ruleId)
       queueMicrotask(() => {
-        const rule = rules.find(r => r.id === alertToResolve.ruleId)
         if (rule) {
-          const enabledChannels = rule.channels.filter(ch => ch.enabled)
+          const enabledChannels = (rule.channels || []).filter(ch => ch.enabled)
           if (enabledChannels.length > 0) {
-            sendNotifications(alertToResolve, enabledChannels).catch(() => {})
+            // #7330 — Send notification with updated resolved status, not the
+            // pre-update firing object. Without this, resolved notifications
+            // are sent with status: "firing".
+            const resolvedAlert: Alert = { ...alertToResolve, status: 'resolved', resolvedAt }
+            sendNotifications(resolvedAlert, enabledChannels).catch(() => {})
           }
         }
       })
     }
-  }
+  }, [])
 
   // Delete an alert
-  const deleteAlert = (alertId: string) => {
+  const deleteAlert = useCallback((alertId: string) => {
     setAlerts(prev => prev.filter(a => a.id !== alertId))
-  }
+  }, [])
 
   // Create a new alert — batching-aware.
   // When called during an evaluateConditions cycle (mutationAccRef.current is non-null),
@@ -723,7 +836,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
       resourceKind?: string
     ) => {
       const acc = mutationAccRef.current
-      const dedupKey = alertDedupKey(rule.id, rule.condition.type, cluster, resource)
+      const dedupKey = alertDedupKey(rule.id, rule.condition.type, cluster, resource, namespace)
 
       if (acc) {
         // ── Batched path: collect mutations, flush later ──────────────
@@ -733,12 +846,12 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
           a =>
             a.ruleId === rule.id &&
             a.status === 'firing' &&
-            alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource) === dedupKey
+            alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource, a.namespace) === dedupKey
         )
         // Also check if a create mutation for this key is already queued
         const alreadyQueued = acc.mutations.some(
           m => m.type === 'create' &&
-            alertDedupKey(m.alert.ruleId, m.rule.condition.type, m.alert.cluster, m.alert.resource) === dedupKey
+            alertDedupKey(m.alert.ruleId, m.rule.condition.type, m.alert.cluster, m.alert.resource, m.alert.namespace) === dedupKey
         )
 
         if (existingAlert) {
@@ -766,7 +879,8 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
             resource,
             resourceKind,
             firedAt: new Date().toISOString(),
-            isDemo: isDemoMode }
+            isDemo: isDemoMode,
+            signalType: 'state' }
           acc.mutations.push({ type: 'create', rule, alert })
 
           // Queue notification for after the flush
@@ -791,7 +905,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         a =>
           a.ruleId === rule.id &&
           a.status === 'firing' &&
-          alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource) === dedupKey
+          alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource, a.namespace) === dedupKey
       )
       // Determine upfront whether this will be a new alert (for notification purposes)
       const isNewAlert = !existingAlertForDedup
@@ -808,14 +922,15 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         resource,
         resourceKind,
         firedAt,
-        isDemo: isDemoMode }
+        isDemo: isDemoMode,
+        signalType: 'state' }
 
       setAlerts(prev => {
         const existingAlert = prev.find(
           a =>
             a.ruleId === rule.id &&
             a.status === 'firing' &&
-            alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource) === dedupKey
+            alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource, a.namespace) === dedupKey
         )
 
         if (existingAlert) {
@@ -891,7 +1006,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   // Send notifications for an alert (best-effort, silent on auth failures)
   const sendNotifications = async (alert: Alert, channels: AlertChannel[]) => {
     try {
-      const token = localStorage.getItem(STORAGE_KEY_AUTH_TOKEN)
+      const token = safeGet(STORAGE_KEY_AUTH_TOKEN)
       // Skip notification if not authenticated - notifications require login
       if (!token) return
 
@@ -901,6 +1016,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
           Authorization: `Bearer ${token}` },
         body: JSON.stringify({ alert, channels }),
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
@@ -926,7 +1042,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   const sendBatchedNotifications = async (items: Array<{ alert: Alert; channels: AlertChannel[] }>) => {
     if (items.length === 0) return
     try {
-      const token = localStorage.getItem(STORAGE_KEY_AUTH_TOKEN)
+      const token = safeGet(STORAGE_KEY_AUTH_TOKEN)
       if (!token) return
 
       const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
@@ -944,6 +1060,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
                 Authorization: `Bearer ${token}` },
               body: JSON.stringify({ alert, channels }),
               signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
@@ -963,91 +1080,151 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  // Run AI diagnosis on an alert
-  const runAIDiagnosis = (alertId: string) => {
-      const alert = alerts.find(a => a.id === alertId)
+  // ── Centralized browser notification dispatch (#8750, #8751, #8752) ──
+  // Replaces 6 inline dedup-check + sendNotificationWithDeepLink patterns
+  // that had inconsistent logic across evaluators.
+  const dispatchBrowserNotification = useCallback(
+    (params: BrowserNotificationParams) => {
+      const { rule, dedupKey, title, body, deepLinkParams } = params
+      if (!shouldDispatchBrowserNotification(rule, dedupKey, notifiedAlertKeysRef.current)) {
+        return
+      }
+      setNotifiedKey(dedupKey, Date.now())
+      sendNotificationWithDeepLink(title, body, deepLinkParams)
+    },
+    [setNotifiedKey]
+  )
+
+  // #7341 — Track in-flight diagnosis requests to prevent duplicate missions
+  const diagnosisInFlightRef = useRef<Set<string>>(new Set())
+
+  // Run AI diagnosis on an alert (#6915 — include runbook evidence in prompt)
+  const runAIDiagnosis = useCallback(async (alertId: string) => {
+      const alert = alertsRef.current.find(a => a.id === alertId)
       if (!alert) return null
 
-      // Look up matching runbook for this alert condition type
-      const rule = rules.find(r => r.id === alert.ruleId)
-      const conditionType = rule?.condition.type
-      const runbook = conditionType ? findRunbookForCondition(conditionType) : undefined
+      // #7341 — Idempotency guard: skip if diagnosis is already in-flight
+      if (diagnosisInFlightRef.current.has(alertId)) return null
+      diagnosisInFlightRef.current.add(alertId)
 
-      // If a runbook matches, execute it in the background to gather evidence
-      // and build an enriched prompt. Fall back to the default prompt otherwise.
-      const initialPrompt = `Please analyze this alert and provide diagnosis with suggestions:
+      // #7401 — Wrap entire async flow in try/finally so the in-flight
+      // flag is always cleared, even if an unexpected error occurs.
+      try {
+        // Look up matching runbook for this alert condition type
+        const rule = rulesRef.current.find(r => r.id === alert.ruleId)
+        const conditionType = rule?.condition.type
+        const runbook = conditionType ? findRunbookForCondition(conditionType) : undefined
+
+        const basePrompt = `Please analyze this alert and provide diagnosis with suggestions:
 
 Alert: ${alert.ruleName}
 Severity: ${alert.severity}
 Message: ${alert.message}
 Cluster: ${alert.cluster || 'N/A'}
 Resource: ${alert.resource || 'N/A'}
-Details: ${JSON.stringify(alert.details, null, 2)}
+Details: ${JSON.stringify(alert.details, null, 2)}`
+
+        // #6915 — If a runbook matches, execute it first and include the
+        // gathered evidence directly in the AI prompt so the diagnosis is
+        // grounded in real cluster data, not just the alert metadata.
+        let runbookEvidence = ''
+        if (runbook) {
+          try {
+            const result = await executeRunbook(runbook, {
+              cluster: alert.cluster,
+              namespace: alert.namespace,
+              resource: alert.resource,
+              resourceKind: alert.resourceKind,
+              alertMessage: alert.message })
+            if (result.enrichedPrompt) {
+              runbookEvidence = `\n\n--- Runbook Evidence (${runbook.title}) ---\n${result.enrichedPrompt}`
+              console.debug(`Runbook "${runbook.title}" gathered ${result.stepResults.length} evidence steps`)
+            }
+          } catch {
+            // Silent failure - runbook is best-effort enhancement
+          }
+        }
+
+        const initialPrompt = `${basePrompt}${runbookEvidence}
 
 Please provide:
 1. A summary of the issue
 2. The likely root cause
 3. Suggested actions to resolve this alert`
 
-      if (runbook) {
-        // Fire-and-forget: runbook evidence will enrich the AI prompt asynchronously
-        executeRunbook(runbook, {
+        const missionId = startMissionRef.current({
+          title: `Diagnose: ${alert.ruleName}`,
+          description: `Analyzing alert on ${alert.cluster || 'cluster'}`,
+          type: 'troubleshoot',
           cluster: alert.cluster,
-          namespace: alert.namespace,
-          resource: alert.resource,
-          resourceKind: alert.resourceKind,
-          alertMessage: alert.message }).then(result => {
-          if (result.enrichedPrompt) {
-            // The mission has already started; the enriched prompt will be
-            // available for subsequent AI interactions in the mission context.
-            console.debug(`Runbook "${runbook.title}" gathered ${result.stepResults.length} evidence steps`)
-          }
-        }).catch(() => {
-          // Silent failure - runbook is best-effort enhancement
-        })
-      }
+          initialPrompt,
+          context: {
+            alertId,
+            alertType: alert.ruleName,
+            details: alert.details,
+            runbookId: runbook?.id } })
 
-      const missionId = startMission({
-        title: `Diagnose: ${alert.ruleName}`,
-        description: `Analyzing alert on ${alert.cluster || 'cluster'}`,
-        type: 'troubleshoot',
-        cluster: alert.cluster,
-        initialPrompt,
-        context: {
-          alertId,
-          alertType: alert.ruleName,
-          details: alert.details,
-          runbookId: runbook?.id } })
-
-      setAlerts(prev =>
-        prev.map(a =>
-          a.id === alertId
-            ? {
-                ...a,
-                aiDiagnosis: {
-                  summary: 'AI is analyzing this alert...',
-                  rootCause: '',
-                  suggestions: [],
-                  missionId,
-                  analyzedAt: new Date().toISOString() } }
-            : a
+        setAlerts(prev =>
+          prev.map(a =>
+            a.id === alertId
+              ? {
+                  ...a,
+                  aiDiagnosis: {
+                    summary: 'AI is analyzing this alert...',
+                    rootCause: '',
+                    suggestions: [],
+                    missionId,
+                    analyzedAt: new Date().toISOString() } }
+              : a
+          )
         )
-      )
 
-      return missionId
-    }
+        return missionId
+      } finally {
+        // #7401 — Always clear in-flight flag so the alert is never
+        // permanently locked from future diagnosis attempts.
+        diagnosisInFlightRef.current.delete(alertId)
+      }
+    // All external deps accessed via refs for stable identity
+    }, [])
+
+  // #7337 — Reconcile AI diagnosis results back into alerts when the
+  // associated mission completes. Without this, alerts stay in the
+  // "AI is analyzing..." placeholder state indefinitely.
+  useEffect(() => {
+    setAlerts(prev => {
+      let changed = false
+      const updated = prev.map(a => {
+        if (!a.aiDiagnosis?.missionId) return a
+        const mission = allMissions.find(m => m.id === a.aiDiagnosis!.missionId)
+        if (!mission || mission.status !== 'completed') return a
+        // Extract diagnosis from the last assistant message
+        const lastAssistant = [...mission.messages].reverse().find(m => m.role === 'assistant')
+        if (!lastAssistant || a.aiDiagnosis.summary !== 'AI is analyzing this alert...') return a
+        changed = true
+        return {
+          ...a,
+          aiDiagnosis: {
+            ...a.aiDiagnosis,
+            summary: lastAssistant.content.slice(0, 500),
+            analyzedAt: new Date().toISOString() } }
+      })
+      return changed ? updated : prev
+    })
+  }, [allMissions])
 
   // Evaluate GPU usage condition — reads from refs for stable identity
   const evaluateGPUUsage = (rule: AlertRule) => {
       const threshold = rule.condition.threshold || 90
-      const currentClusters = clustersRef.current
-      const currentGPUNodes = gpuNodesRef.current
+      const currentClusters = clustersRef.current || []
+      const currentGPUNodes = gpuNodesRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
 
       for (const cluster of relevantClusters) {
-        const clusterGPUNodes = currentGPUNodes.filter(n => n.cluster.startsWith(cluster.name))
+        // #7335 — Use exact match instead of startsWith to prevent "prod" matching "prod-staging"
+        const clusterGPUNodes = currentGPUNodes.filter(n => n.cluster === cluster.name)
         const totalGPUs = clusterGPUNodes.reduce((sum, n) => sum + n.gpuCount, 0)
         const allocatedGPUs = clusterGPUNodes.reduce((sum, n) => sum + n.gpuAllocated, 0)
 
@@ -1075,14 +1252,25 @@ Please provide:
       }
     }
 
-  // Evaluate node ready condition — reads from refs for stable identity
+  // Evaluate node ready condition — reads from refs for stable identity.
+  //
+  // Unreachable clusters are skipped: their node state is unknown (we only
+  // have stale cached values) and pairing every "Cluster Unreachable" alert
+  // with a redundant "Node Not Ready" alert was reported as spurious noise
+  // by a user running 20+ offline clusters. Any already-firing node_ready
+  // alert for an unreachable cluster is auto-resolved so the list clears
+  // down to just the single authoritative Cluster Unreachable entry.
   const evaluateNodeReady = (rule: AlertRule) => {
-      const currentClusters = clustersRef.current
+      const currentClusters = clustersRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
 
       for (const cluster of relevantClusters) {
+        if (isClusterUnreachable(cluster)) {
+          queueAutoResolve(rule.id, cluster.name)
+          continue
+        }
         if (cluster.healthy === false) {
           createAlert(
             rule,
@@ -1109,7 +1297,7 @@ Please provide:
       // auto-resolve alerts whose pods have recovered or been removed.
       const stillFiringKeys = new Set<string>()
 
-      for (const issue of podIssuesRef.current) {
+      for (const issue of (podIssuesRef.current || [])) {
         if (issue.restarts && issue.restarts >= threshold) {
           const clusterMatch =
             !rule.condition.clusters?.length ||
@@ -1119,7 +1307,7 @@ Please provide:
             rule.condition.namespaces.includes(issue.namespace || '')
 
           if (clusterMatch && namespaceMatch) {
-            stillFiringKeys.add(alertDedupKey(rule.id, rule.condition.type, issue.cluster, issue.name))
+            stillFiringKeys.add(alertDedupKey(rule.id, rule.condition.type, issue.cluster, issue.name, issue.namespace))
             createAlert(
               rule,
               `Pod ${issue.name} has restarted ${issue.restarts} times (${issue.status})`,
@@ -1138,10 +1326,10 @@ Please provide:
 
       // Auto-resolve any firing pod_crash alerts whose pods are no longer above
       // the threshold (pod recovered, deleted, or restarts dropped).
-      const currentAlerts = alertsRef.current
+      const currentAlerts = alertsRef.current || []
       for (const a of currentAlerts) {
         if (a.ruleId === rule.id && a.status === 'firing') {
-          const key = alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource)
+          const key = alertDedupKey(a.ruleId, rule.condition.type, a.cluster, a.resource, a.namespace)
           if (!stillFiringKeys.has(key)) {
             const acc = mutationAccRef.current
             if (acc) {
@@ -1152,17 +1340,35 @@ Please provide:
       }
     }
 
-  // Evaluate weather alerts condition - mock implementation for demo purposes
-  // This is intentionally a demo feature to showcase conditional alerting capabilities
-  // Production deployments should disable weather alerts or replace with actual weather API
+  // Evaluate weather alerts condition — supports either a deterministic real-data
+  // path (when the rule provides `currentTemperature` / `currentWindSpeed` from a
+  // weather API) or an opt-in mock path (when `demoMode` is enabled).
+  //
+  // Issue 9255 — previously this unconditionally rolled a 10% random chance
+  // every evaluation cycle, so alerts appeared and auto-resolved randomly with
+  // no real trigger. Random firing is now gated behind `demoMode` so real
+  // deployments never see spurious alerts.
   const evaluateWeatherAlerts = useCallback(
     (rule: AlertRule) => {
-      // Mock weather data evaluation
-      // In production, this would integrate with a weather API
       const mockWeatherCondition = rule.condition.weatherCondition || 'severe_storm'
-      
-      // Randomly trigger alerts for demo purposes (10% chance)
-      const shouldAlert = Math.random() < 0.1
+      // Issue 9255 — demo-mode trigger probability per evaluation cycle
+      const DEMO_TRIGGER_PROBABILITY = 0.1
+
+      // Real-data path: if the rule has actual observed values, fire only when
+      // the threshold is crossed. This is the production-ready path when a
+      // weather API populates currentTemperature / currentWindSpeed.
+      let shouldAlert = false
+      if (mockWeatherCondition === 'extreme_heat' && rule.condition.currentTemperature !== undefined) {
+        const threshold = rule.condition.temperatureThreshold || DEFAULT_TEMPERATURE_THRESHOLD_F
+        shouldAlert = rule.condition.currentTemperature >= threshold
+      } else if (mockWeatherCondition === 'high_wind' && rule.condition.currentWindSpeed !== undefined) {
+        const threshold = rule.condition.windSpeedThreshold || DEFAULT_WIND_SPEED_THRESHOLD_MPH
+        shouldAlert = rule.condition.currentWindSpeed >= threshold
+      } else if (rule.condition.demoMode) {
+        // Opt-in demo path: keep the original random trigger so demo envs can
+        // still showcase conditional alerting without a real weather API.
+        shouldAlert = Math.random() < DEMO_TRIGGER_PROBABILITY
+      }
 
       if (shouldAlert) {
         let message = ''
@@ -1217,8 +1423,8 @@ Please provide:
 
   // Evaluate GPU Health CronJob — reads cached results from ref
   const evaluateGPUHealthCronJob = (rule: AlertRule) => {
-      const cachedResults = cronJobResultsRef.current
-      const currentClusters = clustersRef.current
+      const cachedResults = cronJobResultsRef.current || {}
+      const currentClusters = clustersRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
@@ -1258,23 +1464,18 @@ Please provide:
             'Node'
           )
 
-          // Send browser notification only once per alert (not on every evaluation cycle)
-          const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          if (
-            rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
-            (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
-          ) {
-            setNotifiedKey(notifKey, Date.now())
-            const firstNode = failedNodes[0]
-            sendNotificationWithDeepLink(
-              `GPU Health Alert: ${cluster.name}`,
-              `${totalIssues} issue(s) on ${failedNodes.length} GPU node(s)`,
-              {
-                drilldown: 'node',
-                cluster: cluster.name,
-                node: firstNode.nodeName }
-            )
-          }
+          // Browser notification via centralized dispatcher (#8751)
+          const firstNode = failedNodes[0]
+          dispatchBrowserNotification({
+            rule,
+            dedupKey: alertDedupKey(rule.id, rule.condition.type, cluster.name),
+            title: `GPU Health Alert: ${cluster.name}`,
+            body: `${totalIssues} issue(s) on ${failedNodes.length} GPU node(s)`,
+            deepLinkParams: {
+              drilldown: 'node',
+              cluster: cluster.name,
+              node: firstNode.nodeName },
+          })
         } else {
           // Auto-resolve if all nodes are healthy
           queueAutoResolve(rule.id, cluster.name)
@@ -1284,12 +1485,18 @@ Please provide:
 
   // Evaluate disk pressure condition — checks for DiskPressure in cluster issues
   const evaluateDiskPressure = (rule: AlertRule) => {
-      const currentClusters = clustersRef.current
+      const currentClusters = clustersRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
 
       for (const cluster of relevantClusters) {
+        // Skip unreachable clusters — cached issues are stale and pairing
+        // them with a Cluster Unreachable alert is misleading noise.
+        if (isClusterUnreachable(cluster)) {
+          queueAutoResolve(rule.id, cluster.name)
+          continue
+        }
         const diskPressureIssue = (cluster.issues || []).find(issue =>
           typeof issue === 'string' && issue.includes('DiskPressure')
         )
@@ -1313,23 +1520,16 @@ Please provide:
             'Cluster'
           )
 
-          // Send browser notification only once per alert (not on every evaluation cycle).
-          // notifiedAlertKeysRef tracks which (ruleId, cluster) combos already sent a notification.
-          const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          if (
-            rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
-            (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
-          ) {
-            setNotifiedKey(notifKey, Date.now())
-            sendNotificationWithDeepLink(
-              `Disk Pressure: ${cluster.name}`,
-              diskPressureIssue,
-              // Deep link to the affected node drilldown (not cluster_health card)
-              affectedNode
-                ? { drilldown: 'node', cluster: cluster.name, node: affectedNode, issue: 'DiskPressure' }
-                : { drilldown: 'cluster', cluster: cluster.name, issue: 'DiskPressure' }
-            )
-          }
+          // Browser notification via centralized dispatcher (#8751)
+          dispatchBrowserNotification({
+            rule,
+            dedupKey: alertDedupKey(rule.id, rule.condition.type, cluster.name),
+            title: `Disk Pressure: ${cluster.name}`,
+            body: diskPressureIssue,
+            deepLinkParams: affectedNode
+              ? { drilldown: 'node', cluster: cluster.name, node: affectedNode, issue: 'DiskPressure' }
+              : { drilldown: 'cluster', cluster: cluster.name, issue: 'DiskPressure' },
+          })
         } else {
           // Auto-resolve if DiskPressure clears — also clear the notification dedup key
           queueAutoResolve(rule.id, cluster.name)
@@ -1339,29 +1539,53 @@ Please provide:
 
   // Evaluate memory pressure condition — checks for MemoryPressure in cluster issues
   const evaluateMemoryPressure = (rule: AlertRule) => {
-      const currentClusters = clustersRef.current
+      const currentClusters = clustersRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
 
       for (const cluster of relevantClusters) {
+        // Skip unreachable clusters — cached issues are stale and pairing
+        // them with a Cluster Unreachable alert is misleading noise.
+        if (isClusterUnreachable(cluster)) {
+          queueAutoResolve(rule.id, cluster.name)
+          continue
+        }
         const memPressureIssue = (cluster.issues || []).find(issue =>
           typeof issue === 'string' && issue.includes('MemoryPressure')
         )
 
         if (memPressureIssue) {
+          // Extract node name from issue string (format: "MemoryPressure on node-name")
+          const nodeMatch = memPressureIssue.match(/on\s+(\S+)/)
+          const affectedNode = nodeMatch?.[1]
+
           createAlert(
             rule,
             `${cluster.name}: ${memPressureIssue}`,
             {
               clusterName: cluster.name,
               issue: memPressureIssue,
-              nodeCount: cluster.nodeCount },
+              nodeCount: cluster.nodeCount,
+              affectedNode },
             cluster.name,
             undefined,
             cluster.name,
             'Cluster'
           )
+
+          // Issue 9254 — memory pressure was missing the browser-notification
+          // dispatch that disk pressure has. Without this, users with browser
+          // notifications enabled never hear about memory pressure events.
+          dispatchBrowserNotification({
+            rule,
+            dedupKey: alertDedupKey(rule.id, rule.condition.type, cluster.name),
+            title: `Memory Pressure: ${cluster.name}`,
+            body: memPressureIssue,
+            deepLinkParams: affectedNode
+              ? { drilldown: 'node', cluster: cluster.name, node: affectedNode, issue: 'MemoryPressure' }
+              : { drilldown: 'cluster', cluster: cluster.name, issue: 'MemoryPressure' },
+          })
         } else {
           queueAutoResolve(rule.id, cluster.name)
         }
@@ -1370,13 +1594,13 @@ Please provide:
 
   // Evaluate DNS failures — checks for CoreDNS pods crashing or not ready
   const evaluateDNSFailure = (rule: AlertRule) => {
-      const currentPodIssues = podIssuesRef.current
+      const currentPodIssues = podIssuesRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? rule.condition.clusters
         : undefined
 
       // Find CoreDNS pods with issues (coredns, dns-default on OpenShift)
-      const dnsIssues = (currentPodIssues || []).filter(pod => {
+      const dnsIssues = currentPodIssues.filter(pod => {
         const isDNSPod = pod.name.includes('coredns') || pod.name.includes('dns-default')
         const matchesCluster = !relevantClusters || relevantClusters.includes(pod.cluster || '')
         return isDNSPod && matchesCluster
@@ -1404,23 +1628,19 @@ Please provide:
           'Pod'
         )
 
-        const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster)
-        if (
-          rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
-          (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
-        ) {
-          setNotifiedKey(notifKey, Date.now())
-          sendNotificationWithDeepLink(
-            `DNS Failure: ${cluster}`,
-            `${pods.length} CoreDNS pod(s) unhealthy — ${issues || 'check pod status'}`,
-            { drilldown: 'pod', cluster, namespace: pods[0].namespace, pod: pods[0].name }
-          )
-        }
+        // Browser notification via centralized dispatcher (#8751)
+        dispatchBrowserNotification({
+          rule,
+          dedupKey: alertDedupKey(rule.id, rule.condition.type, cluster),
+          title: `DNS Failure: ${cluster}`,
+          body: `${pods.length} CoreDNS pod(s) unhealthy — ${issues || 'check pod status'}`,
+          deepLinkParams: { drilldown: 'pod', cluster, namespace: pods[0].namespace, pod: pods[0].name },
+        })
       }
 
       // Auto-resolve clusters that no longer have DNS issues
       const clustersWithIssues = new Set(clusterDNSIssues.keys())
-      const currentAlerts = alertsRef.current
+      const currentAlerts = alertsRef.current || []
       for (const a of currentAlerts) {
         if (a.ruleId === rule.id && a.status === 'firing' && a.cluster && !clustersWithIssues.has(a.cluster)) {
           queueAutoResolve(rule.id, a.cluster)
@@ -1430,7 +1650,7 @@ Please provide:
 
   // Evaluate certificate errors — checks for clusters with certificate connection failures
   const evaluateCertificateError = (rule: AlertRule) => {
-      const currentClusters = clustersRef.current
+      const currentClusters = clustersRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
@@ -1451,27 +1671,18 @@ Please provide:
             'Cluster'
           )
 
-          const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          const isPersistent = PERSISTENT_CLUSTER_CONDITIONS.has(rule.condition.type)
-          const alreadyNotified = notifiedAlertKeysRef.current.has(notifKey)
-          const cooldownExpired = !alreadyNotified || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS
-          // Persistent cluster errors: notify once, suppress until recovery.
-          // Transient alerts: use the standard 5-minute cooldown.
-          const shouldNotify = isPersistent ? !alreadyNotified : cooldownExpired
-          if (
-            rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) && shouldNotify
-          ) {
-            setNotifiedKey(notifKey, Date.now())
-            sendNotificationWithDeepLink(
-              `Certificate Error: ${cluster.name}`,
-              cluster.errorMessage || 'TLS certificate validation failed',
-              { drilldown: 'cluster', cluster: cluster.name, issue: 'certificate' }
-            )
-          }
+          // Browser notification via centralized dispatcher (#8751)
+          // Persistent conditions are handled uniformly by shouldDispatchBrowserNotification
+          dispatchBrowserNotification({
+            rule,
+            dedupKey: alertDedupKey(rule.id, rule.condition.type, cluster.name),
+            title: `Certificate Error: ${cluster.name}`,
+            body: cluster.errorMessage || 'TLS certificate validation failed',
+            deepLinkParams: { drilldown: 'cluster', cluster: cluster.name, issue: 'certificate' },
+          })
         } else {
           // Auto-resolve if cert error clears — also clear dedup so next failure re-notifies
-          const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          deleteNotifiedKey(notifKey)
+          deleteNotifiedKey(alertDedupKey(rule.id, rule.condition.type, cluster.name))
           queueAutoResolve(rule.id, cluster.name)
         }
       }
@@ -1479,7 +1690,7 @@ Please provide:
 
   // Evaluate cluster unreachable — checks for clusters with network/auth/timeout failures
   const evaluateClusterUnreachable = (rule: AlertRule) => {
-      const currentClusters = clustersRef.current
+      const currentClusters = clustersRef.current || []
       const relevantClusters = rule.condition.clusters?.length
         ? currentClusters.filter(c => rule.condition.clusters!.includes(c.name))
         : currentClusters
@@ -1506,25 +1717,17 @@ Please provide:
             'Cluster'
           )
 
-          const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          const isPersistent = PERSISTENT_CLUSTER_CONDITIONS.has(rule.condition.type)
-          const alreadyNotified = notifiedAlertKeysRef.current.has(notifKey)
-          const cooldownExpired = !alreadyNotified || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS
-          const shouldNotify = isPersistent ? !alreadyNotified : cooldownExpired
-          if (
-            rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) && shouldNotify
-          ) {
-            setNotifiedKey(notifKey, Date.now())
-            sendNotificationWithDeepLink(
-              `Cluster Unreachable: ${cluster.name}`,
-              `${errorLabel}${cluster.lastSeen ? ` — last seen ${cluster.lastSeen}` : ''}`,
-              { drilldown: 'cluster', cluster: cluster.name, issue: 'unreachable' }
-            )
-          }
+          // Browser notification via centralized dispatcher (#8751)
+          dispatchBrowserNotification({
+            rule,
+            dedupKey: alertDedupKey(rule.id, rule.condition.type, cluster.name),
+            title: `Cluster Unreachable: ${cluster.name}`,
+            body: `${errorLabel}${cluster.lastSeen ? ` — last seen ${cluster.lastSeen}` : ''}`,
+            deepLinkParams: { drilldown: 'cluster', cluster: cluster.name, issue: 'unreachable' },
+          })
         } else if (cluster.reachable !== false) {
           // Auto-resolve when cluster becomes reachable — clear dedup so next failure re-notifies
-          const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          deleteNotifiedKey(notifKey)
+          deleteNotifiedKey(alertDedupKey(rule.id, rule.condition.type, cluster.name))
           queueAutoResolve(rule.id, cluster.name)
         }
       }
@@ -1532,13 +1735,13 @@ Please provide:
 
   // Evaluate nightly E2E failures — reads cached run data from ref
   const evaluateNightlyE2EFailure = (rule: AlertRule) => {
-      const guides = nightlyE2ERef.current
+      const guides = nightlyE2ERef.current || []
       if (!guides.length) return
 
       const currentRunIds = new Set<number>()
 
       for (const guide of guides) {
-        for (const run of guide.runs) {
+        for (const run of (guide.runs || [])) {
           currentRunIds.add(run.id)
 
           // Only alert on completed failures not already alerted
@@ -1576,19 +1779,14 @@ Please provide:
             'WorkflowRun'
           )
 
-          // Send browser notification only once per failed run (not on every evaluation cycle)
-          const notifKey = `${rule.id}::${guide.acronym}::${run.runNumber}`
-          if (
-            rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
-            (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
-          ) {
-            setNotifiedKey(notifKey, Date.now())
-            sendNotificationWithDeepLink(
-              `Nightly E2E Failed: ${guide.acronym} (${guide.platform})`,
-              `Run #${run.runNumber} failed — ${guide.guide}`,
-              { card: 'nightly_e2e_status' }
-            )
-          }
+          // Browser notification via centralized dispatcher (#8751)
+          dispatchBrowserNotification({
+            rule,
+            dedupKey: `${rule.id}::${guide.acronym}::${run.runNumber}`,
+            title: `Nightly E2E Failed: ${guide.acronym} (${guide.platform})`,
+            body: `Run #${run.runNumber} failed — ${guide.guide}`,
+            deepLinkParams: { card: 'nightly_e2e_status' },
+          })
         }
       }
 
@@ -1619,7 +1817,7 @@ Please provide:
     mutationAccRef.current = acc
 
     try {
-      const enabledRules = rulesRef.current.filter(r => r.enabled)
+      const enabledRules = (rulesRef.current || []).filter(r => r.enabled)
 
       for (const rule of enabledRules) {
         switch (rule.condition.type) {
@@ -1690,6 +1888,12 @@ Please provide:
   const evaluateConditionsRef = useRef(evaluateConditions)
   evaluateConditionsRef.current = evaluateConditions
 
+  // Stable proxy for evaluateConditions — delegates through ref so the
+  // identity never changes, even though the underlying callback has unstable deps.
+  const stableEvaluateConditions = useCallback(() => {
+    evaluateConditionsRef.current()
+  }, [])
+
   // Periodic evaluation (every 30 seconds) — stable, never re-creates timers
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -1706,7 +1910,7 @@ Please provide:
     }
   }, [])
 
-  const value: AlertsContextValue = {
+  const value = useMemo<AlertsContextValue>(() => ({
     alerts,
     activeAlerts,
     acknowledgedAlerts,
@@ -1720,11 +1924,17 @@ Please provide:
     resolveAlert,
     deleteAlert,
     runAIDiagnosis,
-    evaluateConditions,
+    evaluateConditions: stableEvaluateConditions,
     createRule,
     updateRule,
     deleteRule,
-    toggleRule }
+    toggleRule }), [
+    alerts, activeAlerts, acknowledgedAlerts, stats, rules,
+    isEvaluating, isLoadingData, dataError,
+    acknowledgeAlert, acknowledgeAlerts, resolveAlert, deleteAlert,
+    runAIDiagnosis, stableEvaluateConditions,
+    createRule, updateRule, deleteRule, toggleRule
+  ])
 
   return (
     <AlertsContext.Provider value={value}>

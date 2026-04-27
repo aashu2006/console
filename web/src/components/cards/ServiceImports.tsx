@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { CheckCircle2, XCircle, AlertCircle, ExternalLink, Globe } from 'lucide-react'
 import { ClusterBadge } from '../ui/ClusterBadge'
 import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
@@ -8,67 +9,7 @@ import type { ServiceImport, ServiceImportType } from '../../types/mcs'
 import { useCardLoadingState } from './CardDataContext'
 import { DynamicCardErrorBoundary } from './DynamicCardErrorBoundary'
 import { useTranslation } from 'react-i18next'
-
-// Demo data for MCS ServiceImports
-const DEMO_IMPORTS: ServiceImport[] = [
-  {
-    name: 'api-gateway',
-    namespace: 'production',
-    cluster: 'us-west-2',
-    sourceCluster: 'us-east-1',
-    type: 'ClusterSetIP',
-    dnsName: 'api-gateway.production.svc.clusterset.local',
-    ports: [{ name: 'http', protocol: 'TCP', port: 8080 }],
-    endpoints: 3,
-    createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() },
-  {
-    name: 'auth-service',
-    namespace: 'production',
-    cluster: 'eu-central-1',
-    sourceCluster: 'us-east-1',
-    type: 'ClusterSetIP',
-    dnsName: 'auth-service.production.svc.clusterset.local',
-    ports: [{ name: 'grpc', protocol: 'TCP', port: 9090 }],
-    endpoints: 2,
-    createdAt: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString() },
-  {
-    name: 'cache-redis',
-    namespace: 'infrastructure',
-    cluster: 'us-east-1',
-    sourceCluster: 'us-west-2',
-    type: 'Headless',
-    dnsName: 'cache-redis.infrastructure.svc.clusterset.local',
-    ports: [{ name: 'redis', protocol: 'TCP', port: 6379 }],
-    endpoints: 1,
-    createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString() },
-  {
-    name: 'metrics-collector',
-    namespace: 'monitoring',
-    cluster: 'ap-southeast-1',
-    sourceCluster: 'us-east-1',
-    type: 'ClusterSetIP',
-    dnsName: 'metrics-collector.monitoring.svc.clusterset.local',
-    ports: [{ name: 'metrics', protocol: 'TCP', port: 9100 }],
-    endpoints: 4,
-    createdAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString() },
-  {
-    name: 'database-proxy',
-    namespace: 'data',
-    cluster: 'eu-central-1',
-    sourceCluster: 'us-west-2',
-    type: 'ClusterSetIP',
-    dnsName: 'database-proxy.data.svc.clusterset.local',
-    ports: [{ name: 'postgres', protocol: 'TCP', port: 5432 }],
-    endpoints: 0,
-    createdAt: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString() },
-]
-
-const DEMO_STATS = {
-  totalImports: 15,
-  withEndpoints: 12,
-  noEndpoints: 3,
-  clusterSetIP: 13,
-  headless: 2 }
+import { useServiceImportsCard } from '../../hooks/useServiceImportsCard'
 
 const getEndpointStatus = (endpoints: number) => {
   if (endpoints > 0) {
@@ -109,15 +50,31 @@ interface ServiceImportsProps {
 function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
   const { t } = useTranslation(['cards', 'common'])
   const SORT_OPTIONS = SORT_OPTIONS_KEYS.map(opt => ({ value: opt.value, label: String(t(opt.labelKey)) }))
-  // Demo data - always available, never loading/erroring
-  const isLoading = false
-  const hasError = false
+
+  // Fetch real ServiceImport data with demo fallback
+  const { imports: allImports, isLoading, isDemoData, isFailed, consecutiveFailures, refetch } = useServiceImportsCard()
+  const hasError = isFailed
+
+  // Compute stats from real data
+  const stats = useMemo(() => {
+    const items = allImports || []
+    const withEndpoints = items.filter(i => i.endpoints > 0).length
+    const noEndpoints = items.filter(i => i.endpoints === 0).length
+    return {
+      totalImports: items.length,
+      withEndpoints,
+      noEndpoints,
+    }
+  }, [allImports])
 
   // Report loading state to CardWrapper for skeleton/refresh behavior
+  const hasData = (allImports || []).length > 0
   useCardLoadingState({
-    isLoading,
-    hasAnyData: DEMO_IMPORTS.length > 0,
-    isDemoData: true })
+    isLoading: isLoading && !hasData,
+    hasAnyData: hasData,
+    isDemoData,
+    isFailed,
+    consecutiveFailures })
 
   const {
     items: filteredImports,
@@ -131,7 +88,7 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
     filters,
     sorting,
     containerRef,
-    containerStyle } = useCardData<ServiceImport, SortByOption>(DEMO_IMPORTS, {
+    containerStyle } = useCardData<ServiceImport, SortByOption>(allImports || [], {
     filter: {
       searchFields: ['name', 'namespace', 'cluster', 'sourceCluster', 'dnsName', 'type'],
       clusterField: 'cluster',
@@ -146,7 +103,7 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
   if (isLoading) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <Skeleton variant="text" width={120} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -166,7 +123,7 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
         <AlertCircle className="w-12 h-12 text-red-400 mb-4" />
         <p className="text-sm text-muted-foreground mb-4">{t('serviceImports.loadFailed')}</p>
         <button
-          onClick={() => window.location.reload()}
+          onClick={() => refetch()}
           className="px-4 py-2 rounded-lg bg-purple-500 hover:bg-purple-600 text-white text-sm"
         >
           {t('common:common.retry')}
@@ -178,7 +135,7 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
   return (
     <div className="h-full flex flex-col min-h-card">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-2 flex-shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 shrink-0">
         <div className="flex items-center gap-2">
           <a
             href={K8S_DOCS.mcsApi}
@@ -190,7 +147,7 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
             <ExternalLink className="w-4 h-4" />
           </a>
           <span className="text-sm font-medium text-muted-foreground">
-            {t('serviceImports.nImports', { count: DEMO_STATS.totalImports })}
+            {t('serviceImports.nImports', { count: stats.totalImports })}
           </span>
         </div>
         <CardControlsRow
@@ -217,38 +174,40 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
         />
       </div>
 
-      {/* MCS Integration Notice */}
-      <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-xs">
-        <AlertCircle className="w-4 h-4 text-cyan-400 flex-shrink-0 mt-0.5" />
-        <div>
-          <p className="text-cyan-400 font-medium">{t('serviceImports.mcsTitle')}</p>
-          <p className="text-muted-foreground">
-            {t('serviceImports.mcsDesc')}{' '}
-            <a
-              href={K8S_DOCS.mcsApiServiceImport}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-purple-400 hover:underline"
-            >
-              {t('serviceImports.learnMore')}
-            </a>
-          </p>
+      {/* MCS Integration Notice — only shown when no real data detected */}
+      {isDemoData && (
+        <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-xs">
+          <AlertCircle className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+          <div>
+            <p className="text-cyan-400 font-medium">{t('serviceImports.mcsTitle')}</p>
+            <p className="text-muted-foreground">
+              {t('serviceImports.mcsDesc')}{' '}
+              <a
+                href={K8S_DOCS.mcsApiServiceImport}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-purple-400 hover:underline"
+              >
+                {t('serviceImports.learnMore')}
+              </a>
+            </p>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Stats */}
-      <div className="grid grid-cols-3 gap-2 mb-3">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-3">
         <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-center">
           <p className="text-2xs text-cyan-400">{t('serviceImports.imports')}</p>
-          <p className="text-lg font-bold text-foreground">{DEMO_STATS.totalImports}</p>
+          <p className="text-lg font-bold text-foreground">{stats.totalImports}</p>
         </div>
         <div className="p-2 rounded-lg bg-green-500/10 border border-green-500/20 text-center">
           <p className="text-2xs text-green-400">{t('common:common.healthy')}</p>
-          <p className="text-lg font-bold text-foreground">{DEMO_STATS.withEndpoints}</p>
+          <p className="text-lg font-bold text-foreground">{stats.withEndpoints}</p>
         </div>
         <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/20 text-center">
           <p className="text-2xs text-red-400">{t('serviceImports.noEndpoints')}</p>
-          <p className="text-lg font-bold text-foreground">{DEMO_STATS.noEndpoints}</p>
+          <p className="text-lg font-bold text-foreground">{stats.noEndpoints}</p>
         </div>
       </div>
 
@@ -270,7 +229,7 @@ function ServiceImportsInternal({ config: _config }: ServiceImportsProps) {
               key={`${imp.cluster}-${imp.namespace}-${imp.name}-${idx}`}
               className="p-2.5 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors"
             >
-              <div className="flex items-center justify-between mb-1">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                 <div className="flex items-center gap-2">
                   <EndpointIcon className={`w-4 h-4 ${endpointStatus.color}`} />
                   <span className="text-sm font-medium text-foreground truncate">{imp.name}</span>

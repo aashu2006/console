@@ -5,10 +5,11 @@ import { useClusters, useHelmReleases, useOperatorSubscriptions } from '../../ho
 import { StatusIndicator } from '../charts/StatusIndicator'
 import { useToast } from '../ui/Toast'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { RefreshCw, GitBranch, FolderGit, Box, Loader2 } from 'lucide-react'
 import { SyncDialog } from './SyncDialog'
-import { api } from '../../lib/api'
+import { LOCAL_AGENT_HTTP_URL, STORAGE_KEY_TOKEN } from '../../lib/constants'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
+import { FETCH_DEFAULT_TIMEOUT_MS } from '../../lib/constants/network'
 import { getDemoMode } from '../../hooks/useDemoMode'
 import { StatBlockValue } from '../ui/StatsOverview'
 import { DashboardPage } from '../../lib/dashboards/DashboardPage'
@@ -79,7 +80,7 @@ function getTimeAgo(timestamp: string | undefined, t: TFunction): string {
   const now = new Date()
   const then = new Date(timestamp)
   const diffMs = now.getTime() - then.getTime()
-  const diffMins = Math.floor(diffMs / 60000)
+  const diffMins = Math.floor(diffMs / MS_PER_MINUTE)
   const diffHours = Math.floor(diffMins / 60)
   if (diffHours > 0) return t('gitops.hoursAgo', { count: diffHours })
   if (diffMins > 0) return t('gitops.minutesAgo', { count: diffMins })
@@ -92,7 +93,6 @@ export function GitOps() {
   const { releases: helmReleases } = useHelmReleases()
   const { subscriptions: operatorSubs } = useOperatorSubscriptions()
   const { drillToAllHelm, drillToAllOperators } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
   const { showToast } = useToast()
 
   // Local state
@@ -193,23 +193,42 @@ export function GitOps() {
 
       // Run drift checks in parallel with individual timeouts instead of
       // sequential requests, reducing total latency significantly.
+      // #7993 Phase 4: drift detection moved to kc-agent — calls go to the
+      // local agent process running under the user's kubeconfig.
+      const token = localStorage.getItem(STORAGE_KEY_TOKEN)
+      const agentAuthHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      }
+      if (token) agentAuthHeaders['Authorization'] = `Bearer ${token}`
       const promises = configs.map(async (appConfig) => {
         try {
-          const response = await api.post<{
+          const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/gitops/detect-drift`, {
+            method: 'POST',
+            headers: agentAuthHeaders,
+            body: JSON.stringify({
+              repoUrl: appConfig.repoUrl,
+              path: appConfig.path,
+              namespace: appConfig.namespace,
+              cluster: appConfig.cluster || undefined,
+            }),
+            signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+          })
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}))
+            throw new Error(errBody.error || `detect-drift failed (HTTP ${res.status})`)
+          }
+          const data = (await res.json()) as {
             drifted: boolean
             resources: DriftResult['resources']
             rawDiff?: string
-          }>('/api/gitops/detect-drift', {
-            repoUrl: appConfig.repoUrl,
-            path: appConfig.path,
-            namespace: appConfig.namespace,
-            cluster: appConfig.cluster || undefined })
+          }
           return {
             name: appConfig.name,
             result: {
               status: 'ok' as const,
-              drifted: response.data.drifted,
-              resources: response.data.resources || [] } satisfies DriftResult }
+              drifted: data.drifted,
+              resources: data.resources || [] } satisfies DriftResult }
         } catch (e) {
           // #6156 — Failed drift checks MUST NOT be coerced to
           // `drifted: false` — that rendered as "synced + healthy" (false
@@ -397,7 +416,7 @@ export function GitOps() {
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   // Filters and Apps List - rendered before cards
   const filtersAndAppsList = (

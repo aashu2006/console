@@ -44,7 +44,6 @@ import { useModalState } from '../../lib/modals'
 import { formatCardTitle } from '../../lib/formatCardTitle'
 import { StatsOverview, StatBlockValue } from '../ui/StatsOverview'
 import { getClusterHealthState, isClusterUnreachable } from '../clusters/utils'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { useRefreshIndicator } from '../../hooks/useRefreshIndicator'
 import { DashboardHeader } from '../shared/DashboardHeader'
 import { DashboardHealthIndicator } from './DashboardHealthIndicator'
@@ -67,13 +66,15 @@ const NARROW_MAX = 1023
 const MIN_NARROW_COLS = 6
 
 /**
- * Minimum pixel height a non-collapsed sortable card cell should occupy.
- * Mirrors the legacy `auto-rows-[minmax(180px,auto)]` baseline so expanded
- * cards keep their previous look now that the grid container uses
- * `auto-rows-min` (which is required so collapsed cards can shrink and let
- * neighbours pack upward — see issue #6072).
+ * Minimum pixel height contributed by ONE row of card span. Effective
+ * min-height = posH × this constant, so the "Resize height" menu has a
+ * visible effect on `auto-rows-min` grids (#8289, #8298). Mirrors the
+ * legacy `auto-rows-[minmax(180px,auto)]` baseline (180px per row).
  */
-const EXPANDED_CARD_MIN_HEIGHT_PX = 180
+const EXPANDED_CARD_ROW_MIN_HEIGHT_PX = 180
+
+/** Default row span when a card has no persisted position.h */
+const DEFAULT_CARD_ROW_SPAN = 2
 
 // Sortable card component
 interface SortableCardProps {
@@ -81,6 +82,7 @@ interface SortableCardProps {
   onConfigure: () => void
   onRemove: () => void
   onWidthChange: (newWidth: number) => void
+  onHeightChange: (newHeight: number) => void
   isDragging?: boolean
   isRefreshing?: boolean
   onRefresh?: () => void
@@ -89,7 +91,7 @@ interface SortableCardProps {
   onInsertAfter?: () => void
 }
 
-function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, isRefreshing, onRefresh, lastUpdated, onInsertBefore: _onInsertBefore, onInsertAfter }: SortableCardProps) {
+function SortableCard({ card, onConfigure, onRemove, onWidthChange, onHeightChange, isDragging, isRefreshing, onRefresh, lastUpdated, onInsertBefore: _onInsertBefore, onInsertAfter }: SortableCardProps) {
   const { t } = useTranslation()
   const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id: card.id })
 
@@ -110,18 +112,23 @@ function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, 
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const effectiveW = isNarrowRange && (card.position?.w || 4) < MIN_NARROW_COLS ? MIN_NARROW_COLS : (card.position?.w || 4)
+  const posH = card.position?.h || DEFAULT_CARD_ROW_SPAN
 
   // Read collapse state so the cell can drop its minimum height when the
   // card is collapsed (#6072). Without this, the grid leaves dead space
   // under collapsed cards because every cell is forced to the expanded
   // baseline height.
   const { isCollapsed } = useCardCollapse(card.id)
+  const effectiveRowSpan = isCollapsed ? 1 : posH
 
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
     gridColumn: `span ${effectiveW}`,
-    minHeight: isCollapsed ? undefined : `${EXPANDED_CARD_MIN_HEIGHT_PX}px`,
+    gridRow: `span ${effectiveRowSpan}`,
+    // Scale min-height by posH so the "Resize height" menu actually changes
+    // the card's visual height on an auto-rows-min grid (#8289, #8298).
+    minHeight: isCollapsed ? undefined : `${posH * EXPANDED_CARD_ROW_MIN_HEIGHT_PX}px`,
     opacity: isDragging ? 0.5 : 1 }
 
   const CardComponent = CARD_COMPONENTS[card.card_type]
@@ -132,7 +139,7 @@ function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, 
         {onInsertAfter && (
           <button
             onClick={(e) => { e.stopPropagation(); onInsertAfter() }}
-            className="absolute -top-2 -right-2 z-20 opacity-0 group-hover/card:opacity-100 transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
+            className="absolute top-1/2 -translate-y-1/2 right-2 z-20 opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
             aria-label="Add card"
             title="Add card here"
           >
@@ -146,7 +153,9 @@ function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, 
           onConfigure={onConfigure}
           onRemove={onRemove}
           onWidthChange={onWidthChange}
+          onHeightChange={onHeightChange}
           cardWidth={effectiveW}
+          cardHeight={card.position?.h || 2}
           isRefreshing={isRefreshing}
           onRefresh={onRefresh}
           lastUpdated={lastUpdated}
@@ -164,7 +173,7 @@ function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, 
       {onInsertAfter && (
         <button
           onClick={(e) => { e.stopPropagation(); onInsertAfter() }}
-          className="absolute -top-2 -right-2 z-20 opacity-0 group-hover/card:opacity-100 transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
+          className="absolute top-1/2 -translate-y-1/2 right-2 z-20 opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
           aria-label="Add card"
           title="Add card here"
         >
@@ -186,7 +195,9 @@ function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, 
         onConfigure={onConfigure}
         onRemove={onRemove}
         onWidthChange={onWidthChange}
+        onHeightChange={onHeightChange}
         cardWidth={effectiveW}
+        cardHeight={card.position?.h || 2}
         isRefreshing={isRefreshing}
         onRefresh={onRefresh}
         lastUpdated={lastUpdated}
@@ -258,8 +269,7 @@ export function CustomDashboard() {
     }
   }
 
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
-  const getStatValue = createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)
+  const getStatValue = getDashboardStatValue
 
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [cards, setCards] = useState<Card[]>([])
@@ -448,8 +458,9 @@ export function CustomDashboard() {
       try {
         await api.delete(`/api/dashboards/${id}/cards/${cardId}`)
       } catch (error) {
-        console.error('Failed to delete card:', error)
-        showToast('Failed to delete card from backend', 'error')
+        // Card is already removed from UI state above — backend failure is
+        // non-critical. Log for debugging but don't alarm the user. (#8564)
+        console.debug('Backend card deletion failed (card already removed from UI):', error)
       }
     }
   }
@@ -472,6 +483,13 @@ export function CustomDashboard() {
     snapshot(cardsRef.current)
     setCards(prev => prev.map(c =>
       c.id === cardId ? { ...c, position: { ...c.position, w: newWidth } } : c
+    ))
+  }
+
+  const handleHeightChange = (cardId: string, newHeight: number) => {
+    snapshot(cardsRef.current)
+    setCards(prev => prev.map(c =>
+      c.id === cardId ? { ...c, position: { ...c.position, h: newHeight } } : c
     ))
   }
 
@@ -669,6 +687,7 @@ export function CustomDashboard() {
                   onConfigure={() => handleConfigureCard(card)}
                   onRemove={() => handleRemoveCard(card.id)}
                   onWidthChange={(w) => handleWidthChange(card.id, w)}
+                  onHeightChange={(h) => handleHeightChange(card.id, h)}
                   isDragging={activeId === card.id}
                   isRefreshing={isRefreshing}
                   onRefresh={triggerRefresh}
@@ -767,7 +786,7 @@ export function CustomDashboard() {
         />
         <BaseModal.Content>
           <div className="flex items-start gap-3 p-4 rounded-lg bg-red-500/10 border border-red-500/20">
-            <AlertTriangle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+            <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
             <div>
               <p className="text-sm text-foreground font-medium">{t('dashboard.delete.warning')}</p>
               <p className="text-sm text-muted-foreground mt-1">

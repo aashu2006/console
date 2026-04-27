@@ -1,19 +1,38 @@
 import { useState, useEffect } from 'react'
 import { Bot } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { useMissions } from '../../../hooks/useMissions'
+import { isAgentConnected } from '../../../hooks/useLocalAgent'
 import { useToast } from '../../ui/Toast'
+import { getSettingsWithHash } from '../../../config/routes'
+import { emitError } from '../../../lib/analytics'
 
 export const ANTHROPIC_KEY_STORAGE = 'kubestellar-anthropic-key'
+
+// Hash anchor for the API Keys section on the Settings page.
+// Matches `id="api-keys-settings"` in components/settings/sections/APIKeysSection.tsx.
+// Settings.tsx scrolls to the matching element on mount when the URL hash is set.
+const SETTINGS_API_KEYS_HASH = 'api-keys-settings'
 
 // Hook to check if any AI agent is available (API-based or CLI-based)
 export function useApiKeyCheck() {
   const { showToast } = useToast()
+  const navigate = useNavigate()
   const [showKeyPrompt, setShowKeyPrompt] = useState(false)
-  const { agents, selectedAgent, openSidebar } = useMissions()
+  const { agents, selectedAgent } = useMissions()
 
   // Check if any agent is available (bob, claude CLI, or API-based)
   const hasAvailableAgent = () => {
-    // First check if any agent in the list is available
+    // #8093 — A locally-connected kc-agent (the same thing the top-nav AI badge
+    // reports as "Connected") is sufficient to run AI-powered actions like the
+    // Cluster Health "Repair" button. The useMissions WebSocket-derived agents
+    // list can be empty even when the local agent is healthy (e.g. before the
+    // WS handshake completes, or when the agent only exposes API providers
+    // without a CLI agent), so we check the local-agent HTTP health state too.
+    if (isAgentConnected()) {
+      return true
+    }
+    // Then check if any agent in the WS-reported list is available
     if (agents.some(a => a.available)) {
       return true
     }
@@ -41,8 +60,10 @@ export function useApiKeyCheck() {
 
   const goToSettings = () => {
     setShowKeyPrompt(false)
-    // Open the sidebar which has agent settings
-    openSidebar()
+    // #8093 — Previously this opened the AI Missions sidebar, which has no
+    // agent selector. Route directly to Settings → API Keys instead so users
+    // can configure a provider when no agent is detected.
+    navigate(getSettingsWithHash(SETTINGS_API_KEYS_HASH))
   }
 
   const dismissPrompt = () => {
@@ -67,6 +88,7 @@ export function ApiKeyPromptModal({ isOpen, onDismiss, onGoToSettings }: {
 }) {
   useEffect(() => {
     if (!isOpen) return
+    emitError('config', 'No AI agent available. Please configure an API key')
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation()
@@ -80,7 +102,7 @@ export function ApiKeyPromptModal({ isOpen, onDismiss, onGoToSettings }: {
   if (!isOpen) return null
 
   return (
-    <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/50 backdrop-blur-sm rounded-lg">
+    <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/50 backdrop-blur-xs rounded-lg">
       <div className="bg-card border border-border rounded-lg p-4 m-4 shadow-xl max-w-sm">
         <div className="flex items-center gap-2 mb-3">
           <div className="p-1.5 rounded bg-purple-500/20">

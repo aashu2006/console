@@ -1,9 +1,13 @@
 import { test, expect, Page } from '@playwright/test'
+import { mockApiFallback } from './helpers/setup'
 
 /**
  * Sets up authentication and MCP mocks for sidebar tests
  */
 async function setupSidebarTest(page: Page) {
+  // Catch-all API mock prevents unmocked requests hanging in webkit/firefox
+  await mockApiFallback(page)
+
   // Mock authentication
   await page.route('**/api/me', (route) =>
     route.fulfill({
@@ -43,10 +47,14 @@ async function setupSidebarTest(page: Page) {
     }
   })
 
-  // Set auth token
-  await page.goto('/login')
-  await page.evaluate(() => {
+  // Seed localStorage BEFORE any page script runs so the auth guard sees
+  // the token on first execution. page.evaluate() runs after the page has
+  // already parsed and executed scripts, which is too late for webkit/Safari
+  // where the auth redirect fires synchronously on script evaluation.
+  // page.addInitScript() injects the snippet ahead of any page code (#9096).
+  await page.addInitScript(() => {
     localStorage.setItem('token', 'test-token')
+    localStorage.setItem('kc-demo-mode', 'true')
     localStorage.setItem('demo-user-onboarded', 'true')
   })
 
@@ -62,8 +70,9 @@ test.describe('Sidebar Navigation', () => {
   test.describe('Navigation Links', () => {
     test('displays sidebar with primary navigation', async ({ page }) => {
       // Wait for sidebar to be visible
-      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 10000 })
-      await expect(page.getByTestId('sidebar-primary-nav')).toBeVisible()
+      const SIDEBAR_TIMEOUT_MS = 10_000
+      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
+      await expect(page.getByTestId('sidebar-primary-nav')).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
 
       // Should have navigation links
       const navLinks = page.getByTestId('sidebar-primary-nav').locator('a')
@@ -72,41 +81,50 @@ test.describe('Sidebar Navigation', () => {
     })
 
     test('dashboard link navigates to home', async ({ page }) => {
-      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 10000 })
+      const SIDEBAR_TIMEOUT_MS = 10_000
+      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
+
+      // Navigate away first — in webkit, clicking <a href="/"> when already
+      // on "/" hangs because no navigation event fires.
+      await page.goto('/clusters')
+      await page.waitForLoadState('domcontentloaded')
+      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
 
       // Find dashboard link by href since sidebar uses NavLink with icons + text
       const dashboardLink = page.getByTestId('sidebar-primary-nav').locator('a[href="/"]').first()
-      await expect(dashboardLink).toBeVisible({ timeout: 5000 })
+      await expect(dashboardLink).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
       await dashboardLink.click()
 
       // Should be on dashboard
-      await expect(page).toHaveURL(/^\/$/, { timeout: 5000 })
+      await expect(page).toHaveURL(/\/$/, { timeout: SIDEBAR_TIMEOUT_MS })
     })
 
     test('clusters link navigates to clusters page', async ({ page }) => {
-      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 10000 })
+      const SIDEBAR_TIMEOUT_MS = 10_000
+      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
 
-      // Find clusters link by href
+      // Find clusters link by href — fall back to sidebar-scoped locator
       const clustersLink = page.getByTestId('sidebar-primary-nav').locator('a[href="/clusters"]').first()
         .or(page.getByTestId('sidebar').locator('a[href="/clusters"]').first())
-      await expect(clustersLink).toBeVisible({ timeout: 5000 })
+      await expect(clustersLink).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
       await clustersLink.click()
 
       // Should be on clusters page
-      await expect(page).toHaveURL(/\/clusters/, { timeout: 5000 })
+      await expect(page).toHaveURL(/\/clusters/, { timeout: SIDEBAR_TIMEOUT_MS })
     })
 
     test('events link navigates to events page', async ({ page }) => {
-      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 10000 })
+      const SIDEBAR_TIMEOUT_MS = 10_000
+      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
 
-      // Find events link by href
+      // Find events link by href — fall back to sidebar-scoped locator
       const eventsLink = page.getByTestId('sidebar-primary-nav').locator('a[href="/events"]').first()
         .or(page.getByTestId('sidebar').locator('a[href="/events"]').first())
-      await expect(eventsLink).toBeVisible({ timeout: 5000 })
+      await expect(eventsLink).toBeVisible({ timeout: SIDEBAR_TIMEOUT_MS })
       await eventsLink.click()
 
       // Should be on events page
-      await expect(page).toHaveURL(/\/events/, { timeout: 5000 })
+      await expect(page).toHaveURL(/\/events/, { timeout: SIDEBAR_TIMEOUT_MS })
     })
   })
 
@@ -118,8 +136,9 @@ test.describe('Sidebar Navigation', () => {
       const collapseToggle = page.getByTestId('sidebar-collapse-toggle')
       await expect(collapseToggle).toBeVisible()
 
-      // Get initial sidebar width
-      const initialWidth = await page.getByTestId('sidebar').evaluate(el => el.offsetWidth)
+      // The toggle button exposes aria-expanded reflecting the sidebar state.
+      // Assert expanded before click, collapsed after — no brittle offsetWidth. #9525
+      await expect(collapseToggle).toHaveAttribute('aria-expanded', 'true')
 
       // Click to collapse
       await collapseToggle.click()
@@ -127,9 +146,8 @@ test.describe('Sidebar Navigation', () => {
       // Wait for sidebar to finish collapsing — Add Card button hides when collapsed
       await expect(page.getByTestId('sidebar-add-card')).not.toBeVisible({ timeout: 5000 })
 
-      // Sidebar should be narrower when collapsed
-      const collapsedWidth = await page.getByTestId('sidebar').evaluate(el => el.offsetWidth)
-      expect(collapsedWidth).toBeLessThan(initialWidth)
+      // Verify the toggle now reports collapsed state
+      await expect(collapseToggle).toHaveAttribute('aria-expanded', 'false')
     })
 
     test('sidebar can be expanded after collapse', async ({ page }) => {
@@ -318,15 +336,18 @@ test.describe('Sidebar Navigation', () => {
       await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 10000 })
 
       // Collapse sidebar
+      const COLLAPSE_TIMEOUT_MS = 5_000
       await page.getByTestId('sidebar-collapse-toggle').click()
-      await expect(page.getByTestId('sidebar-add-card')).not.toBeVisible({ timeout: 5000 })
+      await expect(page.getByTestId('sidebar-add-card')).not.toBeVisible({ timeout: COLLAPSE_TIMEOUT_MS })
 
       // Navigate to clusters
       await page.goto('/clusters')
       await page.waitForLoadState('domcontentloaded')
 
       // Sidebar should still be collapsed (Add Card hidden)
-      await expect(page.getByTestId('sidebar-add-card')).not.toBeVisible()
+      // Firefox may need extra time to apply persisted sidebar state. #10134
+      const PERSIST_CHECK_TIMEOUT_MS = 10_000
+      await expect(page.getByTestId('sidebar-add-card')).not.toBeVisible({ timeout: PERSIST_CHECK_TIMEOUT_MS })
     })
   })
 })

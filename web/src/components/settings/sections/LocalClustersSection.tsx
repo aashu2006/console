@@ -212,7 +212,7 @@ export function LocalClustersSection() {
         title: 'Install vCluster CLI',
         description: 'Install the vCluster CLI tool on this machine',
         type: 'deploy',
-        initialPrompt: 'Install the vCluster CLI tool on the local machine. Try using homebrew first (brew install loft-sh/tap/vcluster), and if that is not available, use the official install script: curl -L -o vcluster "https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-$(uname -s)-$(uname -m)" && sudo install -c -m 0755 vcluster /usr/local/bin && rm -f vcluster. Verify the installation by running vcluster --version.',
+        initialPrompt: 'Install the vCluster CLI tool on the local machine. Try using homebrew first (brew install loft-sh/tap/vcluster), and if that is not available, use the official install script: curl -L -o vcluster "https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-$(uname -s)-$(uname -m)" && sudo install -c -m 0755 vcluster /usr/local/bin && rm -f vcluster. Verify the installation by running vcluster --version. After installation, ask: "vCluster CLI is installed — want to deploy it to a cluster?" or "Something went wrong — want to see details?"',
       })
     })
   }
@@ -237,7 +237,9 @@ Steps:
 4. Wait for readiness: kubectl --context=${clusterContext} -n vcluster wait --for=condition=ready pod -l app=vcluster --timeout=120s
 5. Verify the installation: kubectl --context=${clusterContext} get pods -n vcluster
 
-After installation, the user can create virtual clusters on this host cluster from the console settings page.`,
+After installation, ask:
+- "vCluster operator is ready — want to create a virtual cluster now?"
+- "Something went wrong — want to see details?"`,
       })
     })
   }
@@ -263,7 +265,9 @@ Steps:
 5. Wait for KubeVirt to be ready: kubectl --context=${clusterContext} -n kubevirt wait kv kubevirt --for condition=Available --timeout=300s
 6. Verify the installation: kubectl --context=${clusterContext} get pods -n kubevirt
 
-After installation, the user can manage VMs on this cluster from the console.`,
+After installation, ask:
+- "KubeVirt is ready — want to create a VM?"
+- "Something went wrong — want to see details?"`,
       })
     })
   }
@@ -399,11 +403,11 @@ After installation, the user can manage VMs on this cluster from the console.`,
               <Plus className="w-4 h-4" />
               {t('settings.localClusters.createNew')}
             </h3>
-            <div className="flex flex-col sm:flex-row gap-3">
+            <div className="flex flex-col sm:flex-row sm:flex-wrap gap-3 w-full">
               <select
                 value={selectedTool}
                 onChange={(e) => setSelectedTool(e.target.value)}
-                className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="min-w-0 sm:w-auto sm:max-w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50 truncate"
               >
                 <option value="">{t('settings.localClusters.selectTool')}</option>
                 {localClusterTools.map((tool) => (
@@ -417,12 +421,12 @@ After installation, the user can manage VMs on this cluster from the console.`,
                 value={clusterName}
                 onChange={(e) => setClusterName(e.target.value)}
                 placeholder="Cluster name"
-                className="flex-1 px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="flex-1 min-w-0 px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
               />
               <button
                 onClick={handleCreate}
                 disabled={!selectedTool || !clusterName.trim() || isCreating}
-                className="flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-purple-500 text-white hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="shrink-0 whitespace-nowrap flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-purple-500 text-white hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isCreating ? (
                   <>
@@ -563,7 +567,7 @@ After installation, the user can manage VMs on this cluster from the console.`,
                     <select
                       value={vclusterHostCluster}
                       onChange={(e) => { setVclusterHostCluster(e.target.value); if (e.target.value) checkVClusterOnCluster(e.target.value) }}
-                      className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                      className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                     >
                       <option value="" disabled>{t('settings.localClusters.selectHostCluster')}</option>
                       {(healthyClusters || []).map(c => {
@@ -607,7 +611,7 @@ After installation, the user can manage VMs on this cluster from the console.`,
                       value={vclusterNamespace}
                       onChange={(e) => setVclusterNamespace(e.target.value)}
                       placeholder={t('settings.localClusters.vclusterDefaultNamespace')}
-                      className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                      className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                     />
                   </div>
                   <div className="flex flex-col gap-1">
@@ -617,7 +621,7 @@ After installation, the user can manage VMs on this cluster from the console.`,
                       value={vclusterName}
                       onChange={(e) => setVclusterName(e.target.value)}
                       placeholder="my-vcluster"
-                      className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                      className="px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                     />
                   </div>
                   <div className="flex items-end">

@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -42,7 +45,7 @@ func (h *CardHandler) requireEditorOrAdmin(c *fiber.Ctx) error {
 		return nil
 	}
 	userID := middleware.GetUserID(c)
-	user, err := h.store.GetUser(userID)
+	user, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to verify user role")
 	}
@@ -79,7 +82,7 @@ func (h *CardHandler) ListCards(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership
-	dashboard, err := h.store.GetDashboard(dashboardID)
+	dashboard, err := h.store.GetDashboard(c.UserContext(), dashboardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get dashboard")
 	}
@@ -87,7 +90,7 @@ func (h *CardHandler) ListCards(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusForbidden, "Access denied")
 	}
 
-	cards, err := h.store.GetDashboardCards(dashboardID)
+	cards, err := h.store.GetDashboardCards(c.UserContext(), dashboardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to list cards")
 	}
@@ -109,7 +112,7 @@ func (h *CardHandler) CreateCard(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership
-	dashboard, err := h.store.GetDashboard(dashboardID)
+	dashboard, err := h.store.GetDashboard(c.UserContext(), dashboardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get dashboard")
 	}
@@ -146,7 +149,7 @@ func (h *CardHandler) CreateCard(c *fiber.Ctx) error {
 	// via CreateCardWithLimit to close the TOCTOU race where concurrent
 	// creates could both observe count == MaxCardsPerDashboard-1 and both
 	// succeed (#6010).
-	if err := h.store.CreateCardWithLimit(card, MaxCardsPerDashboard); err != nil {
+	if err := h.store.CreateCardWithLimit(c.UserContext(), card, MaxCardsPerDashboard); err != nil {
 		if errors.Is(err, store.ErrDashboardCardLimitReached) {
 			return fiber.NewError(fiber.StatusTooManyRequests,
 				"Dashboard card limit reached")
@@ -175,7 +178,7 @@ func (h *CardHandler) UpdateCard(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid card ID")
 	}
 
-	card, err := h.store.GetCard(cardID)
+	card, err := h.store.GetCard(c.UserContext(), cardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get card")
 	}
@@ -184,7 +187,7 @@ func (h *CardHandler) UpdateCard(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership via dashboard
-	dashboard, err := h.store.GetDashboard(card.DashboardID)
+	dashboard, err := h.store.GetDashboard(c.UserContext(), card.DashboardID)
 	if err != nil || dashboard == nil || dashboard.UserID != userID {
 		return fiber.NewError(fiber.StatusForbidden, "Access denied")
 	}
@@ -218,7 +221,13 @@ func (h *CardHandler) UpdateCard(c *fiber.Ctx) error {
 		card.Position = *input.Position
 	}
 
-	if err := h.store.UpdateCard(card); err != nil {
+	if err := h.store.UpdateCard(c.UserContext(), card); err != nil {
+		// #6610: UpdateCard now returns sql.ErrNoRows when the row was
+		// deleted concurrently (or never existed). Surface that as 404
+		// so the client re-syncs instead of seeing a spurious 500.
+		if errors.Is(err, sql.ErrNoRows) {
+			return fiber.NewError(fiber.StatusNotFound, "Card not found")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to update card")
 	}
 
@@ -243,7 +252,7 @@ func (h *CardHandler) DeleteCard(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid card ID")
 	}
 
-	card, err := h.store.GetCard(cardID)
+	card, err := h.store.GetCard(c.UserContext(), cardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get card")
 	}
@@ -252,12 +261,12 @@ func (h *CardHandler) DeleteCard(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership via dashboard
-	dashboard, err := h.store.GetDashboard(card.DashboardID)
+	dashboard, err := h.store.GetDashboard(c.UserContext(), card.DashboardID)
 	if err != nil || dashboard == nil || dashboard.UserID != userID {
 		return fiber.NewError(fiber.StatusForbidden, "Access denied")
 	}
 
-	if err := h.store.DeleteCard(cardID); err != nil {
+	if err := h.store.DeleteCard(c.UserContext(), cardID); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to delete card")
 	}
 
@@ -272,13 +281,20 @@ func (h *CardHandler) DeleteCard(c *fiber.Ctx) error {
 
 // RecordFocus records a card focus event
 func (h *CardHandler) RecordFocus(c *fiber.Ctx) error {
+	// Role check: RecordFocus writes to card_focus and the event log, so
+	// it is a mutating operation that must be restricted to editors/admins,
+	// consistent with CreateCard, UpdateCard, DeleteCard, MoveCard (#7011).
+	if err := h.requireEditorOrAdmin(c); err != nil {
+		return err
+	}
+
 	userID := middleware.GetUserID(c)
 	cardID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid card ID")
 	}
 
-	card, err := h.store.GetCard(cardID)
+	card, err := h.store.GetCard(c.UserContext(), cardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get card")
 	}
@@ -287,7 +303,7 @@ func (h *CardHandler) RecordFocus(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership via dashboard
-	dashboard, err := h.store.GetDashboard(card.DashboardID)
+	dashboard, err := h.store.GetDashboard(c.UserContext(), card.DashboardID)
 	if err != nil || dashboard == nil || dashboard.UserID != userID {
 		return fiber.NewError(fiber.StatusForbidden, "Access denied")
 	}
@@ -299,17 +315,21 @@ func (h *CardHandler) RecordFocus(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
 	}
 
-	if err := h.store.UpdateCardFocus(cardID, input.Summary); err != nil {
+	if err := h.store.UpdateCardFocus(c.UserContext(), cardID, input.Summary); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to update focus")
 	}
 
-	// Also record as event
+	// Also record as event. Failures here are telemetry-only and must not
+	// fail the user request — but log structurally so the failure is visible.
 	event := &models.UserEvent{
 		UserID:    userID,
 		EventType: models.EventTypeCardFocus,
 		CardID:    &cardID,
 	}
-	h.store.RecordEvent(event)
+	if err := h.store.RecordEvent(c.UserContext(), event); err != nil {
+		slog.Warn("[cards] failed to record focus event",
+			"user", userID, "card", cardID, "error", err)
+	}
 
 	return c.JSON(fiber.Map{"status": "ok"})
 }
@@ -328,9 +348,13 @@ func (h *CardHandler) GetHistory(c *fiber.Ctx) error {
 		limit = l
 	}
 
-	history, err := h.store.GetUserCardHistory(userID, limit)
+	history, err := h.store.GetUserCardHistory(c.UserContext(), userID, limit)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get history")
+	}
+	// Never marshal a Go nil slice as JSON null; clients expect [].
+	if history == nil {
+		history = []models.CardHistory{}
 	}
 	return c.JSON(history)
 }
@@ -360,7 +384,7 @@ func (h *CardHandler) MoveCard(c *fiber.Ctx) error {
 	}
 
 	// Get the card
-	card, err := h.store.GetCard(cardID)
+	card, err := h.store.GetCard(c.UserContext(), cardID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get card")
 	}
@@ -369,21 +393,31 @@ func (h *CardHandler) MoveCard(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership of source dashboard
-	sourceDashboard, err := h.store.GetDashboard(card.DashboardID)
+	sourceDashboard, err := h.store.GetDashboard(c.UserContext(), card.DashboardID)
 	if err != nil || sourceDashboard == nil || sourceDashboard.UserID != userID {
 		return fiber.NewError(fiber.StatusForbidden, "Access denied to source dashboard")
 	}
 
 	// Verify ownership of target dashboard
-	targetDashboard, err := h.store.GetDashboard(targetDashboardID)
+	targetDashboard, err := h.store.GetDashboard(c.UserContext(), targetDashboardID)
 	if err != nil || targetDashboard == nil || targetDashboard.UserID != userID {
 		return fiber.NewError(fiber.StatusForbidden, "Access denied to target dashboard")
 	}
 
-	// Update the card's dashboard ID
-	card.DashboardID = targetDashboardID
-	if err := h.store.UpdateCard(card); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to move card")
+	// Atomically move the card to the target dashboard, enforcing the
+	// per-dashboard card limit inside a single SQL statement to prevent
+	// TOCTOU races (two concurrent moves both passing the count check).
+	if card.DashboardID != targetDashboardID {
+		if err := h.store.MoveCardWithLimit(c.UserContext(), cardID, targetDashboardID, MaxCardsPerDashboard); err != nil {
+			if errors.Is(err, store.ErrDashboardCardLimitReached) {
+				return fiber.NewError(
+					fiber.StatusBadRequest,
+					fmt.Sprintf("Target dashboard already has the maximum number of cards (limit %d)", MaxCardsPerDashboard),
+				)
+			}
+			return fiber.NewError(fiber.StatusInternalServerError, "Failed to move card")
+		}
+		card.DashboardID = targetDashboardID
 	}
 
 	// Notify via WebSocket

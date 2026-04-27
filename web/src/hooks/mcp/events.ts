@@ -7,7 +7,7 @@ import { registerRefetch } from '../../lib/modeTransition'
 import { registerCacheReset } from '../../lib/modeTransition'
 import { REFRESH_INTERVAL_MS, MIN_REFRESH_INDICATOR_MS, getEffectiveInterval, LOCAL_AGENT_URL, agentFetch } from './shared'
 import { subscribePolling } from './pollingManager'
-import { MCP_HOOK_TIMEOUT_MS } from '../../lib/constants/network'
+import { MCP_HOOK_TIMEOUT_MS, LOCAL_AGENT_HTTP_URL } from '../../lib/constants/network'
 import type { ClusterEvent } from './types'
 
 // ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ export function useEvents(cluster?: string, namespace?: string, limit = 20) {
       sseParams.limit = limit.toString()
 
       const allEvents = await fetchSSE<ClusterEvent>({
-        url: '/api/mcp/events/stream',
+        url: `${LOCAL_AGENT_HTTP_URL}/events/stream`,
         params: sseParams,
         itemsKey: 'events',
         signal,
@@ -334,8 +334,9 @@ export function useWarningEvents(cluster?: string, namespace?: string, limit = 2
       if (namespace) sseParams.namespace = namespace
       sseParams.limit = limit.toString()
 
+      // events/warnings is a backend-only endpoint (#9996) — route SSE via /api/mcp/
       const allEvents = await fetchSSE<ClusterEvent>({
-        url: '/api/mcp/events/warnings/stream',
+        url: `/api/mcp/events/warnings/stream`,
         params: sseParams,
         itemsKey: 'events',
         signal,

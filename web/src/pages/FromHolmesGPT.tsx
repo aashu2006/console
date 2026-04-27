@@ -1,3 +1,4 @@
+import { COPY_FEEDBACK_TIMEOUT_MS } from '../lib/constants'
 import { useEffect, useState, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import {
@@ -17,7 +18,6 @@ import {
 import { copyToClipboard } from '../lib/clipboard'
 import { emitInstallCommandCopied } from '../lib/analytics'
 
-const COPY_FEEDBACK_MS = 2000
 
 /* ------------------------------------------------------------------ */
 /*  Comparison table data                                              */
@@ -191,19 +191,21 @@ export function FromHolmesGPT() {
   }, [])
 
   const copyCommands = async (commands: string[], step: number) => {
-    const text = commands.join('\n')
-    await copyToClipboard(text)
+    const text = commands.filter(c => !c.startsWith('#') && c !== '').join('\n')
+    const ok = await copyToClipboard(text)
+    if (!ok) return
     setCopiedStep(`step-${step}`)
     clearTimeout(copiedTimerRef.current)
-    copiedTimerRef.current = setTimeout(() => setCopiedStep(null), COPY_FEEDBACK_MS)
-    emitInstallCommandCopied('from_holmesgpt', commands[0])
+    copiedTimerRef.current = setTimeout(() => setCopiedStep(null), COPY_FEEDBACK_TIMEOUT_MS)
+    const firstCommand = commands.find(c => !c.startsWith('#') && c !== '') ?? commands[0]
+    emitInstallCommandCopied('from_holmesgpt', firstCommand)
   }
 
   return (
     <div className="min-h-screen bg-background text-foreground">
       {/* Hero */}
       <section className="relative overflow-hidden">
-        <div className="absolute inset-0 bg-gradient-to-b from-purple-500/5 via-transparent to-transparent" />
+        <div className="absolute inset-0 bg-linear-to-b from-purple-500/5 via-transparent to-transparent" />
         <div className="relative max-w-5xl mx-auto px-6 py-20 text-center">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400 text-sm mb-6">
             <Brain className="w-4 h-4" />
@@ -211,7 +213,7 @@ export function FromHolmesGPT() {
           </div>
           <h1 className="text-4xl md:text-5xl font-bold mb-4">
             Everything HolmesGPT does,{' '}
-            <span className="bg-gradient-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent">
+            <span className="bg-linear-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent">
               plus 140+ dashboard cards
             </span>
           </h1>

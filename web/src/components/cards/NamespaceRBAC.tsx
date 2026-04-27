@@ -37,15 +37,25 @@ const SORT_OPTIONS_KEYS: ReadonlyArray<{ value: SortByOption; labelKey: SortTran
   { value: 'rules' as const, labelKey: 'cards:namespaceRBAC.rules' },
 ]
 
+/**
+ * Tab keys that expose a meaningful rule count. ServiceAccounts don't have
+ * rules, so "Sort by Rules" is hidden on the ServiceAccounts tab
+ * (Issue 9268).
+ */
+const TABS_WITH_RULES_COUNT: ReadonlyArray<'roles' | 'bindings' | 'serviceaccounts'> = ['roles']
+
 function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
   const { t } = useTranslation(['cards', 'common'])
-  const SORT_OPTIONS = SORT_OPTIONS_KEYS.map(opt => ({ value: opt.value, label: String(t(opt.labelKey)) }))
-  const { deduplicatedClusters: clusters, isLoading: clustersLoading, isRefreshing: clustersRefreshing, error } = useClusters()
+  const [activeTab, setActiveTab] = useState<'roles' | 'bindings' | 'serviceaccounts'>('roles')
+  // Hide "Sort by Rules" on tabs that don't have a rules count (Issue 9268).
+  const SORT_OPTIONS = SORT_OPTIONS_KEYS
+    .filter(opt => opt.value !== 'rules' || TABS_WITH_RULES_COUNT.includes(activeTab))
+    .map(opt => ({ value: opt.value, label: String(t(opt.labelKey)) }))
+  const { deduplicatedClusters: clusters, isLoading: clustersLoading, isRefreshing: clustersRefreshing, error, isFailed, consecutiveFailures } = useClusters()
   const { selectedClusters, isAllClustersSelected } = useGlobalFilters()
   const { drillToRBAC } = useDrillDownActions()
   const [selectedCluster, setSelectedCluster] = useState<string>(config?.cluster || '')
   const [selectedNamespace, setSelectedNamespace] = useState<string>(config?.namespace || '')
-  const [activeTab, setActiveTab] = useState<'roles' | 'bindings' | 'serviceaccounts'>('roles')
 
   // Fetch namespaces for the selected cluster (requires a cluster to be selected)
   const { namespaces, isDemoFallback: namespacesDemoFallback, isRefreshing: namespacesRefreshing } = useCachedNamespaces(selectedCluster || undefined)
@@ -98,7 +108,9 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
     isLoading: isInitialLoading || !!isFetchingRBAC,
     isRefreshing,
     hasAnyData: clusters.length > 0 || k8sRoles.length > 0 || k8sBindings.length > 0 || k8sServiceAccounts.length > 0,
-    isDemoData })
+    isDemoData,
+    isFailed,
+    consecutiveFailures })
 
   // Transform raw RBAC data into RBACItem arrays (no filtering/sorting — that's handled by useCardData)
   const rbacRoles: RBACItem[] = (() => {
@@ -176,7 +188,7 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={130} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -202,7 +214,7 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           <StatusBadge color="purple">
             {activeTab === 'roles' ? t('namespaceRBAC.nRoles', { count: rbacRoles.length }) : activeTab === 'bindings' ? t('namespaceRBAC.nBindings', { count: rbacBindings.length }) : t('namespaceRBAC.nServiceAccounts', { count: rbacServiceAccounts.length })}
@@ -267,7 +279,7 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
       {/* Error Display */}
       {error && (
         <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-2 mb-3">
-          <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-xs font-medium text-red-400">{t('namespaceRBAC.errorLoading')}</p>
             <p className="text-2xs text-muted-foreground mt-0.5">{error}</p>
@@ -301,7 +313,21 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
             {tabs.map(tab => (
               <button
                 key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
+                onClick={() => {
+                  setActiveTab(tab.key)
+                  // Issue 9268: clear the tab-local search when switching so
+                  // the new tab starts fresh rather than inheriting a query
+                  // that was meaningful only for the previous tab.
+                  if (tab.key !== activeTab) {
+                    filters.setSearch('')
+                    // Issue 9268: if the incoming tab has no rules count, fall
+                    // back to sorting by name so we never leave the card in a
+                    // silent no-op "Sort by Rules" state.
+                    if (!TABS_WITH_RULES_COUNT.includes(tab.key) && sorting.sortBy === 'rules') {
+                      sorting.setSortBy('name')
+                    }
+                  }
+                }}
                 className={`flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded text-xs transition-colors ${
                   activeTab === tab.key
                     ? 'bg-purple-500/20 text-purple-400'
@@ -340,7 +366,7 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
                     subjects: item.subjects })}
                   className={`p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 cursor-pointer transition-colors group ${isFetchingRBAC ? 'opacity-50' : ''}`}
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2">
                     <div className="flex items-center gap-2">
                       {activeTab === 'roles' && <Key className="w-4 h-4 text-yellow-400" />}
                       {activeTab === 'bindings' && <Lock className="w-4 h-4 text-green-400" />}
@@ -375,7 +401,7 @@ function NamespaceRBACInternal({ config }: NamespaceRBACProps) {
           />
 
           {/* Summary */}
-          <div className="mt-4 pt-3 border-t border-border/50 flex items-center justify-between text-xs text-muted-foreground">
+          <div className="mt-4 pt-3 border-t border-border/50 flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
             <span>{t('namespaceRBAC.nRoles', { count: rbacRoles.length })}</span>
             <span>{t('namespaceRBAC.nBindings', { count: rbacBindings.length })}</span>
             <span>{t('namespaceRBAC.nServiceAccounts', { count: rbacServiceAccounts.length })}</span>

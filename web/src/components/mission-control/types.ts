@@ -26,6 +26,8 @@ export interface PayloadProject {
   dependencies: string[]
   /** Path in console-kb to the install mission JSON */
   kbPath?: string
+  /** Kubara chart name when a matching chart exists in the Kubara platform catalog */
+  kubaraChartName?: string
   /** GitHub org for avatar URL */
   githubOrg?: string
   /** CNCF maturity level */
@@ -46,6 +48,21 @@ export interface PayloadProject {
    * loses user-selected CNCF projects on refinement.
    */
   userAdded?: boolean
+  /**
+   * Kubara platform chart reference. When present, the project can be
+   * installed via the Kubara catalog instead of (or in addition to) the
+   * console-kb install mission. `repoPath` is the directory path inside
+   * the kubara-io/kubara repo (e.g. "helm/prometheus-stack"). `valuesUrl`
+   * optionally points to a pre-built values file for the chart (#8480).
+   * Also used to display a "Kubara" badge on project nodes in Phase 2
+   * and Phase 3 (#8484).
+   */
+  kubaraChart?: {
+    /** Path inside the kubara-io/kubara repo (e.g. "helm/prometheus-stack") */
+    repoPath: string
+    /** Optional URL to a default or recommended values file */
+    valuesUrl?: string
+  }
 }
 
 // ---------------------------------------------------------------------------

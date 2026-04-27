@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { CheckCircle, AlertTriangle, XCircle, RefreshCw, Clock, GitBranch, ChevronRight } from 'lucide-react'
+import { formatTimeAgo } from '../../lib/formatters'
 import { useClusters } from '../../hooks/useMCP'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDemoMode } from '../../hooks/useDemoMode'
@@ -89,19 +90,11 @@ function getStatusColor(status: Kustomization['status']) {
   }
 }
 
-function formatTime(timestamp: string) {
-  const date = new Date(timestamp)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
-  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
-  return `${Math.floor(diff / 86400000)}d ago`
-}
 
 export function KustomizationStatus({ config }: KustomizationStatusProps) {
   const { t } = useTranslation(['cards', 'common'])
   const { isDemoMode: demoMode } = useDemoMode()
-  const { deduplicatedClusters: allClusters, isLoading } = useClusters()
+  const { deduplicatedClusters: allClusters, isLoading, isRefreshing, isFailed, consecutiveFailures } = useClusters()
   const [selectedCluster, setSelectedCluster] = useState<string>(config?.cluster || '')
   const [selectedNamespace, setSelectedNamespace] = useState<string>(config?.namespace || '')
   const {
@@ -127,10 +120,14 @@ export function KustomizationStatus({ config }: KustomizationStatusProps) {
   }, [demoMode])
 
   // Report loading state to CardWrapper for skeleton/refresh behavior
+  const hasData = kustomizationData.length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
-    hasAnyData: kustomizationData.length > 0,
-    isDemoData: demoMode })
+    isLoading: isLoading && !hasData,
+    isRefreshing,
+    hasAnyData: hasData,
+    isDemoData: demoMode,
+    isFailed,
+    consecutiveFailures })
 
   // Auto-select first cluster in demo mode so card shows data immediately
   useEffect(() => {
@@ -221,7 +218,7 @@ export function KustomizationStatus({ config }: KustomizationStatusProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={160} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -247,7 +244,7 @@ export function KustomizationStatus({ config }: KustomizationStatusProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-muted-foreground">
             {totalItems} kustomizations
@@ -343,25 +340,51 @@ export function KustomizationStatus({ config }: KustomizationStatusProps) {
             </div>
           </div>
 
-          {/* Kustomizations list */}
-          <div ref={containerRef} className="flex-1 space-y-2 overflow-y-auto" style={containerStyle}>
+          {/* Kustomizations list — Issue 8883: roving-tabindex keyboard nav.
+              Arrow Up/Down moves focus, Home/End jumps to ends, Enter/Space drills in. */}
+          <div ref={containerRef} className="flex-1 space-y-2 overflow-y-auto" style={containerStyle} role="list">
             {kustomizations.map((ks, idx) => {
               const StatusIcon = getStatusIcon(ks.status)
               const color = getStatusColor(ks.status)
+              const activate = () => drillToKustomization(selectedCluster, ks.namespace, ks.name, {
+                path: ks.path,
+                sourceRef: ks.sourceRef,
+                status: ks.status,
+                lastApplied: ks.lastApplied,
+                revision: ks.revision })
+              const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+                const list = e.currentTarget.parentElement
+                const items = list ? Array.from(list.querySelectorAll<HTMLDivElement>('[data-keynav-item="kustomization"]')) : []
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  activate()
+                } else if (e.key === 'ArrowDown' && idx < kustomizations.length - 1) {
+                  e.preventDefault()
+                  items[idx + 1]?.focus()
+                } else if (e.key === 'ArrowUp' && idx > 0) {
+                  e.preventDefault()
+                  items[idx - 1]?.focus()
+                } else if (e.key === 'Home') {
+                  e.preventDefault()
+                  items[0]?.focus()
+                } else if (e.key === 'End') {
+                  e.preventDefault()
+                  items[items.length - 1]?.focus()
+                }
+              }
 
               return (
                 <div
                   key={idx}
-                  onClick={() => drillToKustomization(selectedCluster, ks.namespace, ks.name, {
-                    path: ks.path,
-                    sourceRef: ks.sourceRef,
-                    status: ks.status,
-                    lastApplied: ks.lastApplied,
-                    revision: ks.revision })}
-                  className={`p-3 rounded-lg cursor-pointer group ${ks.status === 'NotReady' ? 'bg-red-500/10 border border-red-500/20' : 'bg-secondary/30'} hover:bg-secondary/50 transition-colors`}
-                  title={`Click to view ${ks.name} details`}
+                  data-keynav-item="kustomization"
+                  role="button"
+                  tabIndex={0}
+                  onClick={activate}
+                  onKeyDown={handleKeyDown}
+                  className={`p-3 rounded-lg cursor-pointer group ${ks.status === 'NotReady' ? 'bg-red-500/10 border border-red-500/20' : 'bg-secondary/30'} hover:bg-secondary/50 transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400`}
+                  title={`Click or press Enter to view ${ks.name} details`}
                 >
-                  <div className="flex items-center justify-between mb-1">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                     <div className="flex items-center gap-2">
                       <StatusIcon className={`w-4 h-4 text-${color}-400 ${ks.status === 'Progressing' ? 'animate-spin' : ''}`} />
                       <span className="text-sm text-foreground font-medium">{ks.name}</span>
@@ -378,9 +401,9 @@ export function KustomizationStatus({ config }: KustomizationStatusProps) {
                       <GitBranch className="w-3 h-3" />
                       <span className="truncate">{ks.path}</span>
                     </div>
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-y-2">
                       <span className="truncate">{ks.revision.split('@')[1]?.slice(0, 12)}</span>
-                      <span>{formatTime(ks.lastApplied)}</span>
+                      <span>{formatTimeAgo(ks.lastApplied)}</span>
                     </div>
                   </div>
                   {(ks.status === 'NotReady' || ks.status === 'Suspended') && (

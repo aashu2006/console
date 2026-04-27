@@ -19,6 +19,7 @@ import { useK3sStatus } from './useK3sStatus'
 import { K3S_INSTALL_PROMPT } from '../shared'
 import { loadMissionPrompt } from '../missionLoader'
 import { K3sDetailModal } from './K3sDetailModal'
+import { createCardSyncFormatter } from '../../../../lib/formatters'
 
 // ============================================================================
 // Constants
@@ -34,25 +35,6 @@ const SKELETON_POD_ROWS = 3
 // Relative time formatting
 // ============================================================================
 
-function useFormatRelativeTime() {
-  const { t } = useTranslation('cards')
-  return (isoString: string): string => {
-    const diff = Date.now() - new Date(isoString).getTime()
-    if (isNaN(diff) || diff < 0) return t('k3sStatus.syncedJustNow')
-
-    /** Milliseconds in one minute */
-    const MINUTE_MS = 60_000
-    /** Milliseconds in one hour */
-    const HOUR_MS = 60 * MINUTE_MS
-    /** Milliseconds in one day */
-    const DAY_MS = 24 * HOUR_MS
-
-    if (diff < MINUTE_MS) return t('k3sStatus.syncedJustNow')
-    if (diff < HOUR_MS) return t('k3sStatus.syncedMinutesAgo', { count: Math.floor(diff / MINUTE_MS) })
-    if (diff < DAY_MS) return t('k3sStatus.syncedHoursAgo', { count: Math.floor(diff / HOUR_MS) })
-    return t('k3sStatus.syncedDaysAgo', { count: Math.floor(diff / DAY_MS) })
-  }
-}
 
 // ============================================================================
 // Component
@@ -60,7 +42,7 @@ function useFormatRelativeTime() {
 
 export function K3sStatus() {
   const { t } = useTranslation('cards')
-  const formatRelativeTime = useFormatRelativeTime()
+  const formatRelativeTime = createCardSyncFormatter(t, 'k3sStatus')
   const { data, error, showSkeleton, showEmptyState, isRefreshing, isDemoData } = useK3sStatus()
   const { startMission } = useMissions()
   const { showKeyPrompt, checkKeyAndRun, goToSettings, dismissPrompt } = useApiKeyCheck()
@@ -145,7 +127,7 @@ export function K3sStatus() {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded gap-4">
       {/* Health badge + last check */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div
           role="button"
           tabIndex={0}
@@ -200,7 +182,7 @@ export function K3sStatus() {
           <p className="text-xs font-medium text-muted-foreground">{t('k3sStatus.serverPodList')}</p>
           <div className="space-y-1.5 max-h-40 overflow-y-auto scrollbar-thin">
             {serverPods.map((pod) => (
-              <div key={pod.name} className="flex items-center justify-between text-xs gap-2 px-2 py-1.5 rounded bg-secondary/30 cursor-pointer hover:bg-secondary/50 transition-colors" role="button" tabIndex={0} aria-label={t('k3sStatus.viewServerPod', { name: pod.name })} onClick={openDetailModal} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetailModal() } }}>
+              <div key={pod.name} className="flex flex-wrap items-center justify-between gap-y-2 text-xs gap-2 px-2 py-1.5 rounded bg-secondary/30 cursor-pointer hover:bg-secondary/50 transition-colors" role="button" tabIndex={0} aria-label={t('k3sStatus.viewServerPod', { name: pod.name })} onClick={openDetailModal} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetailModal() } }}>
                 <span className="text-foreground truncate flex-1" title={pod.name}>
                   {pod.name}
                 </span>

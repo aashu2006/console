@@ -104,7 +104,7 @@ export function HardwareLeaderboard() {
   return (
     <div className="p-4 h-full flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <Trophy size={16} className="text-yellow-400" />
           <span className="text-sm font-medium text-white">Hardware Leaderboard</span>
@@ -138,7 +138,7 @@ export function HardwareLeaderboard() {
       {/* Table */}
       <div className="flex-1 min-h-0 overflow-auto">
         <table className="w-full text-xs">
-          <thead className="sticky top-0 bg-background backdrop-blur-sm z-10">
+          <thead className="sticky top-0 bg-background backdrop-blur-xs z-10">
             <tr className="border-b border-border/50">
               <th className="text-left py-2 px-2 text-muted-foreground font-medium w-[36px]">#</th>
               <th className="text-left py-2 px-2 text-muted-foreground font-medium w-[70px]">Hardware</th>
@@ -163,7 +163,7 @@ export function HardwareLeaderboard() {
               <tr
                 key={row.rank}
                 className={`border-b border-border/50 transition-colors hover:bg-secondary/30 ${
-                  row.config !== 'standalone' ? 'bg-blue-500/[0.03]' : ''
+                  row.config !== 'standalone' ? 'bg-blue-500/3' : ''
                 }`}
               >
                 <td className="py-2 px-2 font-mono text-muted-foreground">
@@ -176,6 +176,11 @@ export function HardwareLeaderboard() {
                 <td className="py-2 px-2 text-white font-medium">{row.hardware}</td>
                 <td className="py-2 px-2 text-foreground truncate max-w-[100px]">{row.model}</td>
                 <td className="py-2 px-2">
+                  {/* Issue 9071: inline `background`/`color` are data-driven accent
+                   * colors from CONFIG_COLORS (per-configuration brand color).
+                   * These are intentionally not theme-switched — the /20 alpha
+                   * background + full-saturation foreground pairing reads on
+                   * both light and dark by design. */}
                   <span
                     className="px-1.5 py-0.5 rounded text-2xs font-medium"
                     style={{ background: `${CONFIG_COLORS[row.config]}20`, color: CONFIG_COLORS[row.config] }}

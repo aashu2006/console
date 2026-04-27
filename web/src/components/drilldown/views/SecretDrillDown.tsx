@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useLocalAgent } from '../../../hooks/useLocalAgent'
 import { LOCAL_AGENT_WS_URL } from '../../../lib/constants'
+import { appendWsAuthToken } from '../../../lib/utils/wsAuth'
 import { useDrillDownActions } from '../../../hooks/useDrillDown'
 import { ClusterBadge } from '../../ui/ClusterBadge'
 import { FileText, Code, Info, Tag, ChevronDown, ChevronUp, Loader2, Copy, Check, Layers, Server, Eye, EyeOff, Lock } from 'lucide-react'
@@ -24,6 +25,9 @@ type TabType = 'overview' | 'data' | 'describe' | 'yaml'
 import { maskKubernetesYamlData } from '../../../lib/yamlMask'
 /** @deprecated use `maskKubernetesYamlData` from `lib/yamlMask` */
 export const maskSecretYaml = maskKubernetesYamlData
+
+/** Property names that must never be used as object keys (prototype pollution prevention). */
+const UNSAFE_PROP_NAMES = new Set(['__proto__', 'constructor', 'prototype'])
 
 export function SecretDrillDown({ data }: Props) {
   const { t } = useTranslation()
@@ -53,7 +57,7 @@ export function SecretDrillDown({ data }: Props) {
   // Helper to run kubectl commands
   const runKubectl = (args: string[]): Promise<string> => {
     return new Promise((resolve) => {
-      const ws = new WebSocket(LOCAL_AGENT_WS_URL)
+      const ws = new WebSocket(appendWsAuthToken(LOCAL_AGENT_WS_URL))
       const requestId = `kubectl-${Date.now()}-${Math.random().toString(36).slice(2)}`
       let output = ''
 
@@ -96,10 +100,9 @@ export function SecretDrillDown({ data }: Props) {
         const secret = JSON.parse(output)
         // Decode base64 data (use null-prototype object to prevent prototype pollution)
         const decodedData: Record<string, string> = Object.create(null) as Record<string, string>
-        const unsafeKeys = new Set(['__proto__', 'constructor', 'prototype'])
         if (secret.data) {
           for (const [key, value] of Object.entries(secret.data)) {
-            if (unsafeKeys.has(key)) continue
+            if (UNSAFE_PROP_NAMES.has(key)) continue
             try {
               decodedData[key] = atob(value as string)
             } catch {
@@ -174,10 +177,10 @@ export function SecretDrillDown({ data }: Props) {
   }
 
   const TABS: { id: TabType; label: string; icon: typeof Info }[] = [
-    { id: 'overview', label: 'Overview', icon: Info },
-    { id: 'data', label: 'Data', icon: Lock },
-    { id: 'describe', label: 'Describe', icon: FileText },
-    { id: 'yaml', label: 'YAML', icon: Code },
+    { id: 'overview', label: t('drilldown.tabs.overview', 'Overview'), icon: Info },
+    { id: 'data', label: t('drilldown.tabs.data', 'Data'), icon: Lock },
+    { id: 'describe', label: t('drilldown.tabs.describe', 'Describe'), icon: FileText },
+    { id: 'yaml', label: t('drilldown.tabs.yaml', 'YAML'), icon: Code },
   ]
 
   const dataEntries = Object.entries(secretData || {})

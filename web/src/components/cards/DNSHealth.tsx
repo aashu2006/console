@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useCachedPods } from '../../hooks/useCachedData'
 import { useCardLoadingState } from './CardDataContext'
@@ -22,14 +23,14 @@ export function DNSHealth() {
     isFailed,
     consecutiveFailures })
 
-  const dnsPods = pods.filter(p => {
+  const dnsPods = useMemo(() => pods.filter(p => {
       // Only consider pods in known DNS namespaces
       if (!DNS_NAMESPACES.includes(p.namespace || '')) return false
       const name = p.name?.toLowerCase() || ''
       return DNS_POD_PATTERNS.some(pattern => name.includes(pattern))
-    })
+    }), [pods])
 
-  const byCluster = (() => {
+  const byCluster = useMemo(() => {
     const map = new Map<string, typeof dnsPods>()
     for (const pod of dnsPods) {
       const cluster = pod.cluster || 'unknown'
@@ -37,7 +38,7 @@ export function DNSHealth() {
       map.get(cluster)!.push(pod)
     }
     return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b))
-  })()
+  }, [dnsPods])
 
   if (showSkeleton) {
     return (
@@ -61,7 +62,7 @@ export function DNSHealth() {
 
   return (
     <div className="space-y-2 p-1">
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2 mb-1">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>{t('dnsHealth.podsSummary', { pods: dnsPods.length, clusters: byCluster.length })}</span>
         </div>
@@ -81,7 +82,7 @@ export function DNSHealth() {
 
         return (
           <div key={cluster} className="px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-y-2">
               <div className="flex items-center gap-2">
                 <div className={`w-2 h-2 rounded-full ${allHealthy ? 'bg-green-500' : 'bg-yellow-500'}`} />
                 <span className="text-sm font-medium">{cluster}</span>
@@ -95,7 +96,9 @@ export function DNSHealth() {
             </div>
             <div className="flex gap-1 mt-1 flex-wrap">
               {clusterPods.map(pod => {
-                const version = pod.containers?.[0]?.image?.split(':')[1] || ''
+                const rawVersion = pod.containers?.[0]?.image?.split(':')[1] || ''
+                // Strip @sha256 digest suffix and normalize leading 'v' prefix
+                const version = rawVersion.split('@')[0].replace(/^v+/, '')
                 return (
                   <span
                     key={pod.name}

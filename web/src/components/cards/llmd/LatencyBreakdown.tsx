@@ -6,7 +6,7 @@
  * Shows how latency degrades as load increases.
  */
 import { useState, useMemo } from 'react'
-import ReactECharts from 'echarts-for-react'
+import { LazyEChart } from '../../charts/LazyEChart'
 import { Clock, AlertTriangle } from 'lucide-react'
 import { useReportCardDataState } from '../CardDataContext'
 import { useCachedBenchmarkReports } from '../../../hooks/useBenchmarkData'
@@ -15,8 +15,19 @@ import {
   groupByExperiment,
   getFilterOptions,
   type ScalingPoint } from '../../../lib/llmd/benchmarkDataUtils'
+import {
+  TOOLTIP_HEADER_MARGIN_PX,
+  TOOLTIP_INLINE_GAP_PX,
+  TOOLTIP_ROW_PADDING_PX,
+  TOOLTIP_SWATCH_SIZE_PX } from '../../../lib/llmd/tooltipSpacing'
 import { useTranslation } from 'react-i18next'
 import { StatusBadge } from '../../ui/StatusBadge'
+import { CHART_MIN_HEIGHT_PX, CHART_TEXT_WHITE, CHART_AXIS_FONT_SIZE, CHART_AXIS_FONT_SIZE_SM, CHART_BODY_FONT_SIZE } from '../../../lib/constants/ui'
+
+const GRID_LEFT_PX = 55
+const GRID_RIGHT_PX = 20
+const GRID_TOP_PX = 10
+const GRID_BOTTOM_PX = 45
 
 type MetricTab = 'ttftP50Ms' | 'tpotP50Ms' | 'p99LatencyMs' | 'itlP50Ms' | 'requestLatencyMs'
 
@@ -130,15 +141,15 @@ function LatencyBreakdownInternal() {
 
     return {
       backgroundColor: 'transparent',
-      grid: { left: 55, right: 20, top: 10, bottom: 45 },
+      grid: { left: GRID_LEFT_PX, right: GRID_RIGHT_PX, top: GRID_TOP_PX, bottom: GRID_BOTTOM_PX },
       xAxis: {
         type: 'category' as const,
         data: chartData.map(d => d.qps),
         name: 'QPS (queries/sec)',
         nameLocation: 'middle' as const,
         nameGap: 30,
-        nameTextStyle: { color: '#71717a', fontSize: 10 },
-        axisLabel: { color: '#71717a', fontSize: 10 },
+        nameTextStyle: { color: '#71717a', fontSize: CHART_AXIS_FONT_SIZE },
+        axisLabel: { color: '#71717a', fontSize: CHART_AXIS_FONT_SIZE },
         axisLine: { lineStyle: { color: '#71717a' } },
         axisTick: { show: false },
       },
@@ -147,8 +158,8 @@ function LatencyBreakdownInternal() {
         name: tabInfo.unit,
         nameLocation: 'middle' as const,
         nameGap: 40,
-        nameTextStyle: { color: '#71717a', fontSize: 10 },
-        axisLabel: { color: '#71717a', fontSize: 10 },
+        nameTextStyle: { color: '#71717a', fontSize: CHART_AXIS_FONT_SIZE },
+        axisLabel: { color: '#71717a', fontSize: CHART_AXIS_FONT_SIZE },
         axisLine: { lineStyle: { color: '#71717a' } },
         axisTick: { show: false },
         splitLine: { lineStyle: { color: '#334155', opacity: 0.5, type: 'dashed' as const } },
@@ -157,15 +168,15 @@ function LatencyBreakdownInternal() {
         trigger: 'axis' as const,
         backgroundColor: 'rgba(15,23,42,0.95)',
         borderColor: 'rgba(100,116,139,0.3)',
-        textStyle: { color: '#fff', fontSize: 12 },
+        textStyle: { color: CHART_TEXT_WHITE, fontSize: CHART_BODY_FONT_SIZE },
         formatter: (params: Array<{ seriesName: string; value: number | null; color: string }>) => {
           const qps = chartData[(params[0] as unknown as { dataIndex: number }).dataIndex]?.qps ?? ''
           const items = (params || [])
             .filter(p => !p.seriesName.endsWith('_area') && p.value !== null && p.value !== undefined)
             .sort((a, b) => (a.value ?? 0) - (b.value ?? 0))
-          let html = `<div style="font-weight:500;margin-bottom:4px">QPS: ${qps}</div>`
+          let html = `<div style="font-weight:500;margin-bottom:${TOOLTIP_HEADER_MARGIN_PX}px">QPS: ${qps}</div>`
           for (const p of items) {
-            html += `<div style="display:flex;align-items:center;gap:6px;padding:1px 0"><div style="width:8px;height:8px;border-radius:50%;background:${p.color}"></div><span>${p.seriesName}</span><span style="font-family:monospace;margin-left:auto">${(p.value ?? 0).toFixed(1)} ${tabInfo.unit}</span></div>`
+            html += `<div style="display:flex;align-items:center;gap:${TOOLTIP_INLINE_GAP_PX}px;padding:${TOOLTIP_ROW_PADDING_PX}px 0"><div style="width:${TOOLTIP_SWATCH_SIZE_PX}px;height:${TOOLTIP_SWATCH_SIZE_PX}px;border-radius:50%;background:${p.color}"></div><span>${p.seriesName}</span><span style="font-family:monospace;margin-left:auto">${(p.value ?? 0).toFixed(1)} ${tabInfo.unit}</span></div>`
           }
           return html
         },
@@ -179,7 +190,7 @@ function LatencyBreakdownInternal() {
             symbol: 'none',
             data: [{
               yAxis: tabInfo.sla,
-              label: { formatter: `SLA: ${tabInfo.sla}ms`, position: 'end' as const, color: '#ef4444', fontSize: 9 },
+              label: { formatter: `SLA: ${tabInfo.sla}ms`, position: 'end' as const, color: '#ef4444', fontSize: CHART_AXIS_FONT_SIZE_SM },
               lineStyle: { color: '#ef4444', type: 'dashed' as const, opacity: 0.6 },
             }],
           },
@@ -192,7 +203,7 @@ function LatencyBreakdownInternal() {
   return (
     <div className="p-4 h-full flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <Clock size={14} className="text-yellow-400" />
           <span className="text-sm font-medium text-white">Latency Under Load</span>
@@ -247,9 +258,9 @@ function LatencyBreakdownInternal() {
       </div>
 
       {/* Chart */}
-      <div className="flex-1 min-h-0" style={{ minHeight: 200 }}>
+      <div className="flex-1 min-h-0" style={{ minHeight: CHART_MIN_HEIGHT_PX }}>
         {chartData.length > 0 ? (
-          <ReactECharts
+          <LazyEChart
             option={chartOption}
             style={{ height: '100%', width: '100%' }}
             notMerge={true}

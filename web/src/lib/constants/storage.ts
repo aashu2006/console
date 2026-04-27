@@ -24,7 +24,11 @@ export const STORAGE_KEY_ONBOARDING_RESPONSES = 'demo-onboarding-responses'
 
 // ── User cache ─────────────────────────────────────────────────────────
 export const STORAGE_KEY_USER_CACHE = 'kc-user-cache'
-export const STORAGE_KEY_BACKEND_STATUS = 'kc-backend-status'
+/** Hint flag set when an authenticated session is established (OAuth callback).
+ *  Used to avoid a spurious /auth/refresh call on initial load when no session
+ *  cookie exists (#6925). HttpOnly cookies are invisible to JS, so this
+ *  localStorage flag acts as a proxy for "we had a session at some point". */
+export const STORAGE_KEY_HAS_SESSION = 'kc-has-session'
 export const STORAGE_KEY_SQLITE_MIGRATED = 'kc-sqlite-migrated'
 
 // ── Settings (synced via settingsSync.ts) ──────────────────────────────
@@ -41,6 +45,7 @@ export const STORAGE_KEY_ANONYMOUS_USER_ID = 'kc-anonymous-user-id'
 
 // ── Dashboard persistence ─────────────────────────────────────────────
 export const STORAGE_KEY_MAIN_DASHBOARD_CARDS = 'kubestellar-main-dashboard-cards'
+export const STORAGE_KEY_DASHBOARD_AUTO_REFRESH = 'dashboard-auto-refresh'
 
 // ── UI state persistence ───────────────────────────────────────────────
 export const STORAGE_KEY_CLUSTER_LAYOUT = 'kubestellar-cluster-layout-mode'
@@ -69,8 +74,6 @@ export const STORAGE_KEY_SEEN_TIPS = 'ksc-seen-tips'
 export const STORAGE_KEY_NPS_STATE = 'kc-nps-state'
 
 // ── Orbit (Recurring Maintenance) ─────────────────────────────────
-export const STORAGE_KEY_ORBIT_MISSIONS = 'kc-orbit-missions'
-export const STORAGE_KEY_ORBIT_HISTORY = 'kc-orbit-history'
 export const STORAGE_KEY_GROUND_CONTROL_DASHBOARDS = 'kc-ground-control-dashboards'
 
 // ── Snooze persistence ────────────────────────────────────────────────
@@ -94,5 +97,14 @@ export const STORAGE_KEY_TRESTLE_CACHE_TIME = 'kc-trestle-cache-time'
 export const STORAGE_KEY_KUBECTL_HISTORY = 'kubectl-history'
 export const STORAGE_KEY_RBAC_CACHE = 'kc-rbac-cache'
 export const STORAGE_KEY_RBAC_CACHE_TIME = 'kc-rbac-cache-time'
+export const STORAGE_KEY_INTOTO_CACHE = 'kc-intoto-cache'
+export const STORAGE_KEY_INTOTO_CACHE_TIME = 'kc-intoto-cache-time'
 export const STORAGE_KEY_NS_OVERVIEW_CLUSTER = 'kc-ns-overview-cluster'
 export const STORAGE_KEY_NS_OVERVIEW_NAMESPACE = 'kc-ns-overview-namespace'
+
+// Drasi reactive-graph card — user-managed list of Drasi server connections
+// and the currently-selected one. Replaces the build-time VITE_DRASI_SERVER_URL
+// / VITE_DRASI_PLATFORM_CLUSTER envs with a runtime picker modeled after the
+// AI/ML endpoint management pattern.
+export const STORAGE_KEY_DRASI_CONNECTIONS = 'ksc-drasi-connections'
+export const STORAGE_KEY_DRASI_ACTIVE_CONNECTION = 'ksc-drasi-active-connection'

@@ -1,23 +1,10 @@
 import { CheckCircle, AlertTriangle, RefreshCw, Monitor, Cpu, MemoryStick, Server } from 'lucide-react'
+import { cn } from '../../../lib/cn'
 import { useTranslation } from 'react-i18next'
 import { Skeleton } from '../../ui/Skeleton'
 import { useLimaStatus } from './useLimaStatus'
 import { MetricTile } from '../../../lib/cards/CardComponents'
-
-function useFormatRelativeTime() {
-  const { t } = useTranslation('cards')
-  return (isoString: string): string => {
-    const diff = Date.now() - new Date(isoString).getTime()
-    if (isNaN(diff) || diff < 0) return t('lima.syncedJustNow')
-    const minute = 60_000
-    const hour = 60 * minute
-    const day = 24 * hour
-    if (diff < minute) return t('lima.syncedJustNow')
-    if (diff < hour) return t('lima.syncedMinutesAgo', { count: Math.floor(diff / minute) })
-    if (diff < day) return t('lima.syncedHoursAgo', { count: Math.floor(diff / hour) })
-    return t('lima.syncedDaysAgo', { count: Math.floor(diff / day) })
-  }
-}
+import { createCardSyncFormatter } from '../../../lib/formatters'
 
 const STATUS_COLORS: Record<string, string> = {
   running: 'text-green-400',
@@ -33,8 +20,8 @@ const STATUS_BG: Record<string, string> = {
 
 export function LimaStatus() {
   const { t } = useTranslation('cards')
-  const formatRelativeTime = useFormatRelativeTime()
-  const { data, error, showSkeleton, showEmptyState, isDemoData } = useLimaStatus()
+  const formatRelativeTime = createCardSyncFormatter(t, 'lima')
+  const { data, error, isRefreshing, showSkeleton, showEmptyState, isDemoData } = useLimaStatus()
 
   if (showSkeleton) {
     return (
@@ -75,7 +62,7 @@ export function LimaStatus() {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded gap-4">
       {/* Health badge + last check */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div
           className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${
             isHealthy
@@ -93,7 +80,7 @@ export function LimaStatus() {
 
         {!isDemoData && (
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <RefreshCw className="w-3 h-3" />
+            <RefreshCw className={cn('w-3 h-3', isRefreshing && 'animate-spin')} />
             <span>{formatRelativeTime(data.lastCheckTime)}</span>
           </div>
         )}
@@ -128,7 +115,7 @@ export function LimaStatus() {
           {data.instances.map((instance) => (
             <div
               key={instance.name}
-              className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 bg-secondary/30"
+              className="flex flex-wrap items-center justify-between gap-y-2 gap-2 rounded-md px-2 py-1.5 bg-secondary/30"
             >
               <div className="flex items-center gap-2 min-w-0">
                 <Monitor className={`w-3.5 h-3.5 shrink-0 ${STATUS_COLORS[instance.status] ?? 'text-muted-foreground'}`} />

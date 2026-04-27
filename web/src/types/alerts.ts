@@ -17,8 +17,26 @@ export type AlertConditionType =
 // Alert severity levels
 export type AlertSeverity = 'critical' | 'warning' | 'info'
 
+/** Sort order for alert severity (lower = more severe). Used by sort comparators. */
+export const ALERT_SEVERITY_ORDER: Record<AlertSeverity, number> = { critical: 0, warning: 1, info: 2 }
+
+/** Sort order for vulnerability severity (5-level: critical > high > medium > low > info). */
+export const VULN_SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
+
 // Alert status
 export type AlertStatus = 'firing' | 'resolved'
+
+/**
+ * Signal classification for alerts (#8750).
+ *
+ * - `state`        Persistent system condition (e.g. "6 alerts firing").
+ *                  Displayed in the alerts card/page. Stays until resolved.
+ * - `notification` Transient user-facing event (toast, browser push).
+ *                  Fires once per dedup window; not persisted in alert list.
+ * - `acknowledged` User has explicitly seen/dismissed the signal.
+ *                  Removes from active count but keeps in history.
+ */
+export type AlertSignalType = 'state' | 'notification' | 'acknowledged'
 
 // Alert channel types
 export type AlertChannelType = 'browser' | 'slack' | 'webhook' | 'pagerduty' | 'opsgenie'
@@ -35,6 +53,14 @@ export interface AlertCondition {
   weatherCondition?: 'severe_storm' | 'extreme_heat' | 'heavy_rain' | 'snow' | 'high_wind'
   temperatureThreshold?: number // for extreme_heat
   windSpeedThreshold?: number // for high_wind
+  // Issue 9255 — weather alerts previously fired on a 10% random chance every
+  // evaluation cycle, which looked like bogus alerts to real users. They now
+  // only fire when demoMode is explicitly enabled (opt-in mock firing) or when
+  // a real weather API integration populates `currentTemperature` /
+  // `currentWindSpeed` that crosses the configured threshold.
+  demoMode?: boolean
+  currentTemperature?: number // current observed temperature (for real API integration)
+  currentWindSpeed?: number // current observed wind speed (for real API integration)
 }
 
 // Alert channel configuration
@@ -93,6 +119,8 @@ export interface Alert {
   acknowledgedBy?: string
   aiDiagnosis?: AlertAIDiagnosis
   isDemo?: boolean // True if alert was generated during demo mode
+  /** Signal classification — see AlertSignalType. Defaults to 'state'. */
+  signalType?: AlertSignalType
 }
 
 // Slack webhook configuration
@@ -142,7 +170,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 300, // 5 minutes
     },
     severity: 'critical',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: true,
   },
   {
@@ -154,7 +182,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 60, // 1 minute
     },
     severity: 'warning',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: true,
   },
   {
@@ -167,7 +195,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 600, // 10 minutes
     },
     severity: 'warning',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: true,
   },
   {
@@ -180,7 +208,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 300, // 5 minutes
     },
     severity: 'info',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: false,
   },
   {
@@ -204,7 +232,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 0, // Immediate — CronJob already ran checks
     },
     severity: 'warning',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: true,
   },
   {
@@ -217,7 +245,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 300,
     },
     severity: 'warning',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: false,
   },
   {
@@ -229,7 +257,7 @@ export const PRESET_ALERT_RULES: Omit<AlertRule, 'id' | 'createdAt' | 'updatedAt
       duration: 0,
     },
     severity: 'warning',
-    channels: [{ type: 'browser', enabled: true, config: {} }],
+    channels: [{ type: 'browser', enabled: false, config: {} }],
     aiDiagnose: true,
   },
   {
@@ -314,7 +342,7 @@ export function formatCondition(condition: AlertCondition): string {
     case 'cpu_pressure':
       return `CPU usage > ${condition.threshold}%`
     case 'disk_pressure':
-      return `Disk usage > ${condition.threshold}%`
+      return condition.threshold != null ? `Disk usage > ${condition.threshold}%` : 'Node reporting DiskPressure condition'
     case 'dns_failure':
       return 'CoreDNS pods not ready or crashing'
     case 'certificate_error':

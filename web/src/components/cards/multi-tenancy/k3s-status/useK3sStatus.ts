@@ -12,6 +12,8 @@ import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../../lib/constants/network'
 import { K3S_CACHE_KEY, OPERATOR_REFRESH_CATEGORY } from '../shared'
 import type { ComponentHealth } from '../shared'
 import { K3S_DEMO_DATA, type K3sServerPodInfo, type K3sStatusDemoData } from './demoData'
+import { LOCAL_AGENT_HTTP_URL } from '../../../../lib/constants/network'
+import { isPodHealthy } from '../../../../lib/k8s'
 
 // ============================================================================
 // Data Interface
@@ -71,13 +73,6 @@ function isK3sPod(pod: BackendPodInfo): boolean {
   return containers.some((c) => (c.image ?? '').includes(K3S_IMAGE_MARKER))
 }
 
-function isPodHealthy(status?: string, ready?: string): boolean {
-  if ((status ?? '').toLowerCase() !== 'running') return false
-  const parts = String(ready ?? '').split('/')
-  const readyCount = Number.parseInt(parts[0] ?? '0', 10)
-  const totalCount = Number.parseInt(parts[1] ?? '0', 10)
-  return totalCount > 0 && readyCount === totalCount
-}
 
 function extractVersion(pod: BackendPodInfo): string {
   const containers = pod.containers ?? []
@@ -97,7 +92,7 @@ function extractVersion(pod: BackendPodInfo): string {
 // ============================================================================
 
 async function fetchK3sStatus(): Promise<K3sStatus> {
-  const podsResp = await fetch('/api/mcp/pods', {
+  const podsResp = await fetch(`${LOCAL_AGENT_HTTP_URL}/pods`, {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
   })
@@ -126,7 +121,7 @@ async function fetchK3sStatus(): Promise<K3sStatus> {
   const serverPods: K3sServerPodInfo[] = []
 
   for (const pod of k3sPods) {
-    const isHealthy = isPodHealthy(pod.status, pod.ready)
+    const isHealthy = isPodHealthy(pod)
     if (isHealthy) {
       healthy += 1
     } else {

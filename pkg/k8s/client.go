@@ -1,3 +1,30 @@
+// Package k8s provides the multi-cluster k8s client used by both the Go
+// backend (cmd/console) and kc-agent (cmd/kc-agent). The underlying type
+// is MultiClusterClient; post-#7993 it is ALSO exported as PrivilegedClient
+// to signal — at the type name — that in the Go backend's context it
+// carries the pod ServiceAccount's privileges and must only be used for
+// the three legitimate pod-SA exceptions:
+//
+//  1. GPU reservation (pkg/api/handlers/mcp_resources.go ResourceQuota
+//     handlers): users cannot create namespaces or set quotas themselves;
+//     the console is the authorized policy layer.
+//  2. Self-upgrade (pkg/api/handlers/self_upgrade.go): the console pod
+//     patches its own Deployment. No other identity could perform a
+//     self-upgrade.
+//  3. The system-internal persistence reconciler
+//     (pkg/api/handlers/console_persistence.go): reacts to CR state
+//     changes without a human in the loop. User-initiated CR writes go
+//     through kc-agent at /console-cr/* per #7993 Phase 2.5.
+//
+// Every other k8s operation against a managed cluster must go through
+// kc-agent with the caller's own kubeconfig. The architectural rule is
+// enforced on every PR by .github/workflows/privileged-client-lint.yml
+// (added in #7993 Phase 5).
+//
+// In kc-agent, the same type carries the USER's identity via their
+// kubeconfig, so the name "PrivilegedClient" is a slight overstatement
+// there — but the type alias is only a hint, not a runtime check, and
+// kc-agent's only k8s surface is user-initiated work anyway.
 package k8s
 
 import (
@@ -21,6 +48,41 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
+// PrivilegedClient is an alias for MultiClusterClient whose sole purpose is
+// to mark — at the type name — that a handler field carries the pod
+// ServiceAccount's privileges (see the package doc above for the three
+// legitimate pod-SA exceptions).
+//
+// This alias is a documentation / code-review signal for human readers. It
+// is NOT what the privileged-client lint rule actually checks. The lint in
+// .github/workflows/privileged-client-lint.yml is call-pattern based: it
+// greps pkg/api/handlers/ for mutation-method calls of the form
+//
+//	h.k8sClient.(Create|Update|Delete|Patch)<Name>(
+//	s.k8sClient.(Create|Update|Delete|Patch)<Name>(
+//	persistence.(Create|Update|Delete)<Name>(
+//
+// and fails the PR if any such call site lives outside the file allowlist
+// in .github/allowlist-privileged-client-callers.txt. The lint never looks
+// at the field's declared Go type, so declaring a field as PrivilegedClient
+// neither satisfies nor trips the rule on its own.
+//
+// Practical guidance for new privileged handlers:
+//  1. If the handler legitimately needs to mutate a managed cluster via the
+//     pod SA, declare the field as *PrivilegedClient to flag intent for
+//     reviewers, AND add the handler's file basename to
+//     .github/allowlist-privileged-client-callers.txt in the same PR. The
+//     allowlist file itself takes only plain basenames (no inline
+//     justifications); explain the rationale for the new exception in the
+//     PR description, as the lint workflow's failure message instructs.
+//  2. If the handler is user-initiated work, it must go through kc-agent
+//     with the caller's kubeconfig instead — neither the type alias nor an
+//     allowlist entry is appropriate.
+//
+// Existing MultiClusterClient fields stay put; this is an intent-signalling
+// alias, not a rename.
+type PrivilegedClient = MultiClusterClient
+
 const (
 	clusterHealthCheckTimeout = 8 * time.Second
 	clusterProbeTimeout       = 5 * time.Second
@@ -33,29 +95,29 @@ const (
 	// perClusterHealthTimeout bounds each individual cluster probe inside
 	// GetAllClusterHealth. Must be less than totalHealthTimeout so a single
 	// cluster cannot consume the entire global budget.
-	perClusterHealthTimeout = 10 * time.Second
-	clusterCacheTTL           = 60 * time.Second
-	authFailureCacheTTL       = 10 * time.Minute // longer TTL for auth errors to avoid exec-plugin spam (#3158)
-	podIssueAgeThreshold      = 5 * time.Minute
-	podPendingAgeThreshold    = 2 * time.Minute
-	clusterEventDebounce      = 500 * time.Millisecond
-	clusterEventPollInterval  = 5 * time.Second
-	slowClusterTTL            = 2 * time.Minute
+	perClusterHealthTimeout  = 10 * time.Second
+	clusterCacheTTL          = 60 * time.Second
+	authFailureCacheTTL      = 10 * time.Minute // longer TTL for auth errors to avoid exec-plugin spam (#3158)
+	podIssueAgeThreshold     = 5 * time.Minute
+	podPendingAgeThreshold   = 2 * time.Minute
+	clusterEventDebounce     = 500 * time.Millisecond
+	clusterEventPollInterval = 5 * time.Second
+	slowClusterTTL           = 2 * time.Minute
 )
 
 // MultiClusterClient manages connections to multiple Kubernetes clusters
 type MultiClusterClient struct {
-	mu              sync.RWMutex
-	kubeconfig      string
-	clients         map[string]kubernetes.Interface
-	dynamicClients  map[string]dynamic.Interface
-	configs         map[string]*rest.Config
-	rawConfig       *api.Config
-	healthCache     map[string]*ClusterHealth
-	cacheTTL        time.Duration
-	cacheTime       map[string]time.Time
-	watcher         *fsnotify.Watcher
-	stopWatch       chan struct{}
+	mu             sync.RWMutex
+	kubeconfig     string
+	clients        map[string]kubernetes.Interface
+	dynamicClients map[string]dynamic.Interface
+	configs        map[string]*rest.Config
+	rawConfig      *api.Config
+	healthCache    map[string]*ClusterHealth
+	cacheTTL       time.Duration
+	cacheTime      map[string]time.Time
+	watcher        *fsnotify.Watcher
+	stopWatch      chan struct{}
 	// #6469/#6470 — lifecycle flags guarding StartWatching/StopWatching.
 	// `watching` tracks whether a watchLoop goroutine is active; it is flipped
 	// under `mu` so concurrent Start/Stop calls are serialized. `stopWatchOnce`
@@ -74,6 +136,16 @@ type MultiClusterClient struct {
 // (i.e., has a valid in-cluster ServiceAccount config).
 func (m *MultiClusterClient) IsInCluster() bool {
 	return m.inClusterConfig != nil
+}
+
+// SetInClusterConfig sets the in-cluster config (for testing)
+func (m *MultiClusterClient) SetInClusterConfig(config *rest.Config) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inClusterConfig = config
 }
 
 // SetDynamicClient injects a dynamic client for a cluster (for testing)
@@ -279,6 +351,15 @@ const (
 	AcceleratorXPU AcceleratorType = "XPU" // Intel XPU
 )
 
+// GPUTaint describes a scheduling-gating taint on a GPU node.
+// Only taint effects that actually gate pod scheduling (NoSchedule, NoExecute)
+// are surfaced — PreferNoSchedule is advisory and is intentionally omitted.
+type GPUTaint struct {
+	Key    string `json:"key"`
+	Value  string `json:"value,omitempty"`
+	Effect string `json:"effect"` // NoSchedule or NoExecute
+}
+
 // GPUNode represents a node with accelerator resources (GPU, TPU, AIU, XPU)
 type GPUNode struct {
 	Name            string          `json:"name"`
@@ -287,6 +368,9 @@ type GPUNode struct {
 	GPUCount        int             `json:"gpuCount"`                  // Number of accelerators
 	GPUAllocated    int             `json:"gpuAllocated"`              // Number of allocated accelerators
 	AcceleratorType AcceleratorType `json:"acceleratorType,omitempty"` // GPU, TPU, AIU, or XPU
+	// Scheduling-gating taints on the underlying node.
+	// Empty when the node has no NoSchedule/NoExecute taints.
+	Taints []GPUTaint `json:"taints,omitempty"`
 	// Enhanced GPU info from NVIDIA GPU Feature Discovery
 	GPUMemoryMB        int    `json:"gpuMemoryMB,omitempty"`        // GPU memory in MB
 	GPUFamily          string `json:"gpuFamily,omitempty"`          // GPU architecture family (e.g., ampere, hopper)
@@ -398,10 +482,27 @@ const (
 	gpuHealthClusterRoleBinding = "gpu-health-checker"
 	gpuHealthDefaultSchedule    = "*/5 * * * *" // every 5 minutes
 	gpuHealthDefaultNS          = "nvidia-gpu-operator"
-	gpuHealthCheckerImage       = "bitnami/kubectl:latest"
-	gpuHealthConfigMapName      = "gpu-health-results"
-	gpuHealthScriptVersion      = 2 // bump when script changes
-	gpuHealthDefaultTier        = 2 // standard tier by default
+	// Supply-chain hardening (#6693): pin the GPU health checker image by
+	// digest so a compromised or unexpected :latest retag cannot change the
+	// binary that runs as cluster-admin via the configured RBAC.
+	//
+	// NOTE on tag choice: Bitnami only publishes a `latest` tag for
+	// `bitnami/kubectl` on Docker Hub (numeric version tags such as
+	// `1.31.0` return 404 against registry-1.docker.io). The digest below
+	// was resolved from `bitnami/kubectl:latest` on 2026-04-11. Operators
+	// should refresh this digest when rotating to a newer kubectl by
+	// running:
+	//   crane digest bitnami/kubectl:latest
+	// or the equivalent Docker Registry HTTP API lookup used here:
+	//   curl -sI -H "Accept: application/vnd.oci.image.index.v1+json" \
+	//        -H "Authorization: Bearer $TOKEN" \
+	//        https://registry-1.docker.io/v2/bitnami/kubectl/manifests/latest
+	// TODO(#6693): when Bitnami restores semver tags, switch to
+	// bitnami/kubectl:<version>@sha256:<digest> for clearer intent.
+	gpuHealthCheckerImage  = "bitnami/kubectl@sha256:59ad45e8bd79e7af7592ff2852b32adcb0da50792bc52ce44679d5c5f1b4d415"
+	gpuHealthConfigMapName = "gpu-health-results"
+	gpuHealthScriptVersion = 2 // bump when script changes
+	gpuHealthDefaultTier   = 2 // standard tier by default
 )
 
 // Deployment represents a Kubernetes deployment with rollout status
@@ -428,28 +529,28 @@ type ServicePortDetail struct {
 	// Name of the port as defined on the k8s ServicePort (may be empty).
 	// When present it is a well-known name like "http" or "metrics" that
 	// operators configure to identify a port across the cluster.
-	Name     string `json:"name,omitempty"`
+	Name string `json:"name,omitempty"`
 	// Port is the service-level port (spec.ports[].port).
-	Port     int32  `json:"port"`
+	Port int32 `json:"port"`
 	// Protocol is TCP / UDP / SCTP.
 	Protocol string `json:"protocol,omitempty"`
 	// NodePort is the externally-exposed port for NodePort / LoadBalancer
 	// services. Zero for ClusterIP services.
-	NodePort int32  `json:"nodePort,omitempty"`
+	NodePort int32 `json:"nodePort,omitempty"`
 }
 
 // Service represents a Kubernetes service
 type Service struct {
-	Name        string            `json:"name"`
-	Namespace   string            `json:"namespace"`
-	Cluster     string            `json:"cluster,omitempty"`
-	Type        string            `json:"type"` // ClusterIP, NodePort, LoadBalancer, ExternalName
-	ClusterIP   string            `json:"clusterIP,omitempty"`
-	ExternalIP  string            `json:"externalIP,omitempty"`
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+	Cluster    string `json:"cluster,omitempty"`
+	Type       string `json:"type"` // ClusterIP, NodePort, LoadBalancer, ExternalName
+	ClusterIP  string `json:"clusterIP,omitempty"`
+	ExternalIP string `json:"externalIP,omitempty"`
 	// Ports is the legacy flat string representation of the ports, kept
 	// for existing consumers. Format: "80/TCP" or "80:30080/TCP" when a
 	// NodePort is allocated. Prefer PortDetails for new code.
-	Ports       []string          `json:"ports,omitempty"`
+	Ports []string `json:"ports,omitempty"`
 	// PortDetails is the structured representation of the ServicePorts
 	// including the optional name field (issue #6163). Same length and
 	// ordering as Ports.
@@ -465,7 +566,7 @@ type Service struct {
 	// LoadBalancer service this is either LBStatusReady (ingress IP/hostname
 	// has been assigned) or LBStatusProvisioning (cloud provider has not yet
 	// provisioned an address). Issue #6153.
-	LBStatus    string            `json:"lbStatus,omitempty"`
+	LBStatus string `json:"lbStatus,omitempty"`
 	// Selector is the label selector used by the service to match backing
 	// pods (corev1.ServiceSpec.Selector). Surfaced so the frontend can
 	// detect orphaned services (selector present but no matching pods,
@@ -698,13 +799,33 @@ type LimitRangeItem struct {
 	Min            map[string]string `json:"min,omitempty"`
 }
 
-// NewMultiClusterClient creates a new multi-cluster client
+// NewMultiClusterClient creates a new multi-cluster client.
+//
+// Kubeconfig discovery order (#6683):
+//  1. explicit argument
+//  2. $KUBECONFIG environment variable
+//  3. ~/.kube/config — only when os.UserHomeDir() succeeds AND the path
+//     is not "/" or "/root" (which indicates a container with no real
+//     home). Previously os.UserHomeDir() errors were discarded with
+//     `home, _ := os.UserHomeDir()` which produced kubeconfig="/.kube/config"
+//     inside containers, leading to confusing "no such file" errors
+//     instead of falling through to in-cluster config.
+//  4. in-cluster config (handled below via rest.InClusterConfig()).
 func NewMultiClusterClient(kubeconfig string) (*MultiClusterClient, error) {
 	if kubeconfig == "" {
 		kubeconfig = os.Getenv("KUBECONFIG")
 		if kubeconfig == "" {
-			home, _ := os.UserHomeDir()
-			kubeconfig = filepath.Join(home, ".kube", "config")
+			home, err := os.UserHomeDir()
+			if err != nil || home == "" || home == "/" || home == "/root" {
+				// Running in a container without a real home directory.
+				// Leave kubeconfig empty so the os.Stat below fails fast
+				// and we fall through to rest.InClusterConfig().
+				slog.Info("no usable home directory for kubeconfig; will try in-cluster config",
+					"homeErr", err, "home", home)
+				kubeconfig = ""
+			} else {
+				kubeconfig = filepath.Join(home, ".kube", "config")
+			}
 		}
 	}
 
@@ -719,8 +840,17 @@ func NewMultiClusterClient(kubeconfig string) (*MultiClusterClient, error) {
 		slowClusters:   make(map[string]time.Time),
 	}
 
-	// Try to detect if we're running in-cluster
-	if _, err := os.Stat(kubeconfig); os.IsNotExist(err) {
+	// Try to detect if we're running in-cluster.
+	// kubeconfig may be empty when running inside a container without a
+	// real home directory (see #6683); os.Stat("") returns an error that
+	// is NOT os.ErrNotExist, so explicitly check for the empty path too.
+	needInCluster := kubeconfig == ""
+	if !needInCluster {
+		if _, err := os.Stat(kubeconfig); os.IsNotExist(err) {
+			needInCluster = true
+		}
+	}
+	if needInCluster {
 		// No kubeconfig file, try in-cluster config
 		if inClusterConfig, err := rest.InClusterConfig(); err == nil {
 			slog.Info("Using in-cluster config (no kubeconfig file found)")
@@ -893,13 +1023,22 @@ func (m *MultiClusterClient) RemoveContext(contextName string) error {
 // second watcher goroutine. Previously every call created a fresh
 // fsnotify.Watcher and watchLoop goroutine, orphaning the previous one.
 func (m *MultiClusterClient) StartWatching() error {
+	// PR #6518 item A + #6573 item A — hold the lock for the ENTIRE setup,
+	// not just the check-and-set. Previous impl set watching=true, released
+	// the lock, then did fsnotify.NewWatcher()+Add. A second caller arriving
+	// during that window saw watching=true and returned nil immediately —
+	// but the first caller's watcher might still fail setup, leaving the
+	// struct in a broken state after the second caller already declared
+	// success. Holding the lock across fsnotify setup is acceptable because
+	// setup is fast (microseconds) and StartWatching is only called at
+	// startup / after a Stop, not on any hot path.
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if m.watching {
-		m.mu.Unlock()
 		slog.Info("kubeconfig watcher already running, skipping StartWatching")
 		return nil
 	}
-	m.mu.Unlock()
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -918,7 +1057,6 @@ func (m *MultiClusterClient) StartWatching() error {
 		slog.Warn("could not watch kubeconfig directory", "error", err)
 	}
 
-	m.mu.Lock()
 	m.watcher = watcher
 	// issue 6472 — Recreate stopWatch and reset the once on every Start so
 	// Stop→Start sequences actually work. Previously Start only initialized
@@ -926,12 +1064,15 @@ func (m *MultiClusterClient) StartWatching() error {
 	// succeeded but watchLoop exited immediately because stopWatch was closed.
 	m.stopWatch = make(chan struct{})
 	m.stopWatchOnce = sync.Once{}
-	m.watching = true
 	// Snapshot for the goroutine so it reads a stable value even if a
 	// concurrent Stop+Start rotates m.stopWatch.
 	stopCh := m.stopWatch
 	w := m.watcher
-	m.mu.Unlock()
+	// Only flip watching=true after setup has fully succeeded. A concurrent
+	// caller arriving before this line sees watching=false and will block
+	// on m.mu until we return; by then setup is complete (or rolled back
+	// via the error path, leaving watching=false for a clean retry).
+	m.watching = true
 
 	go m.watchLoop(stopCh, w)
 	slog.Info("watching kubeconfig for changes", "path", m.kubeconfig)
@@ -955,14 +1096,37 @@ func (m *MultiClusterClient) reloadAndNotify() {
 	}
 	slog.Info("Kubeconfig reloaded successfully")
 
-	// Re-add file watch — after atomic writes (rm+create or rename-over),
-	// the old inode-level watch is dead. This re-establishes it on the new inode.
-	if m.watcher != nil {
-		_ = m.watcher.Remove(m.kubeconfig)
+	// PR #6518 item H — Re-add file watch under the lock. This runs from
+	// a debounce timer on a separate goroutine; without locking it races
+	// with StartWatching / StopWatching which mutate m.watcher. We also
+	// check m.watching so a Stop-then-timer-fires sequence doesn't touch
+	// a closed watcher.
+	m.mu.Lock()
+	if m.watching && m.watcher != nil {
+		// #6692 — Log Remove errors (previously discarded with `_ =`).
+		// fsnotify returns a "can't remove non-existent watcher" error
+		// when the old inode has already been garbage-collected, which
+		// is benign; any other error (EACCES, ENOSPC, …) indicates a
+		// stale inode watch that will silently persist unless we notice.
+		if removeErr := m.watcher.Remove(m.kubeconfig); removeErr != nil {
+			// fsnotify doesn't expose typed errors; match on text.
+			errText := removeErr.Error()
+			isBenign := strings.Contains(errText, "non-existent") ||
+				strings.Contains(errText, "not found") ||
+				strings.Contains(errText, "can't remove")
+			if isBenign {
+				slog.Debug("fsnotify Remove returned benign 'not found'",
+					"path", m.kubeconfig, "error", removeErr)
+			} else {
+				slog.Warn("fsnotify Remove failed; stale inode watch may persist — will attempt Add anyway",
+					"path", m.kubeconfig, "error", removeErr)
+			}
+		}
 		if err := m.watcher.Add(m.kubeconfig); err != nil {
 			slog.Warn("could not re-watch kubeconfig file", "error", err)
 		}
 	}
+	m.mu.Unlock()
 
 	// Notify listeners
 	m.mu.RLock()
@@ -1055,6 +1219,12 @@ func (m *MultiClusterClient) watchLoop(stopCh <-chan struct{}, watcher *fsnotify
 // The sync.Once guards the close; the watching flag prevents double-close
 // of the fsnotify watcher too.
 func (m *MultiClusterClient) StopWatching() {
+	// PR #6518 item B — hold the lock through once.Do so a concurrent
+	// Stop→Start that replaces m.stopWatchOnce cannot race with this Do.
+	// Previously we captured &m.stopWatchOnce then released the lock; a
+	// concurrent StartWatching could assign a fresh sync.Once to that
+	// address while this goroutine was still inside Do, producing a
+	// data race on the Once's internal state.
 	m.mu.Lock()
 	if !m.watching {
 		m.mu.Unlock()
@@ -1063,12 +1233,11 @@ func (m *MultiClusterClient) StopWatching() {
 	m.watching = false
 	stopCh := m.stopWatch
 	w := m.watcher
-	once := &m.stopWatchOnce
+	if stopCh != nil {
+		m.stopWatchOnce.Do(func() { close(stopCh) })
+	}
 	m.mu.Unlock()
 
-	if stopCh != nil {
-		once.Do(func() { close(stopCh) })
-	}
 	if w != nil {
 		w.Close()
 	}
@@ -1243,6 +1412,15 @@ func (m *MultiClusterClient) WarmupHealthCache() {
 		wg.Add(1)
 		go func(name, ctxName string) {
 			defer wg.Done()
+			// #9334 — Respect context cancellation promptly. If the outer
+			// warmup deadline already fired, don't start a fresh 5s probe
+			// that extends the effective timeout well past the documented
+			// clusterHealthCheckTimeout.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			probeCtx, probeCancel := context.WithTimeout(ctx, clusterProbeTimeout)
 			defer probeCancel()
 
@@ -1396,7 +1574,17 @@ func isBetterClusterName(candidate, current string) bool {
 	return len(candidate) < len(current)
 }
 
-// GetClient returns a kubernetes client for the specified context
+// GetClient returns a kubernetes client for the specified context.
+//
+// #9334 — Client construction (especially `clientcmd…ClientConfig()` for
+// kubeconfigs that invoke an exec credential plugin like aws-iam-authenticator,
+// oci, gcloud, tsh, etc.) can take hundreds of ms to several seconds. Holding
+// the global write lock for the entire construction serializes every other
+// cluster probe in the process — fan-out health checks end up running
+// one-at-a-time. We build the client OUTSIDE the lock and only take the write
+// lock for the short final insertion, which permits concurrent construction
+// for different contexts while still preventing a single context from being
+// constructed twice.
 func (m *MultiClusterClient) GetClient(contextName string) (kubernetes.Interface, error) {
 	m.mu.RLock()
 	if client, ok := m.clients[contextName]; ok {
@@ -1404,26 +1592,25 @@ func (m *MultiClusterClient) GetClient(contextName string) (kubernetes.Interface
 		return client, nil
 	}
 	inClusterConfig := m.inClusterConfig
+	kubeconfigPath := m.kubeconfig
+	inClusterName := m.inClusterName
 	m.mu.RUnlock()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if client, ok := m.clients[contextName]; ok {
-		return client, nil
-	}
-
+	// Build the client OUTSIDE the lock so concurrent callers for distinct
+	// contexts don't serialize on a single write lock (#9334). It is
+	// intentionally acceptable for two goroutines racing on the same context
+	// to both build a client here — the final map insertion under the write
+	// lock is idempotent (first writer wins, second discards its extra client).
 	var config *rest.Config
 	var err error
 
 	// Handle in-cluster context specially — accept both "in-cluster" and the detected name
-	isInCluster := inClusterConfig != nil && (contextName == "in-cluster" || contextName == m.inClusterName)
+	isInCluster := inClusterConfig != nil && (contextName == "in-cluster" || contextName == inClusterName)
 	if isInCluster {
 		config = rest.CopyConfig(inClusterConfig)
 	} else {
 		config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			&clientcmd.ClientConfigLoadingRules{ExplicitPath: m.kubeconfig},
+			&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfigPath},
 			&clientcmd.ConfigOverrides{CurrentContext: contextName},
 		).ClientConfig()
 		if err != nil {
@@ -1440,6 +1627,13 @@ func (m *MultiClusterClient) GetClient(contextName string) (kubernetes.Interface
 		return nil, fmt.Errorf("failed to create client for context %s: %w", contextName, err)
 	}
 
+	// Install the constructed client under a short write lock. If a concurrent
+	// caller beat us to it, reuse the existing entry (#9334).
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.clients[contextName]; ok {
+		return existing, nil
+	}
 	m.clients[contextName] = client
 	m.configs[contextName] = config
 	return client, nil
@@ -1460,33 +1654,42 @@ func (m *MultiClusterClient) GetRestConfig(contextName string) (*rest.Config, er
 	return rest.CopyConfig(config), nil
 }
 
-// GetDynamicClient returns a dynamic kubernetes client for the specified context
+// GetDynamicClient returns a dynamic kubernetes client for the specified context.
+//
+// #10255 — Same lock-reduction pattern as GetClient (#9334). Client construction
+// (especially kubeconfigs with exec credential plugins) can take hundreds of ms.
+// Holding the global write lock during construction serializes all cluster probes.
+// We build the client OUTSIDE the lock and only take the write lock for the short
+// final insertion.
 func (m *MultiClusterClient) GetDynamicClient(contextName string) (dynamic.Interface, error) {
 	m.mu.RLock()
 	if client, ok := m.dynamicClients[contextName]; ok {
 		m.mu.RUnlock()
 		return client, nil
 	}
+	// Snapshot fields needed for construction so we can release the lock.
+	cachedConfig, hasConfig := m.configs[contextName]
+	inClusterConfig := m.inClusterConfig
+	kubeconfigPath := m.kubeconfig
+	inClusterName := m.inClusterName
 	m.mu.RUnlock()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if client, ok := m.dynamicClients[contextName]; ok {
-		return client, nil
-	}
-
-	// Get or create config
-	config, ok := m.configs[contextName]
-	if !ok {
+	// Build the client OUTSIDE the lock so concurrent callers for distinct
+	// contexts don't serialize on a single write lock (#10255). It is
+	// intentionally acceptable for two goroutines racing on the same context
+	// to both build a client here — the final map insertion under the write
+	// lock is idempotent (first writer wins, second discards its extra client).
+	var config *rest.Config
+	if hasConfig {
+		config = cachedConfig
+	} else {
 		var err error
-		isInCluster := m.inClusterConfig != nil && (contextName == "in-cluster" || contextName == m.inClusterName)
+		isInCluster := inClusterConfig != nil && (contextName == "in-cluster" || contextName == inClusterName)
 		if isInCluster {
-			config = rest.CopyConfig(m.inClusterConfig)
+			config = rest.CopyConfig(inClusterConfig)
 		} else {
 			config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-				&clientcmd.ClientConfigLoadingRules{ExplicitPath: m.kubeconfig},
+				&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfigPath},
 				&clientcmd.ConfigOverrides{CurrentContext: contextName},
 			).ClientConfig()
 			if err != nil {
@@ -1494,7 +1697,6 @@ func (m *MultiClusterClient) GetDynamicClient(contextName string) (dynamic.Inter
 			}
 		}
 		config.Timeout = k8sClientTimeout
-		m.configs[contextName] = config
 	}
 
 	client, err := dynamic.NewForConfig(config)
@@ -1502,7 +1704,17 @@ func (m *MultiClusterClient) GetDynamicClient(contextName string) (dynamic.Inter
 		return nil, fmt.Errorf("failed to create dynamic client for context %s: %w", contextName, err)
 	}
 
+	// Install the constructed client under a short write lock. If a concurrent
+	// caller beat us to it, reuse the existing entry (#10255).
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.dynamicClients[contextName]; ok {
+		return existing, nil
+	}
 	m.dynamicClients[contextName] = client
+	if !hasConfig {
+		m.configs[contextName] = config
+	}
 	return client, nil
 }
 

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,8 +30,10 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/recover"
 
 	"github.com/kubestellar/console/pkg/agent"
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/handlers"
 	"github.com/kubestellar/console/pkg/api/middleware"
+	"github.com/kubestellar/console/pkg/compliance/residency"
 	"github.com/kubestellar/console/pkg/k8s"
 	"github.com/kubestellar/console/pkg/kagent"
 	"github.com/kubestellar/console/pkg/kagenti_provider"
@@ -46,19 +51,48 @@ const (
 	portReleasePollInterval = 50 * time.Millisecond
 	defaultDevFrontendURL   = "http://localhost:5174"
 	defaultProdFrontendURL  = "http://localhost:8080"
+
+	// kcAgentBaseURL is the loopback URL of the co-located kc-agent HTTP server.
+	// The backend proxies auto-update requests to this address so the browser
+	// never makes a cross-origin call to kc-agent (avoids CORS/PNA issues).
+	kcAgentBaseURL = "http://127.0.0.1:8585"
+
+	// kcAgentProxyTimeout is the timeout for proxied requests to kc-agent.
+	kcAgentProxyTimeout = 30 * time.Second
+
+	// apiDefaultBodyLimit is the per-route body-size limit enforced by the
+	// bodyGuard middleware on all API routes except feedback screenshot uploads.
+	apiDefaultBodyLimit = 1 * 1024 * 1024 // 1 MB — sufficient for JSON API requests
+
+	// feedbackBodyLimit is the global Fiber BodyLimit, elevated to support
+	// base64-encoded screenshot uploads in POST /api/feedback/requests.
+	// Reduced from 20 MB to 5 MB to limit memory-based DoS surface (#9710).
+	feedbackBodyLimit = 5 * 1024 * 1024 // 5 MB — base64 screenshot uploads
+
+	// envMaxBodyBytes is the environment variable that overrides the global
+	// Fiber BodyLimit applied to every HTTP request (#9891). When unset or
+	// invalid, the server falls back to feedbackBodyLimit so feedback screenshot
+	// uploads continue to work. Larger deployments can raise this for big
+	// form posts; smaller appliances can lower it to tighten DoS surface.
+	envMaxBodyBytes = "MAX_BODY_BYTES"
 )
 
 // Version is the build version, injected via ldflags at build time.
 // Used in /health response for stale-frontend detection.
 var Version = "dev"
 
-// buildInfo holds VCS metadata extracted from the Go binary at startup.
-var buildInfo struct {
+// BuildInfo holds VCS metadata extracted from the Go binary at startup.
+type BuildInfo struct {
 	GoVersion   string
 	VCSRevision string
 	VCSTime     string
 	VCSModified string
 }
+
+var buildInfo BuildInfo
+
+// GetBuildInfo returns the VCS metadata extracted from the Go binary.
+func GetBuildInfo() BuildInfo { return buildInfo }
 
 func init() {
 	info, ok := debug.ReadBuildInfo()
@@ -129,6 +163,25 @@ type Config struct {
 	BrandIssuesURL    string // ISSUES_URL (default: "https://github.com/kubestellar/kubestellar/issues/new")
 	BrandRepoURL      string // REPO_URL (default: "https://github.com/kubestellar/console")
 	BrandHostedDomain string // HOSTED_DOMAIN — domain for demo mode (default: "console.kubestellar.io")
+	// AgentToken is the shared secret for authenticating with kc-agent.
+	// startup-oauth.sh generates this and passes it to both kc-agent and
+	// the Go backend via the KC_AGENT_TOKEN env var. The backend serves
+	// it to authenticated users via GET /api/agent/token so the frontend
+	// can call kc-agent endpoints that require Bearer auth.
+	AgentToken string
+	// Kubara platform catalog configuration
+	// KubaraCatalogRepo is the GitHub owner/name of the catalog repo
+	// (e.g. "my-org/my-catalog"). Defaults to "kubara-io/kubara".
+	KubaraCatalogRepo string
+	// KubaraCatalogPath is the directory path inside the repo containing
+	// Helm chart subdirectories. Defaults to the standard Kubara path.
+	KubaraCatalogPath string
+	// NoLocalAgent suppresses the frontend's local kc-agent connections
+	// (ws://127.0.0.1:8585). Set to true for in-cluster deployments
+	// (Helm/Kubernetes) where no local kc-agent exists on the user's machine.
+	// Exposed via /health as "no_local_agent" so the pre-built frontend image
+	// can detect this at runtime without requiring a VITE_NO_LOCAL_AGENT rebuild.
+	NoLocalAgent bool
 	// Watchdog support: when set, the backend listens on this port instead of Port
 	BackendPort int
 }
@@ -146,7 +199,9 @@ type Server struct {
 	loadingSrv          *http.Server // temporary loading screen server
 	shuttingDown        int32        // atomic flag: 1 during graceful shutdown
 	gpuUtilWorker       *GPUUtilizationWorker
+	workloadHandlers    *handlers.WorkloadHandlers // for cache refresh shutdown (#10007)
 	done                chan struct{} // closed on Shutdown to stop background goroutines
+	shutdownOnce        sync.Once     // ensures Shutdown is idempotent (#6478)
 }
 
 // NewServer creates a new API server. It starts a temporary loading page
@@ -163,13 +218,12 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 	}
 
-	// JWT secret handling — in dev mode, a random secret is generated on each
-	// startup, which means existing JWTs (browser cookies, WebSocket tokens) are
-	// invalidated on restart. Set JWT_SECRET in .env to persist across restarts.
+	// JWT secret handling — in dev mode, generate a random secret and persist
+	// it to .jwt-secret so it survives server restarts and hot-reloads (#6850).
+	// Set JWT_SECRET in .env to use a fixed secret instead.
 	if cfg.JWTSecret == "" {
 		if cfg.DevMode {
-			cfg.JWTSecret = generateDevSecret()
-			slog.Warn("Using auto-generated JWT secret (tokens will not survive restart). Set JWT_SECRET in .env to persist sessions across restarts.")
+			cfg.JWTSecret = loadOrCreateDevSecret()
 		} else {
 			slog.Error("FATAL: JWT_SECRET environment variable is required in production mode. " +
 				"Set JWT_SECRET to a cryptographically secure random string (at least 32 characters).")
@@ -199,19 +253,40 @@ func NewServer(cfg Config) (*Server, error) {
 	middleware.InitTokenRevocation(db)
 
 	// Create Fiber app
-	// feedbackBodyLimit is elevated globally to 20 MB to support base64-encoded
-	// screenshot uploads in the POST /api/feedback/requests endpoint. Non-feedback
-	// POST routes are protected by a tighter per-route body-size middleware
-	// (apiDefaultBodyLimit) to limit memory pressure from oversized requests.
-	const feedbackBodyLimit = 20 * 1024 * 1024 // 20 MB — base64 screenshot uploads
+	// trustedProxyCIDRs are the RFC-1918 and link-local ranges typical of
+	// Kubernetes ingress controllers, cloud load-balancers, and service meshes.
+	// When EnableTrustedProxyCheck is true, Fiber only honours X-Forwarded-For /
+	// X-Real-Ip from source IPs within these CIDRs, so c.IP() returns the real
+	// client IP instead of the proxy's IP (#7028).
+	trustedProxyCIDRs := []string{
+		"10.0.0.0/8",     // RFC-1918 Class A private
+		"172.16.0.0/12",  // RFC-1918 Class B private
+		"192.168.0.0/16", // RFC-1918 Class C private
+		"fc00::/7",       // IPv6 ULA
+		"127.0.0.0/8",    // loopback
+		"::1/128",        // IPv6 loopback
+	}
+
+	// BodyLimit defaults to feedbackBodyLimit (5 MB) because the feedback endpoint
+	// accepts base64-encoded screenshot uploads. Per-route enforcement is done by
+	// bodyGuard middleware (1 MB for most routes) and analyticsBodyGuard (64 KB).
+	// Reduced from 20 MB to 5 MB to limit memory-based DoS surface (#9710).
+	// Deployers can override via MAX_BODY_BYTES env var (#9891) to raise the cap
+	// for large form uploads or lower it to tighten the DoS surface further.
+	// ReadTimeout (30s) further bounds the buffering window.
+	maxBodyBytes := resolveMaxBodyBytes()
+	slog.Info("fiber body limit configured", "bytes", maxBodyBytes)
 	app := fiber.New(fiber.Config{
-		ErrorHandler:    customErrorHandler,
-		ReadBufferSize:  16384,
-		WriteBufferSize: 16384,
-		BodyLimit:       feedbackBodyLimit,
-		ReadTimeout:     30 * time.Second,
-		WriteTimeout:    5 * time.Minute, // large static assets on slow networks
-		IdleTimeout:     2 * time.Minute,
+		ErrorHandler:            customErrorHandler,
+		ReadBufferSize:          16384,
+		WriteBufferSize:         16384,
+		BodyLimit:               maxBodyBytes,
+		ReadTimeout:             30 * time.Second,
+		WriteTimeout:            5 * time.Minute, // large static assets on slow networks
+		IdleTimeout:             2 * time.Minute,
+		EnableTrustedProxyCheck: true,
+		TrustedProxies:          trustedProxyCIDRs,
+		ProxyHeader:             "X-Forwarded-For",
 	})
 
 	// WebSocket hub
@@ -247,7 +322,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Initialize AI providers
 	if err := agent.InitializeProviders(); err != nil {
-		slog.Info("AI features disabled — add API keys in Settings to enable")
+		slog.Warn("AI features disabled — add API keys in Settings to enable", "error", err)
 	}
 
 	// Initialize MCP bridge (starts in background)
@@ -263,7 +338,7 @@ func NewServer(cfg Config) (*Server, error) {
 			defer cancel()
 			if err := bridge.Start(ctx); err != nil {
 				// MCP tools not installed — expected for local binary quickstart
-				slog.Info("MCP bridge not available (install kubestellar-ops/deploy plugins to enable)")
+				slog.Warn("MCP bridge not available (install kubestellar-ops/deploy plugins to enable)", "error", err)
 			} else {
 				slog.Info("MCP bridge started successfully")
 			}
@@ -302,13 +377,18 @@ func NewServer(cfg Config) (*Server, error) {
 		done:                make(chan struct{}),
 	}
 
+	// Enable SQLite persistence for audit entries (#8670 Phase 3).
+	audit.SetStore(db)
+
 	server.setupMiddleware()
 	server.setupRoutes()
 
 	// Start GPU utilization background worker (collects hourly snapshots)
 	if k8sClient != nil {
-		server.gpuUtilWorker = NewGPUUtilizationWorker(db, k8sClient)
+		server.gpuUtilWorker = NewGPUUtilizationWorker(db, k8sClient, notificationService)
 		server.gpuUtilWorker.Start()
+	} else {
+		slog.Info("[Server] GPU utilization worker skipped — no Kubernetes client available")
 	}
 
 	slog.Info("Server initialization complete")
@@ -318,10 +398,24 @@ func NewServer(cfg Config) (*Server, error) {
 
 // startLoadingServer starts a temporary HTTP server that serves a loading page.
 // It returns immediately — the server runs in a background goroutine.
+//
+// The loading server intentionally returns HTTP 503 (Service Unavailable) on
+// /health while the real Fiber app is still initializing. This matters for
+// readiness probes, smoke tests, and `curl -sf` style checks (#9904): without
+// it, callers think the backend is ready as soon as the loading page binds,
+// race ahead to real API routes like /auth/github, and get the loading HTML
+// back with HTTP 200 — which looks like a broken auth contract but is
+// actually the loading page's catch-all `/` handler answering the request.
+// A 503 on /health forces probes to keep polling until the real server is up.
 func startLoadingServer(addr string) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// 503 + Retry-After tells orchestrators and smoke tests the backend is
+		// not ready yet. The body still describes the state for human debugging.
+		const loadingHealthRetryAfterSec = "1"
+		w.Header().Set("Retry-After", loadingHealthRetryAfterSec)
+		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte(`{"status":"starting"}`))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -345,15 +439,17 @@ func (s *Server) setupMiddleware() {
 	// Recovery middleware
 	s.app.Use(recover.New())
 
-	// Gzip/Brotli compression for API responses only — static assets are pre-compressed at build time
+	// Gzip/Brotli compression for API responses only — static assets are pre-compressed at build time.
+	// The handler is created once and reused across requests (#7575).
+	compressHandler := compress.New(compress.Config{
+		Level: compress.LevelBestCompression,
+	})
 	s.app.Use(func(c *fiber.Ctx) error {
 		p := c.Path()
 		if strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".wasm") || strings.HasSuffix(p, ".json") || strings.HasSuffix(p, ".svg") || strings.HasSuffix(p, ".woff2") {
 			return c.Next() // skip compress middleware — served pre-compressed with Content-Length
 		}
-		return compress.New(compress.Config{
-			Level: compress.LevelBestCompression,
-		})(c)
+		return compressHandler(c)
 	})
 
 	// Logger
@@ -366,18 +462,71 @@ func (s *Server) setupMiddleware() {
 	s.app.Use(cors.New(cors.Config{
 		AllowOrigins:     s.config.FrontendURL,
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
+		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Requested-With,X-KC-Client-Auth",
 		ExposeHeaders:    "X-Token-Refresh",
 		AllowCredentials: true,
 	}))
 
-	// Security headers
+	// Security headers (#7037 CSP, #7038 HSTS)
 	s.app.Use(func(c *fiber.Ctx) error {
 		c.Set("X-Content-Type-Options", "nosniff")
-		c.Set("X-Frame-Options", "DENY")
+		// Skip X-Frame-Options: DENY for /embed/* routes to allow iframe embedding
+		// These routes display public CI/CD data and are designed for embedding
+		if !strings.HasPrefix(c.Path(), "/embed/") {
+			c.Set("X-Frame-Options", "DENY")
+		}
 		c.Set("X-XSS-Protection", "0") // Disabled per OWASP — modern browsers don't need it and it can introduce vulnerabilities
 		c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		c.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
+		// Content-Security-Policy: restrict script/style sources to self and
+		// known analytics/CDN origins. 'unsafe-inline' is required for Vite
+		// dev mode injected styles and inline event handlers in the SPA.
+		//
+		// connect-src includes the local kc-agent (port 8585) for both HTTP
+		// and WebSocket on 127.0.0.1 and localhost. Without these, the
+		// browser blocks all frontend→agent communication because the agent
+		// runs on a different port than the backend (cross-origin).
+		// See: web/src/lib/constants/network.ts (LOCAL_AGENT_HTTP_URL,
+		// LOCAL_AGENT_WS_URL) for the exact URLs the frontend uses.
+		const kcAgentLoopback = "http://127.0.0.1:8585"  // kc-agent HTTP on loopback IP
+		const kcAgentLoopbackWS = "ws://127.0.0.1:8585"  // kc-agent WebSocket on loopback IP
+		const kcAgentLocalhost = "http://localhost:8585" // kc-agent HTTP on localhost
+		const kcAgentLocalhostWS = "ws://localhost:8585" // kc-agent WebSocket on localhost
+
+		// script-src includes 'wasm-unsafe-eval' because the SQLite cache
+		// worker compiles a WebAssembly module at runtime; without it the
+		// worker aborts, logs a noisy CompileError, and forces an IndexedDB
+		// fallback on every page load. 'wasm-unsafe-eval' is a narrower
+		// permission than 'unsafe-eval' — it allows WebAssembly.instantiate
+		// but still blocks JS eval/Function.
+		//
+		// connect-src includes https://cdn.jsdelivr.net because the login
+		// page's Three.js globe renders cluster labels via troika-three-text,
+		// which fetches a unicode font resolver from jsdelivr at runtime.
+		// Without it the font lookup throws, labels fail to render, and the
+		// globe initialization aborts — leaving the right side of the login
+		// page blank.
+		c.Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://www.googletagmanager.com; "+
+				"worker-src 'self' blob:; "+
+				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
+				"img-src 'self' data: https:; "+
+				"connect-src 'self' "+kcAgentLoopback+" "+kcAgentLoopbackWS+" "+kcAgentLocalhost+" "+kcAgentLocalhostWS+" https://console.kubestellar.io https://api.github.com https://www.google-analytics.com https://www.googletagmanager.com https://cdn.jsdelivr.net wss:; "+
+				"font-src 'self' data: https://fonts.gstatic.com; "+
+				"object-src 'none'; "+
+				"base-uri 'self'")
+
+		// Strict-Transport-Security: instruct browsers to always use HTTPS.
+		// Only emitted when the request arrived over TLS (or via a TLS-terminating
+		// proxy) to avoid breaking local HTTP development (#7038).
+		if c.Protocol() == "https" {
+			const hstsMaxAgeSec = 63072000 // 2 years in seconds
+			c.Set("Strict-Transport-Security",
+				fmt.Sprintf("max-age=%d; includeSubDomains", hstsMaxAgeSec))
+		}
+
 		return c.Next()
 	})
 }
@@ -470,11 +619,16 @@ func (s *Server) setupRoutes() {
 			// If no cached health data yet, keep "ok" — health poller hasn't run yet
 		}
 
+		// Suppress local kc-agent connections when explicitly configured
+		// (NO_LOCAL_AGENT=true) or auto-detected as running in-cluster.
+		noLocalAgent := s.config.NoLocalAgent || inCluster
+
 		resp := fiber.Map{
 			"status":           healthStatus,
 			"version":          Version,
 			"oauth_configured": s.oauthConfigured(),
 			"in_cluster":       inCluster,
+			"no_local_agent":   noLocalAgent,
 			"install_method":   detectInstallMethod(inCluster),
 			"project":          s.config.ConsoleProject,
 			"branding": fiber.Map{
@@ -557,28 +711,82 @@ func (s *Server) setupRoutes() {
 		DevMode:        s.config.DevMode,
 		SkipOnboarding: s.config.SkipOnboarding,
 	})
-	// Rate limit auth endpoints — stricter to prevent brute-force
+	// FailureTracker for per-user/IP auth failure counting (#8676 Phase 1).
+	// Exposed via c.Locals for use in auth handlers in future phases.
+	failureTracker := middleware.NewFailureTracker()
+
+	// Rate limit auth endpoints — stricter to prevent brute-force.
+	// Uses composite key (userID:IP when authenticated, IP alone pre-auth)
+	// so users behind shared NAT don't exhaust each other's budgets (#8676).
 	authLimiterMaxRequests := 10         // max requests per window
 	authLimiterWindow := 1 * time.Minute // sliding window duration
 	authLimiter := limiter.New(limiter.Config{
-		Max:        authLimiterMaxRequests,
-		Expiration: authLimiterWindow,
+		Max:          authLimiterMaxRequests,
+		Expiration:   authLimiterWindow,
+		KeyGenerator: middleware.CompositeKey,
+		LimitReached: func(c *fiber.Ctx) error {
+			ip := c.IP()
+			retryAfter := failureTracker.GetRetryAfter(ip)
+			count := failureTracker.GetFailureCount(ip)
+			if count >= middleware.FailureThresholdSoftLock {
+				slog.Warn("[RateLimit] auth soft-lock", "ip", ip, "failures", count)
+			}
+			c.Set("Retry-After", strconv.Itoa(retryAfter)) // #7040 + #8676 Phase 2
+			return c.Status(429).JSON(fiber.Map{"error": "too many requests, try again later"})
+		},
+	})
+	// Inject FailureTracker into request context for auth handlers (#8676).
+	injectTracker := func(c *fiber.Ctx) error {
+		c.Locals("failureTracker", failureTracker)
+		return c.Next()
+	}
+
+	// Wire WebSocket hub into auth handler so logout disconnects WS sessions (#4906)
+	auth.SetHub(s.hub)
+	s.app.Get("/auth/github", authLimiter, injectTracker, auth.GitHubLogin)
+	s.app.Get("/auth/github/callback", authLimiter, injectTracker, auth.GitHubCallback)
+	// #6587 — /auth/logout now requires JWTAuth. Previously anyone could
+	// POST /auth/logout with any JWT (even a stolen one) because the route
+	// was registered without the auth middleware. Requiring JWTAuth proves
+	// the caller owns the token it is trying to revoke. The Logout handler
+	// itself still validates the token independently so it can surface an
+	// idempotent 200 when an expired token is presented.
+	//
+	// #6579 — /auth/refresh similarly requires JWTAuth so that a revoked
+	// token is rejected by the middleware before the handler even runs.
+	jwtAuth := middleware.JWTAuth(s.config.JWTSecret)
+	csrfGuard := middleware.RequireCSRF()
+	s.app.Post("/auth/refresh", authLimiter, injectTracker, csrfGuard, jwtAuth, auth.RefreshToken)
+	s.app.Post("/auth/logout", authLimiter, injectTracker, csrfGuard, jwtAuth, auth.Logout)
+
+	// Public endpoint rate limiter — loose limit to prevent DoS on unauthenticated
+	// routes (active-users, ping, nightly-e2e, youtube, medium, analytics) (#7029).
+	publicLimiterMaxRequests := 120        // max requests per window per IP (#9969: raised from 60 — multiple users behind shared NAT)
+	publicLimiterWindow := 1 * time.Minute // sliding window duration
+	publicLimiter := limiter.New(limiter.Config{
+		Max:        publicLimiterMaxRequests,
+		Expiration: publicLimiterWindow,
 		KeyGenerator: func(c *fiber.Ctx) string {
 			return c.IP()
 		},
 		LimitReached: func(c *fiber.Ctx) error {
+			c.Set("Retry-After", strconv.Itoa(int(publicLimiterWindow.Seconds()))) // #7040
 			return c.Status(429).JSON(fiber.Map{"error": "too many requests, try again later"})
 		},
 	})
-	// Wire WebSocket hub into auth handler so logout disconnects WS sessions (#4906)
-	auth.SetHub(s.hub)
-	s.app.Get("/auth/github", authLimiter, auth.GitHubLogin)
-	s.app.Get("/auth/github/callback", authLimiter, auth.GitHubCallback)
-	s.app.Post("/auth/refresh", authLimiter, auth.RefreshToken)
-	s.app.Post("/auth/logout", authLimiter, auth.Logout)
+
+	// analyticsBodyLimit constrains analytics proxy POST bodies at the Fiber level
+	// so oversized payloads are rejected before full buffering (#7030).
+	const analyticsBodyLimit = 64 * 1024 // 64 KB — analytics payloads are small JSON/query strings
+	analyticsBodyGuard := func(c *fiber.Ctx) error {
+		if len(c.Body()) > analyticsBodyLimit {
+			return fiber.ErrRequestEntityTooLarge
+		}
+		return c.Next()
+	}
 
 	// Active users endpoint (public — returns only aggregate counts, no sensitive data)
-	s.app.Get("/api/active-users", func(c *fiber.Ctx) error {
+	s.app.Get("/api/active-users", publicLimiter, func(c *fiber.Ctx) error {
 		wsUsers := s.hub.GetActiveUsersCount()
 		demoSessions := s.hub.GetDemoSessionCount()
 		wsTotalConns := s.hub.GetTotalConnectionsCount()
@@ -602,7 +810,7 @@ func (s *Server) setupRoutes() {
 	// Active users heartbeat endpoint (for demo mode session counting)
 	// This is unauthenticated telemetry — session IDs are validated for length
 	// and the total number of unique sessions is capped to prevent inflation.
-	s.app.Post("/api/active-users", func(c *fiber.Ctx) error {
+	s.app.Post("/api/active-users", publicLimiter, func(c *fiber.Ctx) error {
 		var body struct {
 			SessionID string `json:"sessionId"`
 		}
@@ -622,57 +830,162 @@ func (s *Server) setupRoutes() {
 	// Public API routes (no auth — only non-sensitive, publicly-available data)
 	// Nightly E2E status is public GitHub Actions data, safe for desktop widgets
 	nightlyE2EPublic := handlers.NewNightlyE2EHandler(s.config.GitHubToken)
-	s.app.Get("/api/public/nightly-e2e/runs", nightlyE2EPublic.GetRuns)
-	s.app.Get("/api/public/nightly-e2e/run-logs", nightlyE2EPublic.GetRunLogs)
+	s.app.Get("/api/public/nightly-e2e/runs", publicLimiter, nightlyE2EPublic.GetRuns)
+	s.app.Get("/api/public/nightly-e2e/run-logs", publicLimiter, nightlyE2EPublic.GetRunLogs)
 
 	// Analytics proxies (public — no auth required, have their own origin validation)
-	// MUST be registered before the /api group so JWTAuth middleware doesn't intercept them
-	s.app.All("/api/m", handlers.GA4CollectProxy)
-	s.app.Get("/api/gtag", handlers.GA4ScriptProxy)
-	s.app.Get("/api/ksc", handlers.UmamiScriptProxy)
-	s.app.Post("/api/send", handlers.UmamiCollectProxy)
+	// MUST be registered before the /api group so JWTAuth middleware doesn't intercept them.
+	// Protected by publicLimiter (#7029) and analyticsBodyGuard (#7030).
+	s.app.All("/api/m", publicLimiter, analyticsBodyGuard, handlers.GA4CollectProxy)
+	s.app.Get("/api/gtag", publicLimiter, handlers.GA4ScriptProxy)
+	s.app.Get("/api/ksc", publicLimiter, handlers.UmamiScriptProxy)
+	s.app.Post("/api/send", publicLimiter, analyticsBodyGuard, handlers.UmamiCollectProxy)
 
 	// Network ping proxy (public — lightweight server-side HTTP HEAD for latency measurement)
 	// Avoids browser no-cors limitations that produce unreliable results
-	s.app.Get("/api/ping", handlers.PingHandler)
+	s.app.Get("/api/ping", publicLimiter, handlers.PingHandler)
 
 	// MCP handlers (used in protected routes below)
-	mcpHandlers := handlers.NewMCPHandlers(s.bridge, s.k8sClient)
+	mcpHandlers := handlers.NewMCPHandlers(s.bridge, s.k8sClient, s.store)
 	// SECURITY FIX: All MCP routes are now protected regardless of dev mode
 	// Dev mode only affects things like frontend URLs and default users,
 	// NOT authentication requirements
 
 	// YouTube playlist (public — proxies to YouTube RSS feed, cached 1h)
-	s.app.Get("/api/youtube/playlist", handlers.YouTubePlaylistHandler)
-	s.app.Get("/api/youtube/thumbnail/:id", handlers.YouTubeThumbnailProxy)
+	s.app.Get("/api/youtube/playlist", publicLimiter, handlers.YouTubePlaylistHandler)
+	s.app.Get("/api/youtube/thumbnail/:id", publicLimiter, handlers.YouTubeThumbnailProxy)
 
 	// Medium blog (public — proxies to Medium RSS feed, cached 1h)
-	s.app.Get("/api/medium/blog", handlers.MediumBlogHandler)
+	s.app.Get("/api/medium/blog", publicLimiter, handlers.MediumBlogHandler)
+
+	// ACMM scan — registered below on the authenticated api group
 
 	// Mission knowledge base browse/file (public — proxies to public GitHub repo)
 	missions := handlers.NewMissionsHandler()
 	missions.RegisterPublicRoutes(s.app.Group("/api/missions"))
 
+	// Compliance frameworks public read endpoints (no auth — needed for demo mode).
+	// POST endpoints (evaluate, report) are registered on the auth-protected api group below.
+	complianceFrameworks := handlers.NewComplianceFrameworksHandler(nil)
+	complianceFrameworks.RegisterPublicRoutes(s.app.Group("/api/compliance/frameworks", publicLimiter))
+	// Data residency enforcement (public read — demo mode).
+	residencyEngine := residency.NewEngine()
+	dataResidency := handlers.NewDataResidencyHandler(residencyEngine)
+	dataResidency.RegisterPublicRoutes(s.app.Group("/api/compliance/residency", publicLimiter))
+
+	// Wrap publicLimiter to skip critical paths that must never be rate-limited
+	// by background polling collateral. Fiber v2 group("/api") prefix matching
+	// applies group middleware to ALL /api/* routes — including /api/me,
+	// /api/feedback/requests, /api/github/*, and /api/version — even though
+	// those routes are registered standalone outside the group. Without this
+	// skip wrapper, 16 compliance/supply-chain handlers each creating
+	// Group("/api", publicLimiter) would stack 16 independent publicLimiter
+	// checks on every /api/* request.
+	publicLimiterSkipPaths := map[string]bool{
+		"/api/feedback/requests": true,
+		"/api/me":                true,
+		"/api/version":           true,
+	}
+	publicLimiterWithSkip := func(c *fiber.Ctx) error {
+		path := c.Path()
+		if publicLimiterSkipPaths[path] {
+			return c.Next()
+		}
+		if strings.HasPrefix(path, "/api/github/") {
+			return c.Next()
+		}
+		if strings.HasPrefix(path, "/api/auth/") {
+			return c.Next()
+		}
+		return publicLimiter(c)
+	}
+	publicAPI := s.app.Group("/api", publicLimiterWithSkip)
+
+	// Change control audit trail public read endpoints (demo mode).
+	changeControl := handlers.NewChangeControlHandler()
+	changeControl.RegisterPublicRoutes(publicAPI)
+
+	// Segregation of duties public read endpoints (demo mode).
+	sodHandler := handlers.NewSoDHandler()
+	sodHandler.RegisterPublicRoutes(publicAPI)
+
+	// BAA tracker public read endpoints (demo mode).
+	baaHandler := handlers.NewBAAHandler()
+	baaHandler.RegisterPublicRoutes(publicAPI)
+	// HIPAA compliance public read endpoints (demo mode).
+	hipaaHandler := handlers.NewHIPAAHandler()
+	hipaaHandler.RegisterPublicRoutes(publicAPI)
+	// GxP / 21 CFR Part 11 public read endpoints (demo mode).
+	gxpHandler := handlers.NewGxPHandler()
+	gxpHandler.RegisterPublicRoutes(publicAPI)
+	// NIST 800-53 control mapping public read endpoints (demo mode).
+	nistHandler := handlers.NewNIST80053Handler()
+	nistHandler.RegisterPublicRoutes(publicAPI)
+	// DISA STIG compliance public read endpoints (demo mode).
+	stigHandler := handlers.NewSTIGHandler()
+	stigHandler.RegisterPublicRoutes(publicAPI)
+	// Air-gap readiness public read endpoints (demo mode).
+	airgapHandler := handlers.NewAirGapHandler()
+	airgapHandler.RegisterPublicRoutes(publicAPI)
+	// FedRAMP readiness public read endpoints (demo mode).
+	fedrampHandler := handlers.NewFedRAMPHandler()
+	fedrampHandler.RegisterPublicRoutes(publicAPI)
+	// Epic 5: Security Operations — SIEM Export (#9643).
+	siemHandler := handlers.NewSIEMHandler()
+	siemHandler.RegisterPublicRoutes(publicAPI)
+	// Epic 6: Supply Chain & Software Provenance (#9632, #9644, #9646, #9647, #9648).
+	sbomHandler := handlers.NewSBOMHandler()
+	sbomHandler.RegisterPublicRoutes(publicAPI)
+	signingHandler := handlers.NewSigningHandler()
+	signingHandler.RegisterPublicRoutes(publicAPI)
+	slsaHandler := handlers.NewSLSAHandler()
+	slsaHandler.RegisterPublicRoutes(publicAPI)
+	licenseHandler := handlers.NewLicenseHandler()
+	licenseHandler.RegisterPublicRoutes(publicAPI)
+	// Runtime Attestation Score (#9987) — composite trust score per cluster.
+	attestationHandler := handlers.NewAttestationHandler()
+	attestationHandler.RegisterPublicRoutes(publicAPI)
+
 	// API routes (protected) — with rate limiting
-	apiLimiterMaxRequests := 200        // max requests per window per IP
+	//
+	// NOTE (#7033): Both authLimiter and apiLimiter use Fiber's default in-process
+	// memory storage. In a multi-replica Kubernetes deployment each pod maintains
+	// an independent counter, so the effective limit is `max × N` where N is the
+	// pod count. A shared Redis/Valkey storage backend is recommended for strict
+	// enforcement across replicas but is out of scope for this change.
+	apiLimiterMaxRequests := 2000       // max requests per window per user+IP (#10100: raised from 600 — dashboard + background polling can exceed 600 in the first minute)
 	apiLimiterWindow := 1 * time.Minute // sliding window duration
 	apiLimiter := limiter.New(limiter.Config{
-		Max:        apiLimiterMaxRequests,
-		Expiration: apiLimiterWindow,
-		KeyGenerator: func(c *fiber.Ctx) string {
-			return c.IP()
-		},
+		Max:          apiLimiterMaxRequests,
+		Expiration:   apiLimiterWindow,
+		KeyGenerator: middleware.CompositeKey, // per-user+IP: authenticated users are bucketed individually (#9969)
 		LimitReached: func(c *fiber.Ctx) error {
+			c.Set("Retry-After", strconv.Itoa(int(apiLimiterWindow.Seconds()))) // #7040
 			return c.Status(429).JSON(fiber.Map{"error": "too many requests, try again later"})
 		},
 	})
-	// Body-size guard: enforce a 1 MB limit on all API routes except the
-	// feedback creation endpoint which accepts large base64 screenshot payloads
-	// (up to the global 20 MB Fiber BodyLimit).
-	const apiDefaultBodyLimit = 1 * 1024 * 1024 // 1 MB — sufficient for JSON API requests
+
+	// feedbackLimiter is a dedicated per-user rate limiter for the issue
+	// submission endpoint (#9969). It uses a 1-hour window so a single user
+	// can submit at least 10 feature requests per hour without being blocked
+	// by background API polling that may saturate the general apiLimiter.
+	// CompositeKey keys on userID+IP for authenticated users and plain IP
+	// for unauthenticated callers.
+	const feedbackLimiterMaxRequests = 10        // 10 submissions per user per hour
+	feedbackLimiterWindow := 1 * time.Hour       // sliding window duration
+	feedbackLimiter := limiter.New(limiter.Config{
+		Max:          feedbackLimiterMaxRequests,
+		Expiration:   feedbackLimiterWindow,
+		KeyGenerator: middleware.CompositeKey,
+		LimitReached: func(c *fiber.Ctx) error {
+			c.Set("Retry-After", strconv.Itoa(int(feedbackLimiterWindow.Seconds()))) // #9969
+			return c.Status(429).JSON(fiber.Map{"error": "too many requests, try again later"})
+		},
+	})
+	// bodyGuard: enforce apiDefaultBodyLimit (1 MB) on all API routes except the
+	// feedback creation endpoint which accepts large base64 screenshot payloads.
 	bodyGuard := func(c *fiber.Ctx) error {
 		if c.Method() == fiber.MethodPost && c.Path() == "/api/feedback/requests" {
-			// Allow the elevated feedbackBodyLimit (checked by Fiber global config)
 			return c.Next()
 		}
 		if len(c.Body()) > apiDefaultBodyLimit {
@@ -680,19 +993,131 @@ func (s *Server) setupRoutes() {
 		}
 		return c.Next()
 	}
-	api := s.app.Group("/api", apiLimiter, bodyGuard, middleware.JWTAuth(s.config.JWTSecret))
 
-	// User routes
+	// Feedback POST route: uses its own feedbackLimiter (10 req/hr per user).
+	// The apiLimiterWithSkip wrapper exempts this path so dashboard polling
+	// cannot block user feedback submission (#9969).
+	feedbackCfg := handlers.LoadFeedbackConfig()
+	feedback := handlers.NewFeedbackHandler(s.store, feedbackCfg)
+	s.app.Post("/api/feedback/requests", bodyGuard, csrfGuard, middleware.JWTAuth(s.config.JWTSecret), feedbackLimiter, feedback.CreateFeatureRequest)
+
+	// Wrap apiLimiter so it skips the feedback POST — that route has its own
+	// dedicated feedbackLimiter (10 req/hr). Without this, Fiber's group prefix
+	// matching applies apiLimiter to ALL /api/* routes including the standalone
+	// POST registered above, causing 429 when dashboard polling exhausts the
+	// general budget.
+	apiLimiterSkipPaths := map[string]bool{
+		"/api/feedback/requests": true, // feedback submission has its own feedbackLimiter
+		"/api/me":                true, // user identity — must survive for login to work
+		"/api/version":           true, // version check for update dialog
+	}
+	apiLimiterSkipPrefixes := []string{
+		"/api/github/", // GitHub proxy (updates dialog, contributions list) has its own per-user limiter
+	}
+	apiLimiterWithSkip := func(c *fiber.Ctx) error {
+		path := c.Path()
+		if apiLimiterSkipPaths[path] {
+			return c.Next()
+		}
+		for _, prefix := range apiLimiterSkipPrefixes {
+			if strings.HasPrefix(path, prefix) {
+				return c.Next()
+			}
+		}
+		return apiLimiter(c)
+	}
+
+	api := s.app.Group("/api", apiLimiterWithSkip, bodyGuard, csrfGuard, middleware.JWTAuth(s.config.JWTSecret))
+
+	// User identity routes — exempt from both apiLimiter (via skip list) and
+	// authLimiter. JWTAuth is sufficient protection. The old authLimiter
+	// (10 req/min) caused login loops: initial page load fires multiple /api/me
+	// calls, exhausting the budget and triggering a 429→redirect→login cycle.
 	user := handlers.NewUserHandler(s.store)
-	api.Get("/me", user.GetCurrentUser)
-	api.Put("/me", user.UpdateCurrentUser)
+	s.app.Get("/api/me", bodyGuard, csrfGuard, middleware.JWTAuth(s.config.JWTSecret), user.GetCurrentUser)
+	s.app.Put("/api/me", bodyGuard, csrfGuard, middleware.JWTAuth(s.config.JWTSecret), user.UpdateCurrentUser)
+
+	// kc-agent token endpoint — returns the shared KC_AGENT_TOKEN so the
+	// frontend can authenticate to kc-agent HTTP endpoints (auto-update, etc.).
+	// Auth-protected: only logged-in users can retrieve this.
+	agentToken := s.config.AgentToken
+	api.Get("/agent/token", func(c *fiber.Ctx) error {
+		if agentToken == "" {
+			return c.JSON(fiber.Map{"token": ""})
+		}
+		return c.JSON(fiber.Map{"token": agentToken})
+	})
+
+	// kc-agent auto-update proxy — forwards /api/agent/auto-update/* to the
+	// co-located kc-agent at 127.0.0.1:8585. This avoids cross-origin requests
+	// from the browser (localhost:8080 → 127.0.0.1:8585) which trigger CORS
+	// and Private Network Access checks that are fragile across browser versions.
+	// The backend injects the Bearer token server-side so the frontend never
+	// needs to know KC_AGENT_TOKEN for auto-update operations.
+	// allowedAgentSubPaths restricts which kc-agent endpoints the proxy
+	// can forward to — prevents path-traversal attacks via crafted :path.
+	allowedAgentSubPaths := map[string]bool{
+		"status":  true,
+		"config":  true,
+		"trigger": true,
+		"cancel":  true,
+	}
+	agentHTTPClient := &http.Client{Timeout: kcAgentProxyTimeout}
+	api.All("/agent/auto-update/:path", func(c *fiber.Ctx) error {
+		subPath := c.Params("path")
+
+		// Reject path-traversal sequences and non-allowlisted endpoints.
+		if strings.Contains(subPath, "..") || strings.Contains(subPath, "%2e") || strings.Contains(subPath, "%2E") || !allowedAgentSubPaths[subPath] {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid agent proxy path"})
+		}
+
+		targetURL := kcAgentBaseURL + "/auto-update/" + subPath
+
+		var bodyReader io.Reader
+		if len(c.Body()) > 0 {
+			bodyReader = bytes.NewReader(c.Body())
+		}
+
+		req, err := http.NewRequestWithContext(c.Context(), c.Method(), targetURL, bodyReader)
+		if err != nil {
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to create proxy request"})
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		if agentToken != "" {
+			req.Header.Set("Authorization", "Bearer "+agentToken)
+		}
+
+		resp, err := agentHTTPClient.Do(req)
+		if err != nil {
+			slog.Warn("[agent-proxy] request failed", "path", subPath, "error", err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "kc-agent unreachable"})
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		c.Set("Content-Type", resp.Header.Get("Content-Type"))
+		return c.Status(resp.StatusCode).Send(body)
+	})
 
 	// GitHub API proxy — keeps PAT server-side, frontend calls /api/github/*
 	githubProxy := handlers.NewGitHubProxyHandler(s.config.GitHubToken, s.store)
 	api.Get("/github/token/status", githubProxy.HasToken)
 	api.Post("/github/token", githubProxy.SaveToken)
 	api.Delete("/github/token", githubProxy.DeleteToken)
+	// GitHub Pipelines dashboard — registered BEFORE the /github/* wildcard
+	// proxy so Fiber matches the specific route first.
+	githubPipelines := handlers.NewGitHubPipelinesHandler(s.config.GitHubToken)
+	api.Get("/github-pipelines", githubPipelines.Serve)
+	api.Post("/github-pipelines", githubPipelines.Serve)
+	api.Get("/github-pipelines/health", githubPipelines.HandleHealth)
+
 	api.Get("/github/*", githubProxy.Proxy)
+
+	// ACMM scan — uses server's GitHub token like other GitHub-powered cards
+	api.Get("/acmm/scan", handlers.ACMMScanHandler)
+	// ACMM badge — shields.io endpoint with server-side caching
+	api.Get("/acmm/badge", handlers.ACMMBadgeHandler)
 
 	// Persistent settings routes
 	settingsHandler := handlers.NewSettingsHandler(settings.GetSettingsManager(), s.store)
@@ -756,20 +1181,49 @@ func (s *Server) setupRoutes() {
 	api.Get("/rbac/service-accounts", rbac.ListK8sServiceAccounts)
 	api.Get("/rbac/roles", rbac.ListK8sRoles)
 	api.Get("/rbac/bindings", rbac.ListK8sRoleBindings)
-	api.Get("/rbac/permissions", rbac.GetClusterPermissions)
-	api.Post("/rbac/service-accounts", rbac.CreateServiceAccount)
-	api.Post("/rbac/bindings", rbac.CreateRoleBinding)
-	api.Get("/permissions/summary", rbac.GetPermissionsSummary)
-	api.Post("/rbac/can-i", rbac.CheckCanI)
+	// NOTE: POST /api/rbac/service-accounts and POST /api/rbac/bindings moved
+	// to kc-agent (#7993 Phase 1.5 PR A). The frontend now POSTs to
+	// ${LOCAL_AGENT_HTTP_URL}/serviceaccounts and
+	// ${LOCAL_AGENT_HTTP_URL}/rolebindings so the mutation runs under the
+	// user's kubeconfig instead of the backend pod's ServiceAccount.
+	//
+	// NOTE: GET /api/rbac/permissions, GET /api/permissions/summary, and
+	// POST /api/rbac/can-i moved to kc-agent (#7993 Phase 6). The frontend
+	// now calls ${LOCAL_AGENT_HTTP_URL}/rbac/permissions,
+	// ${LOCAL_AGENT_HTTP_URL}/permissions/summary, and
+	// ${LOCAL_AGENT_HTTP_URL}/rbac/can-i so SelfSubjectAccessReviews run
+	// under the user's kubeconfig instead of the backend pod ServiceAccount
+	// when console is deployed in-cluster.
 
-	// Namespace management routes (admin only)
+	// Admin audit-log endpoint (#8670 Phase 3) — returns recent audit entries.
+	auditHandler := handlers.NewAuditHandler(s.store)
+	api.Get("/admin/audit-log", auditHandler.GetAuditLog)
+
+	// Compliance frameworks: pass nil evaluator for demo/synthetic results.
+	// A real evaluator requires a ClusterProber implementation backed by
+	// kubeconfig access to each managed cluster.
+	// Read-only GET routes are registered as public above; only POST
+	// (evaluate, report) requires authentication.
+	complianceFrameworks.RegisterRoutes(api.Group("/compliance/frameworks"))
+
+	// Compliance report generation: shares the same route group so
+	// POST /compliance/frameworks/:id/report sits alongside evaluate.
+	complianceReports := handlers.NewComplianceReportsHandler(nil)
+	complianceReports.RegisterRoutes(api.Group("/compliance/frameworks"))
+
+	// Namespace read routes. GET /namespaces is viewer-or-above (see
+	// ListNamespaces's requireViewerOrAbove check) and
+	// GET /namespaces/:name/access is admin-only (see GetNamespaceAccess).
+	// POST/DELETE /namespaces and POST/DELETE /namespaces/:name/access were
+	// migrated to kc-agent in #7993 Phases 1.5 and 2 — they now run under the
+	// user's kubeconfig instead of the backend pod ServiceAccount.
 	namespaces := handlers.NewNamespaceHandler(s.store, s.k8sClient)
 	api.Get("/namespaces", namespaces.ListNamespaces)
-	api.Post("/namespaces", namespaces.CreateNamespace)
-	api.Delete("/namespaces/:name", namespaces.DeleteNamespace)
 	api.Get("/namespaces/:name/access", namespaces.GetNamespaceAccess)
-	api.Post("/namespaces/:name/access", namespaces.GrantNamespaceAccess)
-	api.Delete("/namespaces/:name/access/:binding", namespaces.RevokeNamespaceAccess)
+
+	// Admin visibility routes — rate-limit metrics (#8676 Phase 3).
+	adminHandler := handlers.NewAdminHandler(failureTracker)
+	api.Get("/admin/rate-limit-status", adminHandler.GetRateLimitStatus)
 
 	// Mission knowledge base routes (validate, share — protected)
 	missions.RegisterRoutes(api.Group("/missions"))
@@ -782,6 +1236,11 @@ func (s *Server) setupRoutes() {
 	orbit := handlers.NewOrbitHandler(orbitDataDir)
 	orbit.RegisterRoutes(api.Group("/orbit"))
 	orbit.StartScheduler(s.done)
+
+	// Cross-cluster event journal (#9967 Phase 1)
+	timeline := handlers.NewTimelineHandler(s.store, s.k8sClient)
+	api.Get("/timeline", timeline.GetTimeline)
+	timeline.StartEventCollector(s.done)
 
 	// MCP routes (cluster operations via kubestellar tools and direct k8s)
 	// SECURITY: All MCP routes require authentication in both dev and production modes
@@ -798,8 +1257,9 @@ func (s *Server) setupRoutes() {
 	api.Get("/mcp/gpu-nodes", mcpHandlers.GetGPUNodes)
 	api.Get("/mcp/gpu-nodes/health", mcpHandlers.GetGPUNodeHealth)
 	api.Get("/mcp/gpu-nodes/health/cronjob", mcpHandlers.GetGPUHealthCronJobStatus)
-	api.Post("/mcp/gpu-nodes/health/cronjob", mcpHandlers.InstallGPUHealthCronJob)
-	api.Delete("/mcp/gpu-nodes/health/cronjob", mcpHandlers.UninstallGPUHealthCronJob)
+	// POST and DELETE /mcp/gpu-nodes/health/cronjob moved to kc-agent
+	// (#7993 Phase 3e). The agent exposes /gpu-health-cronjob with the same
+	// body shape, running under the user's kubeconfig.
 	api.Get("/mcp/gpu-nodes/health/cronjob/results", mcpHandlers.GetGPUHealthCronJobResults)
 	api.Get("/mcp/nvidia-operators", mcpHandlers.GetNVIDIAOperatorStatus)
 	api.Get("/mcp/nodes", mcpHandlers.GetNodes)
@@ -825,6 +1285,10 @@ func (s *Server) setupRoutes() {
 	api.Get("/mcp/wasmcloud/hosts", mcpHandlers.GetWasmCloudHosts)
 	api.Get("/mcp/wasmcloud/actors", mcpHandlers.GetWasmCloudActors)
 	api.Get("/mcp/custom-resources", mcpHandlers.GetCustomResources)
+	// Drasi reverse proxy — forwards to drasi-server (mode 1+2) or drasi-platform
+	// (mode 3) so the `/drasi` dashboard speaks the same client code to either.
+	// See pkg/api/handlers/drasi_proxy.go for the protocol detection contract.
+	api.All("/drasi/proxy/*", mcpHandlers.ProxyDrasi)
 	api.Get("/mcp/replicasets", mcpHandlers.GetReplicaSets)
 	api.Get("/mcp/statefulsets", mcpHandlers.GetStatefulSets)
 	api.Get("/mcp/daemonsets", mcpHandlers.GetDaemonSets)
@@ -875,12 +1339,10 @@ func (s *Server) setupRoutes() {
 	api.Get("/gitops/operator-subscriptions", gitopsHandlers.ListOperatorSubscriptions)
 	api.Get("/gitops/operator-subscriptions/stream", gitopsHandlers.StreamOperatorSubscriptions)
 	api.Get("/gitops/helm-releases/stream", gitopsHandlers.StreamHelmReleases)
-	api.Post("/gitops/detect-drift", gitopsHandlers.DetectDrift)
-	api.Post("/gitops/sync", gitopsHandlers.Sync)
-	// Helm write operations (rollback, uninstall, upgrade)
-	api.Post("/gitops/helm-rollback", gitopsHandlers.RollbackHelmRelease)
-	api.Post("/gitops/helm-uninstall", gitopsHandlers.UninstallHelmRelease)
-	api.Post("/gitops/helm-upgrade", gitopsHandlers.UpgradeHelmRelease)
+	// POST /gitops/detect-drift, /gitops/sync, /gitops/helm-rollback,
+	// /gitops/helm-uninstall, and /gitops/helm-upgrade moved to kc-agent in
+	// #7993 Phase 4 (agent-side added in 3a/3b). They run under the user's
+	// kubeconfig instead of the backend pod ServiceAccount.
 	// Helm self-upgrade (in-cluster Deployment patch)
 	selfUpgradeHandler := handlers.NewSelfUpgradeHandler(s.k8sClient, s.hub, s.store)
 	api.Get("/self-upgrade/status", selfUpgradeHandler.GetStatus)
@@ -891,7 +1353,8 @@ func (s *Server) setupRoutes() {
 	api.Get("/gitops/argocd/health", gitopsHandlers.GetArgoHealthSummary)
 	api.Get("/gitops/argocd/sync", gitopsHandlers.GetArgoSyncSummary)
 	api.Get("/gitops/argocd/status", gitopsHandlers.GetArgoStatus)
-	api.Post("/gitops/argocd/sync", gitopsHandlers.TriggerArgoSync)
+	// POST /gitops/argocd/sync moved to kc-agent in #7993 Phase 4 (agent-side
+	// added in Phase 3c). Runs under the user's kubeconfig.
 	// Frontend compatibility alias
 	api.Get("/mcp/operator-subscriptions", gitopsHandlers.ListOperatorSubscriptions)
 
@@ -900,8 +1363,9 @@ func (s *Server) setupRoutes() {
 	api.Get("/mcs/status", mcsHandlers.GetMCSStatus)
 	api.Get("/mcs/exports", mcsHandlers.ListServiceExports)
 	api.Get("/mcs/exports/:cluster/:namespace/:name", mcsHandlers.GetServiceExport)
-	api.Post("/mcs/exports", mcsHandlers.CreateServiceExport)
-	api.Delete("/mcs/exports/:cluster/:namespace/:name", mcsHandlers.DeleteServiceExport)
+	// Create/Delete ServiceExport routes removed in #7993 Phase 1.5 PR B.
+	// User-initiated mutations now run via kc-agent /serviceexports under
+	// the user's kubeconfig. The backend handlers had no frontend consumer.
 	api.Get("/mcs/imports", mcsHandlers.ListServiceImports)
 	api.Get("/mcs/imports/:cluster/:namespace/:name", mcsHandlers.GetServiceImport)
 
@@ -917,6 +1381,10 @@ func (s *Server) setupRoutes() {
 	crdHandlers := handlers.NewCRDHandlers(s.k8sClient)
 	api.Get("/crds", crdHandlers.ListCRDs)
 
+	// Lima routes (Lima VM status)
+	limaHandlers := handlers.NewLimaHandlers(s.k8sClient)
+	api.Get("/lima", limaHandlers.ListLima)
+
 	// MCS ServiceExport routes
 	svcExportHandlers := handlers.NewServiceExportHandlers(s.k8sClient)
 	api.Get("/service-exports", svcExportHandlers.ListServiceExports)
@@ -931,6 +1399,11 @@ func (s *Server) setupRoutes() {
 
 	// Workload routes
 	workloadHandlers := handlers.NewWorkloadHandlers(s.k8sClient, s.hub, s.store)
+	// Reload persisted cluster groups on startup (#7013) and start periodic
+	// refresh so multi-instance deployments converge on DB state (#10007).
+	workloadHandlers.LoadPersistedClusterGroups()
+	workloadHandlers.StartCacheRefresh()
+	s.workloadHandlers = workloadHandlers
 	api.Get("/workloads", workloadHandlers.ListWorkloads)
 	api.Get("/workloads/capabilities", workloadHandlers.GetClusterCapabilities)
 	api.Get("/workloads/policies", workloadHandlers.ListBindingPolicies)
@@ -939,9 +1412,10 @@ func (s *Server) setupRoutes() {
 	api.Get("/workloads/resolve-deps/:cluster/:namespace/:name", workloadHandlers.ResolveDependencies)
 	api.Get("/workloads/monitor/:cluster/:namespace/:name", workloadHandlers.MonitorWorkload)
 	api.Get("/workloads/:cluster/:namespace/:name", workloadHandlers.GetWorkload)
-	api.Post("/workloads/deploy", workloadHandlers.DeployWorkload)
-	api.Post("/workloads/scale", workloadHandlers.ScaleWorkload)
-	api.Delete("/workloads/:cluster/:namespace/:name", workloadHandlers.DeleteWorkload)
+	// NOTE: /workloads/deploy, /workloads/scale, and the DELETE
+	// /workloads/:cluster/:namespace/:name route all moved to kc-agent
+	// (#7993 Phase 1 PRs A and B). The agent uses the user's kubeconfig
+	// instead of the backend pod SA for those mutating operations.
 
 	// Cluster Group routes
 	api.Get("/cluster-groups", workloadHandlers.ListClusterGroups)
@@ -953,10 +1427,8 @@ func (s *Server) setupRoutes() {
 	api.Delete("/cluster-groups/:name", workloadHandlers.DeleteClusterGroup)
 
 	// Feature requests and feedback routes
-	feedbackCfg := handlers.LoadFeedbackConfig()
-	feedback := handlers.NewFeedbackHandler(s.store, feedbackCfg)
-	// Feedback token routes removed — consolidated into /api/github/token/* endpoints
-	api.Post("/feedback/requests", feedback.CreateFeatureRequest)
+	// POST route is registered outside the /api group to exempt it from apiLimiter (#9969)
+	// GET routes still use the group limiters for general API protection
 	api.Get("/feedback/requests", feedback.ListFeatureRequests)
 	api.Get("/feedback/queue", feedback.ListAllFeatureRequests)
 	api.Get("/feedback/requests/:id", feedback.GetFeatureRequest)
@@ -981,6 +1453,13 @@ func (s *Server) setupRoutes() {
 	})
 	api.Get("/rewards/github", rewardsHandler.GetGitHubRewards)
 
+	// Public contributor-tier badge (RFC #8862 Phase 2). SVG response, no
+	// auth required, rate-limited via publicLimiter (60 req/min/IP). Mounted
+	// on s.app, not `api`, because the `api` group is gated by JWTAuth and
+	// this endpoint must be reachable from READMEs via Camo.
+	badgeHandler := handlers.NewBadgeHandler(rewardsHandler, s.store)
+	s.app.Get("/api/rewards/badge/:github_login", publicLimiter, badgeHandler.GetBadge)
+
 	// Persistent per-user reward balances (issue #6011). Every authenticated
 	// user can read and mutate their own row — no RBAC gate needed because
 	// the handler scopes every query by the JWT-derived user id.
@@ -1003,6 +1482,13 @@ func (s *Server) setupRoutes() {
 	nightlyE2E := handlers.NewNightlyE2EHandler(s.config.GitHubToken)
 	api.Get("/nightly-e2e/runs", nightlyE2E.GetRuns)
 	api.Get("/nightly-e2e/run-logs", nightlyE2E.GetRunLogs)
+
+	// Kubara platform catalog — server-side cache so all users share one
+	// upstream fetch. Repo/path are configurable via KUBARA_CATALOG_REPO and
+	// KUBARA_CATALOG_PATH for private or self-hosted catalogs (#8487).
+	kubaraCatalog := handlers.NewKubaraCatalogHandler(s.config.GitHubToken, s.config.KubaraCatalogRepo, s.config.KubaraCatalogPath)
+	api.Get("/kubara/catalog", kubaraCatalog.GetCatalog)
+	api.Get("/kubara/config", kubaraCatalog.GetConfig)
 
 	// GPU reservation routes — capacity provider uses live k8s node data
 	// so the server never trusts client-supplied GPU limits (#5421).
@@ -1065,40 +1551,39 @@ func (s *Server) setupRoutes() {
 	api.Get("/persistence/status", persistenceHandler.GetStatus)
 	api.Post("/persistence/sync", persistenceHandler.SyncNow)
 	api.Post("/persistence/test", persistenceHandler.TestConnection)
-	// ManagedWorkload endpoints
+	// ManagedWorkload endpoints — writes moved to kc-agent /console-cr/workloads
+	// (#7993 Phase 2.5). They run under the user's kubeconfig instead of the
+	// backend pod SA. List/Get remain until Phase 4.5.
 	api.Get("/persistence/workloads", persistenceHandler.ListManagedWorkloads)
 	api.Get("/persistence/workloads/:name", persistenceHandler.GetManagedWorkload)
-	api.Post("/persistence/workloads", persistenceHandler.CreateManagedWorkload)
-	api.Put("/persistence/workloads/:name", persistenceHandler.UpdateManagedWorkload)
-	api.Delete("/persistence/workloads/:name", persistenceHandler.DeleteManagedWorkload)
-	// ClusterGroup endpoints
+	// ClusterGroup endpoints — writes moved to kc-agent /console-cr/groups (#7993 Phase 2.5).
 	api.Get("/persistence/groups", persistenceHandler.ListClusterGroups)
 	api.Get("/persistence/groups/:name", persistenceHandler.GetClusterGroup)
-	api.Post("/persistence/groups", persistenceHandler.CreateClusterGroup)
-	api.Put("/persistence/groups/:name", persistenceHandler.UpdateClusterGroup)
-	api.Delete("/persistence/groups/:name", persistenceHandler.DeleteClusterGroup)
-	// WorkloadDeployment endpoints
+	// WorkloadDeployment endpoints — writes (including the status subresource)
+	// moved to kc-agent /console-cr/deployments and
+	// /console-cr/deployments/status (#7993 Phase 2.5).
 	api.Get("/persistence/deployments", persistenceHandler.ListWorkloadDeployments)
 	api.Get("/persistence/deployments/:name", persistenceHandler.GetWorkloadDeployment)
-	api.Post("/persistence/deployments", persistenceHandler.CreateWorkloadDeployment)
-	api.Put("/persistence/deployments/:name/status", persistenceHandler.UpdateWorkloadDeploymentStatus)
-	api.Delete("/persistence/deployments/:name", persistenceHandler.DeleteWorkloadDeployment)
 
-	// GitHub webhook (public endpoint, uses signature verification)
+	// GitHub webhook (public endpoint, uses signature verification).
+	// Not behind the /api group, so the CSRF middleware does not apply — the
+	// handler's own HMAC signature check (X-Hub-Signature-256) authenticates
+	// the request instead.
 	s.app.Post("/webhooks/github", feedback.HandleGitHubWebhook)
 
 	// WebSocket for real-time updates
-	s.app.Use("/ws", middleware.WebSocketUpgrade())
+	// Rate-limited with publicLimiter to prevent connection flooding DoS
+	s.app.Use("/ws", publicLimiter, middleware.WebSocketUpgrade())
 	s.app.Get("/ws", websocket.New(func(c *websocket.Conn) {
 		s.hub.HandleConnection(c)
 	}))
 
-	// WebSocket for pod exec terminal — uses first-message JWT auth (same pattern as /ws hub)
-	execHandlers := handlers.NewExecHandlers(s.k8sClient, s.config.JWTSecret, s.config.DevMode)
-	s.app.Use("/ws/exec", middleware.WebSocketUpgrade())
-	s.app.Get("/ws/exec", websocket.New(func(c *websocket.Conn) {
-		execHandlers.HandleExec(c)
-	}))
+	// Pod exec WebSocket moved to kc-agent (#7993 Phase 3d, closes #5406).
+	// kc-agent runs the SPDY exec stream under the user's kubeconfig so the
+	// target apiserver enforces RBAC natively — no SubjectAccessReview
+	// workaround required. The frontend now connects to kc-agent's
+	// /ws/exec route via LOCAL_AGENT_WS_URL. See pkg/agent/server_exec.go
+	// and web/src/hooks/useExecSession.ts for the replacement.
 
 	// Serve static files in production
 	if !s.config.DevMode {
@@ -1281,37 +1766,57 @@ func waitForPortRelease(port int, timeout time.Duration) error {
 // Shutdown gracefully shuts down the server.
 // Sets shuttingDown flag first so /health returns "shutting_down"
 // before services are torn down, giving the frontend time to notice.
+//
+// Shutdown is idempotent (#6478): subsequent calls are no-ops. Previously a
+// second call panicked with "close of closed channel" when close(s.done)
+// was invoked a second time.
 func (s *Server) Shutdown() error {
-	atomic.StoreInt32(&s.shuttingDown, 1)
+	var shutdownErr error
+	s.shutdownOnce.Do(func() {
+		atomic.StoreInt32(&s.shuttingDown, 1)
 
-	// Signal background goroutines (orbit scheduler, etc.) to stop.
-	close(s.done)
+		// Signal background goroutines (orbit scheduler, etc.) to stop.
+		close(s.done)
 
-	// If Shutdown is called before Start, the temporary loading server
-	// is still running and holding the port. Shut it down first.
-	if s.loadingSrv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), serverHealthTimeout)
-		defer cancel()
-		s.loadingSrv.Shutdown(ctx)
-		s.loadingSrv = nil
-	}
-
-	if s.gpuUtilWorker != nil {
-		s.gpuUtilWorker.Stop()
-	}
-	s.hub.Close()
-	if s.k8sClient != nil {
-		s.k8sClient.StopWatching()
-	}
-	if s.bridge != nil {
-		if err := s.bridge.Stop(); err != nil {
-			slog.Error("[Server] MCP bridge shutdown error", "error", err)
+		// If Shutdown is called before Start, the temporary loading server
+		// is still running and holding the port. Shut it down first.
+		if s.loadingSrv != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), serverHealthTimeout)
+			defer cancel()
+			s.loadingSrv.Shutdown(ctx)
+			s.loadingSrv = nil
 		}
-	}
-	if err := s.store.Close(); err != nil {
-		return err
-	}
-	return s.app.Shutdown()
+
+		if s.gpuUtilWorker != nil {
+			s.gpuUtilWorker.Stop()
+		}
+		s.hub.Close()
+		// #10007 — stop the periodic cluster group cache refresh goroutine.
+		if s.workloadHandlers != nil {
+			s.workloadHandlers.StopCacheRefresh()
+		}
+		// #7043 — stop the SSE cache evictor goroutine that was started
+		// lazily by sseCacheSet. Without this the goroutine leaks after
+		// server shutdown.
+		handlers.StopSSECacheEvictor()
+		// #6578 — stop the token revocation cleanup goroutine so tests
+		// and embedded usage don't leak it across Server lifecycles.
+		middleware.ShutdownTokenRevocation()
+		if s.k8sClient != nil {
+			s.k8sClient.StopWatching()
+		}
+		if s.bridge != nil {
+			if err := s.bridge.Stop(); err != nil {
+				slog.Error("[Server] MCP bridge shutdown error", "error", err)
+			}
+		}
+		if err := s.store.Close(); err != nil {
+			shutdownErr = err
+			return
+		}
+		shutdownErr = s.app.Shutdown()
+	})
+	return shutdownErr
 }
 
 func customErrorHandler(c *fiber.Ctx, err error) error {
@@ -1390,6 +1895,8 @@ func LoadConfigFromEnv() Config {
 		DevUserLogin:  getEnvOrDefault("DEV_USER_LOGIN", "dev-user"),
 		DevUserEmail:  getEnvOrDefault("DEV_USER_EMAIL", "dev@localhost"),
 		DevUserAvatar: getEnvOrDefault("DEV_USER_AVATAR", ""),
+		// kc-agent shared secret (generated by startup-oauth.sh)
+		AgentToken:          os.Getenv("KC_AGENT_TOKEN"),
 		// Consolidated GitHub token (FEEDBACK_GITHUB_TOKEN preferred, GITHUB_TOKEN as alias)
 		GitHubToken:         settings.ResolveGitHubTokenEnv(),
 		GitHubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
@@ -1402,6 +1909,9 @@ func LoadConfigFromEnv() Config {
 		// Benchmark data from Google Drive
 		BenchmarkGoogleDriveAPIKey: os.Getenv("GOOGLE_DRIVE_API_KEY"),
 		BenchmarkFolderID:          getEnvOrDefault("BENCHMARK_FOLDER_ID", "1r2Z2Xp1L0KonUlvQHvEzed8AO9Xj8IPm"),
+		// Kubara platform catalog (optional — defaults to kubara-io/kubara public catalog)
+		KubaraCatalogRepo: os.Getenv("KUBARA_CATALOG_REPO"),
+		KubaraCatalogPath: os.Getenv("KUBARA_CATALOG_PATH"),
 		// Sidebar dashboard filter
 		EnabledDashboards: os.Getenv("ENABLED_DASHBOARDS"),
 		// White-label project context
@@ -1419,6 +1929,8 @@ func LoadConfigFromEnv() Config {
 		BrandIssuesURL:    getEnvOrDefault("ISSUES_URL", "https://github.com/kubestellar/kubestellar/issues/new"),
 		BrandRepoURL:      getEnvOrDefault("REPO_URL", "https://github.com/kubestellar/console"),
 		BrandHostedDomain: getEnvOrDefault("HOSTED_DOMAIN", "console.kubestellar.io"),
+		// Suppress local kc-agent connections in in-cluster deployments
+		NoLocalAgent: os.Getenv("NO_LOCAL_AGENT") == "true",
 		// Watchdog backend port override
 		BackendPort: backendPort,
 	}
@@ -1429,6 +1941,25 @@ func getEnvOrDefault(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// resolveMaxBodyBytes returns the global Fiber BodyLimit in bytes.
+// It reads the envMaxBodyBytes environment variable and falls back to
+// feedbackBodyLimit when the value is unset, non-numeric, or non-positive.
+// This is the canonical cap that rejects oversized payloads before Fiber
+// buffers them, mitigating memory-exhaustion DoS (#9891).
+func resolveMaxBodyBytes() int {
+	raw := os.Getenv(envMaxBodyBytes)
+	if raw == "" {
+		return feedbackBodyLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		slog.Warn("invalid MAX_BODY_BYTES env var; using default",
+			"value", raw, "default_bytes", feedbackBodyLimit)
+		return feedbackBodyLimit
+	}
+	return n
 }
 
 // warnDefaultEnvVars logs a warning for each env var that is not explicitly
@@ -1452,9 +1983,78 @@ func warnDefaultEnvVars(vars map[string]string) {
 // devSecretBytes is the number of random bytes used to generate a dev secret (32 bytes = 256 bits).
 const devSecretBytes = 32
 
-func generateDevSecret() string {
-	// Generate a cryptographically random secret each time the server starts.
-	// This ensures dev instances don't share a well-known secret.
+// devSecretFile is the filename used to persist the auto-generated JWT secret
+// across dev-mode restarts (#6850). The file is created in the working directory
+// and should be gitignored.
+const devSecretFile = ".jwt-secret"
+
+// sharedSecretDir is the user-level config directory where the JWT secret is
+// also persisted so it survives across fresh curl-install runs (#8202).
+const sharedSecretDir = ".kubestellar"
+
+// loadOrCreateDevSecret checks two locations for an existing JWT secret:
+// first the local working directory (explicit override), then the shared
+// ~/.kubestellar/ dir (survives reinstalls). If neither exists, it generates
+// a new secret and writes to both locations.
+func loadOrCreateDevSecret() string {
+	localPath := filepath.Join(".", devSecretFile)
+	sharedPath := sharedSecretPath()
+
+	for _, p := range []string{localPath, sharedPath} {
+		if p == "" {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		secret := strings.TrimSpace(string(data))
+		if len(secret) >= devSecretBytes {
+			slog.Info("Loaded persisted dev JWT secret", "path", p)
+			if p == sharedPath {
+				persistSecret(localPath, secret)
+			}
+			return secret
+		}
+		slog.Warn("Existing secret file is too short, skipping", "path", p)
+	}
+
+	secret := generateRandomSecret()
+
+	persistSecret(localPath, secret)
+	if sharedPath != "" {
+		persistSecret(sharedPath, secret)
+	}
+
+	return secret
+}
+
+func sharedSecretPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, sharedSecretDir, devSecretFile)
+}
+
+func persistSecret(path, secret string) {
+	const secretFilePerms = 0o600
+	const secretDirPerms = 0o700
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, secretDirPerms); err != nil {
+		slog.Warn("Could not create directory for JWT secret", "dir", dir, "error", err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(secret+"\n"), secretFilePerms); err != nil {
+		slog.Warn("Could not persist dev JWT secret", "path", path, "error", err)
+	} else {
+		slog.Info("Persisted dev JWT secret", "path", path)
+	}
+}
+
+// generateRandomSecret produces a cryptographically random hex string for use
+// as a JWT signing secret.
+func generateRandomSecret() string {
 	b := make([]byte, devSecretBytes)
 	if _, err := rand.Read(b); err != nil {
 		// crypto/rand.Read should never fail on supported platforms;

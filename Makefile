@@ -33,6 +33,7 @@ build:
 	mkdir -p bin
 	go build -o bin/kc-agent ./cmd/kc-agent
 	go build -o bin/console ./cmd/console
+	go build -o bin/kc-watcher ./cmd/watcher
 	@# Update Homebrew kc-agent if installed
 	@if command -v kc-agent >/dev/null 2>&1; then cp bin/kc-agent $$(which kc-agent) 2>/dev/null || true; fi
 
@@ -59,3 +60,12 @@ dev:
 ## lint: Run frontend linter
 lint:
 	cd web && npm run lint
+
+## test: Run all Go tests with a hard 5-minute timeout per package
+## Prevents zombie agent.test process leaks from ad-hoc test runs
+test:
+	go test -timeout 5m ./...
+
+## test-agent: Run agent tests only (most likely to leak subprocesses)
+test-agent:
+	go test -timeout 5m -v ./pkg/agent/...

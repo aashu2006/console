@@ -30,6 +30,9 @@ const MAX_SELECTED_CLUSTERS = 4
 /** Default number of clusters to show when none are selected */
 const DEFAULT_CLUSTER_COUNT = 3
 
+/** Maximum policy name length before truncation in table headers */
+const MAX_POLICY_NAME_DISPLAY = 12
+
 type PolicyStatus = 'pass' | 'fail' | 'na'
 
 interface PolicyRow {
@@ -199,12 +202,12 @@ function CrossClusterPolicyComparisonInternal({ config: _config }: CardConfig) {
     <div className="space-y-2 p-1">
       {/* Context description */}
       <div className="flex items-start gap-1.5 text-[10px] text-muted-foreground bg-secondary/20 rounded-md px-2 py-1.5">
-        <Info className="w-3 h-3 flex-shrink-0 mt-0.5 text-muted-foreground/60" />
+        <Info className="w-3 h-3 shrink-0 mt-0.5 text-muted-foreground/60" />
         <span>{t('crossClusterPolicy.contextDescription')}</span>
       </div>
 
       {/* Refresh indicator + inline progress */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         {(isLoading || isRefreshing) && totalClusters > 0 && (
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <ProgressRing progress={clustersChecked / totalClusters} size={14} strokeWidth={1.5} />
@@ -251,7 +254,7 @@ function CrossClusterPolicyComparisonInternal({ config: _config }: CardConfig) {
                 <th className="text-left py-1 px-1 font-medium text-muted-foreground">Policy</th>
                 {clustersToCompare.map(c => (
                   <th key={c} className="text-center py-1 px-1 font-mono font-medium text-muted-foreground truncate max-w-[80px]" title={c}>
-                    {c.length > 12 ? `${c.slice(0, 12)}...` : c}
+                    {c.length > MAX_POLICY_NAME_DISPLAY ? `${c.slice(0, MAX_POLICY_NAME_DISPLAY)}...` : c}
                   </th>
                 ))}
               </tr>

@@ -1,8 +1,10 @@
 import { useCache } from '../../../lib/cache'
 import { useCardLoadingState } from '../CardDataContext'
+import { useDemoMode } from '../../../hooks/useDemoMode'
 import { FLUENTD_DEMO_DATA, type FluentdDemoData } from './demoData'
 import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/constants'
 import { authFetch } from '../../../lib/api'
+import { LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 
 export type FluentdStatus = FluentdDemoData
 
@@ -174,7 +176,7 @@ async function fetchPods(url: string): Promise<BackendPodInfo[]> {
 
 async function fetchDaemonSets(namespace?: string): Promise<BackendDaemonSetInfo[]> {
   const query = namespace ? `?namespace=${encodeURIComponent(namespace)}` : ''
-  const resp = await authFetch(`/api/mcp/daemonsets${query}`, {
+  const resp = await authFetch(`${LOCAL_AGENT_HTTP_URL}/daemonsets${query}`, {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
   })
@@ -194,7 +196,7 @@ async function fetchEvents(namespace: string): Promise<BackendEventInfo[]> {
       limit: String(EVENT_SAMPLE_LIMIT),
     })
 
-    const resp = await authFetch(`/api/mcp/events?${params}`, {
+    const resp = await authFetch(`${LOCAL_AGENT_HTTP_URL}/events?${params}`, {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
     })
@@ -212,7 +214,7 @@ async function fetchEvents(namespace: string): Promise<BackendEventInfo[]> {
 
 async function fetchFluentdStatus(): Promise<FluentdStatus> {
   const [labeledPods, daemonSets, events] = await Promise.all([
-    fetchPods('/api/mcp/pods?labelSelector=app.kubernetes.io%2Fname%3Dfluentd').catch(() => []),
+    fetchPods(`${LOCAL_AGENT_HTTP_URL}/pods?labelSelector=app.kubernetes.io%2Fname%3Dfluentd`).catch(() => []),
     fetchDaemonSets(LOGGING_NAMESPACE).catch(() => []),
     fetchEvents(LOGGING_NAMESPACE),
   ])
@@ -221,7 +223,7 @@ async function fetchFluentdStatus(): Promise<FluentdStatus> {
   const fluentdDaemonSets = (daemonSets || []).filter(isFluentdDaemonSet)
 
   if ((fluentdPods || []).length === 0 && (fluentdDaemonSets || []).length === 0) {
-    const fallbackPods = (await fetchPods('/api/mcp/pods?labelSelector=app%3Dfluentd')).filter(isFluentdPod)
+    const fallbackPods = (await fetchPods(`${LOCAL_AGENT_HTTP_URL}/pods?labelSelector=app%3Dfluentd`)).filter(isFluentdPod)
     if (fallbackPods.length === 0) {
       return {
         ...INITIAL_DATA,
@@ -298,10 +300,21 @@ export interface UseFluentdStatusResult {
   consecutiveFailures: number
   showSkeleton: boolean
   showEmptyState: boolean
+  // Issue 8836: cache-layer refresh timestamp, used by the card to render a
+  // "Last updated X ago" indicator. Preferred over data.lastCheckTime
+  // because it reflects the actual refresh cadence (not the backend-reported
+  // fetch time, which does not advance across cache rehydrates).
+  lastRefresh: number | null
 }
 
 export function useFluentdStatus(): UseFluentdStatusResult {
-  const { data, isLoading, isRefreshing, isFailed, consecutiveFailures, isDemoFallback } =
+  // Issue 8836: subscribe to demo mode toggles so the card swaps to demo data
+  // immediately (and shows the Demo badge / yellow outline) when the user
+  // flips demo mode on, instead of only switching when the cache layer falls
+  // back after a fetch failure.
+  const { isDemoMode } = useDemoMode()
+
+  const { data: liveData, isLoading, isRefreshing, isFailed, consecutiveFailures, isDemoFallback, lastRefresh } =
     useCache<FluentdStatus>({
       key: CACHE_KEY,
       category: 'default',
@@ -311,11 +324,12 @@ export function useFluentdStatus(): UseFluentdStatusResult {
       fetcher: fetchFluentdStatus,
     })
 
-  const effectiveIsDemoData = isDemoFallback && !isLoading
+  const data = isDemoMode ? FLUENTD_DEMO_DATA : liveData
+  const effectiveIsDemoData = isDemoMode || (isDemoFallback && !isLoading)
   const hasAnyData = (data.pods?.total ?? 0) > 0
 
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !isDemoMode && !hasAnyData,
     isRefreshing,
     hasAnyData,
     isFailed,
@@ -325,12 +339,13 @@ export function useFluentdStatus(): UseFluentdStatusResult {
 
   return {
     data,
-    loading: isLoading,
+    loading: isLoading && !isDemoMode,
     isRefreshing,
-    isDemoFallback,
-    error: isFailed && !hasAnyData,
+    isDemoFallback: effectiveIsDemoData,
+    error: isFailed && !hasAnyData && !isDemoMode,
     consecutiveFailures,
     showSkeleton,
     showEmptyState,
+    lastRefresh,
   }
 }

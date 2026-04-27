@@ -18,8 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	k8sclient "github.com/kubestellar/console/pkg/k8s"
 	"github.com/kubestellar/console/pkg/api/middleware"
+	k8sclient "github.com/kubestellar/console/pkg/k8s"
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/store"
 )
@@ -40,6 +40,10 @@ type SelfUpgradeHandler struct {
 	k8sClient *k8sclient.MultiClusterClient
 	hub       *Hub
 	store     store.Store
+
+	// inClusterClient is used for testing to provide a mock kubernetes client.
+	// When nil, getInClusterClient falls back to rest.InClusterConfig().
+	inClusterClient kubernetes.Interface
 }
 
 // NewSelfUpgradeHandler creates a new SelfUpgradeHandler.
@@ -95,6 +99,9 @@ func getReleaseName() string {
 
 // getInClusterClient creates a typed Kubernetes client using the in-cluster config.
 func (h *SelfUpgradeHandler) getInClusterClient() (kubernetes.Interface, error) {
+	if h.inClusterClient != nil {
+		return h.inClusterClient, nil
+	}
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("not running in-cluster: %w", err)
@@ -132,9 +139,12 @@ func (h *SelfUpgradeHandler) findDeployment(ctx context.Context, client kubernet
 	return nil, fmt.Errorf("no kubestellar-console Deployment found in namespace %s", namespace)
 }
 
-// canPatchDeployment checks if the ServiceAccount has permission to patch Deployments
-// in the given namespace using a SelfSubjectAccessReview.
-func (h *SelfUpgradeHandler) canPatchDeployment(ctx context.Context, client kubernetes.Interface, namespace string) bool {
+// canPatchDeployment checks if the ServiceAccount has permission to patch a
+// specific Deployment in the given namespace using a SelfSubjectAccessReview.
+// The deploymentName is required because the self-upgrade Role uses resourceNames
+// to scope access to the console's own Deployment only — an SSAR without a Name
+// field would check "can I patch ANY deployment?" which the scoped Role denies.
+func (h *SelfUpgradeHandler) canPatchDeployment(ctx context.Context, client kubernetes.Interface, namespace, deploymentName string) bool {
 	review := &authorizationv1.SelfSubjectAccessReview{
 		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
@@ -142,6 +152,7 @@ func (h *SelfUpgradeHandler) canPatchDeployment(ctx context.Context, client kube
 				Verb:      "patch",
 				Group:     "apps",
 				Resource:  "deployments",
+				Name:      deploymentName,
 			},
 		},
 	}
@@ -194,8 +205,9 @@ func (h *SelfUpgradeHandler) GetStatus(c *fiber.Ctx) error {
 		resp.CurrentImage = dep.Spec.Template.Spec.Containers[0].Image
 	}
 
-	// Check RBAC
-	resp.CanPatch = h.canPatchDeployment(ctx, client, namespace)
+	// Check RBAC — pass the specific deployment name so the SSAR matches
+	// the resourceNames-scoped Role created by self-upgrade-role.yaml.
+	resp.CanPatch = h.canPatchDeployment(ctx, client, namespace, dep.Name)
 	if !resp.CanPatch {
 		resp.Reason = "insufficient RBAC — deploy with selfUpgrade.enabled=true"
 		return c.JSON(resp)
@@ -211,25 +223,44 @@ func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
 	// SECURITY (#5409): Only admin users may trigger a self-upgrade. Without
 	// this check any authenticated user could roll the console to an arbitrary
 	// image tag using the in-cluster service account's RBAC permissions.
+	//
+	// SECURITY (#7950): fail CLOSED when the store is unavailable. The prior
+	// form `if h.store != nil { /* admin check */ }` was fail-open: if the
+	// handler was constructed without a store (missing dependency, init
+	// failure, or test fixture), every authenticated user became effectively
+	// admin for self-upgrade. Flip the guard so a nil store produces a clear
+	// 503 instead of silently allowing the upgrade.
 	userID := middleware.GetUserID(c)
-	if h.store != nil {
-		user, err := h.store.GetUser(userID)
-		if err != nil {
-			slog.Warn("[self-upgrade] SECURITY: failed to look up user for role check",
-				"user_id", userID, "error", err)
-			return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
-				Error: "unable to verify user role — access denied",
-			})
-		}
-		if user.Role != models.UserRoleAdmin {
-			slog.Warn("[self-upgrade] SECURITY: non-admin user attempted self-upgrade",
-				"user_id", userID,
-				"github_login", middleware.GetGitHubLogin(c),
-				"role", user.Role)
-			return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
-				Error: "self-upgrade requires admin role",
-			})
-		}
+	if h.store == nil {
+		slog.Warn("[self-upgrade] SECURITY: self-upgrade requested but store is not configured — refusing fail-open",
+			"user_id", userID)
+		return c.Status(fiber.StatusServiceUnavailable).JSON(SelfUpgradeTriggerResponse{
+			Error: "self-upgrade unavailable — user store is not configured",
+		})
+	}
+	user, err := h.store.GetUser(c.UserContext(), userID)
+	if err != nil {
+		slog.Warn("[self-upgrade] SECURITY: failed to look up user for role check",
+			"user_id", userID, "error", err)
+		return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
+			Error: "unable to verify user role — access denied",
+		})
+	}
+	if user == nil {
+		slog.Warn("[self-upgrade] SECURITY: user not found for role check",
+			"user_id", userID)
+		return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
+			Error: "user not found — access denied",
+		})
+	}
+	if user.Role != models.UserRoleAdmin {
+		slog.Warn("[self-upgrade] SECURITY: non-admin user attempted self-upgrade",
+			"user_id", userID,
+			"github_login", middleware.GetGitHubLogin(c),
+			"role", user.Role)
+		return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
+			Error: "self-upgrade requires admin role",
+		})
 	}
 	slog.Info("[self-upgrade] admin user triggering upgrade",
 		"user_id", userID,
@@ -288,26 +319,39 @@ func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
 	}
 
 	// Verify RBAC before proceeding
-	if !h.canPatchDeployment(ctx, client, namespace) {
+	if !h.canPatchDeployment(ctx, client, namespace, dep.Name) {
 		return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
 			Error: "insufficient RBAC permissions — deploy with selfUpgrade.enabled=true",
 		})
 	}
 
-	// Build the new image reference
-	currentImage := ""
-	if len(dep.Spec.Template.Spec.Containers) > 0 {
-		currentImage = dep.Spec.Template.Spec.Containers[0].Image
+	// Build the new image reference — require at least one container.
+	if len(dep.Spec.Template.Spec.Containers) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(SelfUpgradeTriggerResponse{
+			Error: fmt.Sprintf("deployment %s has no containers — cannot determine image to patch", dep.Name),
+		})
 	}
+	currentImage := dep.Spec.Template.Spec.Containers[0].Image
 
 	// Extract repository from current image.
 	// Must handle registries with ports (e.g. "registry.internal:5000/console")
 	// where the colon is NOT a tag separator.  A tag colon always appears
 	// after the last slash, so we only strip a ":tag" suffix from the segment
 	// after the final "/".
+	//
+	// #7951: preserve the `@sha256:...` digest if the current image was
+	// pinned by digest. A hardened install deliberately pins the backend
+	// image by digest for supply-chain integrity; rewriting to a pure
+	// tag-based reference would silently loosen that gate every time the
+	// user triggers an upgrade. We keep the digest on the rewritten image
+	// so the admin still has to opt into a tag-only reference.
 	repo := currentImage
-	// Handle @sha256 digests first (e.g. "ghcr.io/console@sha256:abc123")
+	digest := "" // e.g. "@sha256:abc123..." — empty when image is tag-based.
+	// Handle @sha256 digests first (e.g. "ghcr.io/console@sha256:abc123" or
+	// "ghcr.io/console:v1@sha256:abc123"). Capture the suffix so we can
+	// reattach it to the rewritten image reference.
 	if idx := strings.LastIndex(repo, "@"); idx > 0 {
+		digest = repo[idx:]
 		repo = repo[:idx]
 	}
 	// Strip tag — only look for ":" after the last "/"
@@ -322,20 +366,16 @@ func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
 			repo = repo[:colonIdx]
 		}
 	}
-	newImage := repo + ":" + req.ImageTag
+	newImage := repo + ":" + req.ImageTag + digest
 
 	slog.Info("[self-upgrade] upgrading deployment", "namespace", namespace, "deployment", dep.Name, "from", currentImage, "to", newImage)
 
-	// Broadcast progress to all WebSocket clients
-	h.hub.BroadcastAll(Message{
-		Type: "update_progress",
-		Data: map[string]any{
-			"status":   "running",
-			"step":     1,
-			"progress": 20,
-			"message":  fmt.Sprintf("Patching deployment image to %s", req.ImageTag),
-		},
-	})
+	// #7976: Do NOT broadcast a progress event here. Earlier versions emitted
+	// `progress: 20` with a "Patching deployment image to X" message BEFORE
+	// the Patch call, which gave clients a false "something already happened"
+	// signal when the patch subsequently failed (RBAC, API server error,
+	// etc.). Progress events must only fire after the state they describe is
+	// actually true — so we wait until Patch returns successfully.
 
 	// Build JSON patch to update the container image
 	patch := []map[string]any{
@@ -362,6 +402,9 @@ func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
 	)
 	if err != nil {
 		slog.Error("[self-upgrade] patch failed", "error", err)
+		// Terminal error — no intermediate progress was claimed, so clients
+		// transition directly from "idle" to "failed" without a misleading
+		// 20% checkpoint.
 		h.hub.BroadcastAll(Message{
 			Type: "update_progress",
 			Data: map[string]any{
@@ -377,7 +420,23 @@ func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
 
 	slog.Info("[self-upgrade] Deployment patched successfully, rollout starting")
 
-	// Broadcast success — the pod will be terminated shortly by the rollout
+	// Broadcast progress: the patch has actually been applied. We emit step 1
+	// (image patched) and step 2 (waiting for rollout) back-to-back so the UI
+	// still sees a smooth progression, but neither event is sent unless the
+	// underlying state it describes is true.
+	h.hub.BroadcastAll(Message{
+		Type: "update_progress",
+		Data: map[string]any{
+			"status":   "running",
+			"step":     1,
+			"progress": 20,
+			"message":  fmt.Sprintf("Deployment image patched to %s", req.ImageTag),
+		},
+	})
+	// Step 2 / 60%: last broadcast this handler emits. The rollout completes
+	// asynchronously and terminates this pod mid-request, so no terminal
+	// success event is sent over this hub — clients detect completion by
+	// polling /health (see web/src/hooks/useSelfUpgrade.ts:pollForRestart).
 	h.hub.BroadcastAll(Message{
 		Type: "update_progress",
 		Data: map[string]any{

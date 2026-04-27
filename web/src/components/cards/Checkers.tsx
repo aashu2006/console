@@ -81,6 +81,7 @@ const PRE_GAME_TAUNTS = [
 ]
 
 const PRE_GAME_TAUNT_DELAY_MS = 2_000
+const TAUNT_DISPLAY_MS = 3000
 
 // Initialize board with starting positions
 function createInitialBoard(): Board {
@@ -571,7 +572,7 @@ export function Checkers(_props: CardComponentProps) {
         // Show capture taunt
         if (capturedAny) {
           setPirateTaunt(CAPTURE_TAUNTS[Math.floor(Math.random() * CAPTURE_TAUNTS.length)])
-          setTimeout(() => setPirateTaunt(''), 3000)
+          setTimeout(() => setPirateTaunt(''), TAUNT_DISPLAY_MS)
         }
       }
 
@@ -692,7 +693,7 @@ export function Checkers(_props: CardComponentProps) {
   return (
     <div className="h-full flex flex-col p-2 select-none">
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1">
             <Box className="w-3 h-3 text-blue-400" />
@@ -723,6 +724,7 @@ export function Checkers(_props: CardComponentProps) {
             onClick={newGame}
             className="p-1.5 rounded hover:bg-secondary"
             title={t('checkers.newGame')}
+            aria-label={t('checkers.newGame')}
           >
             <RotateCcw className="w-4 h-4" />
           </button>
@@ -801,10 +803,10 @@ export function Checkers(_props: CardComponentProps) {
 
       {/* Pirate Taunt — below board, no overlap */}
       {pirateTaunt && (
-        <div className="flex-shrink-0 p-1 animate-fade-in">
+        <div className="shrink-0 p-1 animate-fade-in">
           <div className="flex items-start gap-2 px-2">
-            <div className="text-lg flex-shrink-0">🏴‍☠️</div>
-            <div className="bg-background/80 backdrop-blur-sm border border-orange-400/50 rounded-lg px-2 py-1.5 flex-1">
+            <div className="text-lg shrink-0">🏴‍☠️</div>
+            <div className="bg-background/80 backdrop-blur-xs border border-orange-400/50 rounded-lg px-2 py-1.5 flex-1">
               <span className="text-orange-300 italic text-xs font-medium leading-tight block">
                 &quot;{pirateTaunt}&quot;
               </span>

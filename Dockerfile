@@ -1,5 +1,5 @@
 # Build stage - Backend
-FROM golang:1.25-alpine AS backend-builder
+FROM golang:1.25-alpine@sha256:5caaf1cca9dc351e13deafbc3879fd4754801acba8653fa9540cea125d01a71f AS backend-builder
 
 WORKDIR /app
 
@@ -16,9 +16,10 @@ ARG TARGETARCH
 
 # Build for the target platform (TARGETARCH is set automatically by buildx)
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w -X github.com/kubestellar/console/pkg/api.Version=${APP_VERSION}" -o console ./cmd/console
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w -X main.version=${APP_VERSION}" -o kc-watcher ./cmd/watcher
 
 # Build stage - Frontend
-FROM node:22-alpine AS frontend-builder
+FROM node:22-alpine@sha256:8ea2348b068a9544dae7317b4f3aafcdc032df1647bb7d768a05a5cad1a7683f AS frontend-builder
 
 WORKDIR /app
 
@@ -39,15 +40,16 @@ ENV VITE_COMMIT_HASH=${COMMIT_HASH}
 RUN npm run build
 
 # Final stage
-FROM alpine:3.20
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 WORKDIR /app
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates tzdata
 
-# Copy backend binary
+# Copy backend and watcher binaries
 COPY --from=backend-builder /app/console .
+COPY --from=backend-builder /app/kc-watcher .
 
 # Copy frontend build
 COPY --from=frontend-builder /app/dist ./web/dist

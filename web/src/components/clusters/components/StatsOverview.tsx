@@ -189,9 +189,12 @@ function StatBlock({ blockId, stats, hasData, onClick, color, icon }: StatBlockP
       className={`glass p-4 rounded-lg ${isClickable ? 'cursor-pointer hover:bg-secondary/50' : ''} transition-colors`}
       onClick={() => isClickable && onClick?.()}
     >
-      <div className="flex items-center gap-2 mb-2">
-        <IconComponent className={`w-5 h-5 shrink-0 ${colorClass}`} />
-        <span className="text-sm text-muted-foreground truncate">{wrapAbbreviations(label)}</span>
+      {/* Allow long labels (e.g. "Unhealthy", "Storage") to wrap to a second
+          line at narrow widths instead of being clipped with an ellipsis
+          */}
+      <div className="flex items-start gap-2 mb-2 min-w-0">
+        <IconComponent className={`w-5 h-5 shrink-0 mt-0.5 ${colorClass}`} />
+        <span className="text-sm text-muted-foreground wrap-break-word leading-tight min-w-0" title={label}>{wrapAbbreviations(label)}</span>
       </div>
       <div className={`text-3xl font-bold ${valueColor}`}>{value}</div>
       <div className="text-xs text-muted-foreground">{sublabel}</div>
@@ -261,11 +264,12 @@ export function StatsOverview({
     }
   }
 
-  // Dynamic grid columns based on visible blocks
-  const gridCols = visibleBlocks.length <= 5 ? 'grid-cols-5' :
-    visibleBlocks.length <= 6 ? 'grid-cols-6' :
-    visibleBlocks.length <= 8 ? 'grid-cols-4 lg:grid-cols-8' :
-    'grid-cols-5 lg:grid-cols-10'
+  // Dynamic grid columns based on visible blocks.
+  // Cap at 5 columns per row so every label (e.g. "Unhealthy", "Storage")
+  // remains fully readable without mid-word breaks or truncation.
+  // Blocks beyond 5 simply wrap to a second row.
+  const gridCols = visibleBlocks.length <= 4 ? 'grid-cols-2 md:grid-cols-4' :
+    'grid-cols-2 md:grid-cols-3 lg:grid-cols-5'
 
   return (
     <div className="relative mb-6">

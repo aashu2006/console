@@ -43,7 +43,7 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
     backendUp: false,
   })
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const { totalCoins, awardCoins } = useRewards()
+  const { totalCoins, githubPoints, localCoins, bonusPoints, awardCoins } = useRewards()
   const { channel, installMethod } = useVersionCheck()
   const { t, i18n } = useTranslation()
 
@@ -53,6 +53,9 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
     i18n.changeLanguage(langCode)
     emitLanguageChanged(langCode)
     setShowLanguageSubmenu(false)
+    // Issue 9284: close the outer profile dropdown after a language is picked
+    // so the user doesn't have to click again to dismiss it.
+    closeDropdown()
   }
 
   const handleLinkedInShare = () => {
@@ -127,17 +130,20 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
       {/* Trigger button */}
       <button
         onClick={toggleDropdown}
-        className="flex items-center gap-3 pl-3 border-l border-border hover:bg-secondary rounded-lg p-2 transition-colors"
+        aria-expanded={isOpen}
+        aria-haspopup="true"
+        aria-controls="profile-dropdown-menu"
+        className="flex items-center gap-2 border-l border-border hover:bg-secondary rounded-lg px-3 py-1.5 h-9 transition-colors"
       >
         {user.avatar_url ? (
           <img
             src={user.avatar_url}
             alt={user.github_login}
-            className="w-8 h-8 rounded-full"
+            className="w-6 h-6 rounded-full"
           />
         ) : (
-          <div className="w-8 h-8 rounded-full bg-purple-900 flex items-center justify-center">
-            <User className="w-4 h-4 text-purple-400" />
+          <div className="w-6 h-6 rounded-full bg-purple-900 flex items-center justify-center">
+            <User className="w-3.5 h-3.5 text-purple-400" />
           </div>
         )}
         <div className="hidden sm:block text-left">
@@ -148,7 +154,7 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
 
       {/* Dropdown menu */}
       {isOpen && (
-        <div className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-1rem)] bg-card border border-border rounded-xl shadow-2xl overflow-hidden z-50">
+        <div id="profile-dropdown-menu" role="menu" className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-1rem)] max-h-[calc(100vh-5rem)] bg-card border border-border rounded-xl shadow-2xl overflow-hidden overflow-y-auto z-toast">
           {/* Header with avatar and name */}
           <div className="p-4 bg-secondary border-b border-border">
             <div className="flex items-center gap-3">
@@ -173,13 +179,13 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
           {/* User details section */}
           <div className="p-3 space-y-2 border-b border-border">
             <div className="flex items-center gap-3 px-2 py-1.5 text-sm min-w-0">
-              <Mail className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-              <span className="text-muted-foreground flex-shrink-0">{t('profile.email')}</span>
+              <Mail className="w-4 h-4 text-muted-foreground shrink-0" />
+              <span className="text-muted-foreground shrink-0">{t('profile.email')}</span>
               <span className="text-foreground truncate">{user.email || t('profile.notSet')}</span>
             </div>
             <div className="flex items-center gap-3 px-2 py-1.5 text-sm min-w-0">
-              <MessageSquare className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-              <span className="text-muted-foreground flex-shrink-0">{t('profile.slack')}</span>
+              <MessageSquare className="w-4 h-4 text-muted-foreground shrink-0" />
+              <span className="text-muted-foreground shrink-0">{t('profile.slack')}</span>
               <span className="text-foreground truncate">{user.slack_id || t('profile.notConnected')}</span>
             </div>
             <div className="flex items-center gap-3 px-2 py-1.5 text-sm">
@@ -200,7 +206,15 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
             >
               <Coins className="w-4 h-4 text-yellow-500" />
               <span className="text-muted-foreground">{t('profile.coins')}</span>
-              <span className="text-yellow-400 font-medium">{totalCoins.toLocaleString()}</span>
+              <span
+                className="text-yellow-400 font-medium"
+                title={[
+                  `Console activity: ${localCoins.toLocaleString()}`,
+                  githubPoints > 0 ? `GitHub contributions: ${githubPoints.toLocaleString()}` : null,
+                  bonusPoints > 0 ? `Bonus: ${bonusPoints.toLocaleString()}` : null,
+                  'Note: Docs leaderboard shows GitHub points only',
+                ].filter(Boolean).join('\n')}
+              >{totalCoins.toLocaleString()}</span>
               <span className={`text-2xs px-1.5 py-0.5 rounded-full ${getContributorLevel(totalCoins).current.bgClass} ${getContributorLevel(totalCoins).current.textClass}`}>
                 {getContributorLevel(totalCoins).current.name}
               </span>
@@ -365,7 +379,7 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
               onClick={handleLinkedInShare}
               className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
             >
-              <Linkedin className="w-4 h-4 text-[#0A66C2]" />
+              <Linkedin className="w-4 h-4 text-linkedin" />
               <span>{t('feedback.shareOnLinkedIn')}</span>
               <span className="ml-auto text-xs px-1.5 py-0.5 rounded bg-yellow-900 text-yellow-400">+{REWARD_ACTIONS.linkedin_share.coins}</span>
             </button>

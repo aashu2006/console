@@ -8,21 +8,7 @@ import { CardSearchInput, CardControlsRow, CardPaginationFooter, CardSkeleton, C
 import type { ClusterEvent } from '../../hooks/useMCP'
 import { useTranslation } from 'react-i18next'
 import { StatusBadge } from '../ui/StatusBadge'
-
-function getTimeAgo(timestamp: string | undefined): string {
-  if (!timestamp) return 'Unknown'
-  const now = new Date()
-  const then = new Date(timestamp)
-  const diffMs = now.getTime() - then.getTime()
-  const diffMins = Math.floor(diffMs / 60000)
-  const diffHours = Math.floor(diffMins / 60)
-  const diffDays = Math.floor(diffHours / 24)
-
-  if (diffDays > 0) return `${diffDays}d ago`
-  if (diffHours > 0) return `${diffHours}h ago`
-  if (diffMins > 0) return `${diffMins}m ago`
-  return 'Just now'
-}
+import { formatTimeAgo } from '../../lib/formatters'
 
 type SortByOption = 'time' | 'count' | 'reason'
 
@@ -109,14 +95,28 @@ export function WarningEvents() {
     )
   }
 
+  /* If there are no warning events at all, show a clean empty state without filters */
+  if (warningOnly.length === 0) {
+    return (
+      <div className="h-full flex flex-col content-loaded">
+        <div className="flex-1 flex flex-col items-center justify-center text-center py-6">
+          <CheckCircle2 className="w-8 h-8 mx-auto mb-2 text-green-400 opacity-50" />
+          <p className="text-sm text-foreground font-medium">{t('warningEvents.noWarnings')}</p>
+          <p className="text-xs text-muted-foreground mt-1">{t('warningEvents.noWarningsHint')}</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-3">
       {/* Header controls */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
+        {/* Bug #9043: use i18n plural keys so non-English languages get correct pluralization */}
         <span className="text-xs text-muted-foreground">
-          {totalItems} warning{totalItems !== 1 ? 's' : ''}
+          {t('warningEvents.count', { count: totalItems })}
         </span>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <CardControlsRow
             clusterFilter={{
               availableClusters,
@@ -134,6 +134,7 @@ export function WarningEvents() {
               onSortChange: (v) => sorting.setSortBy(v as SortByOption),
               sortDirection: sorting.sortDirection,
               onSortDirectionChange: sorting.setSortDirection }}
+            className="mb-0!"
           />
           <RefreshButton
             isRefreshing={isRefreshing}
@@ -145,13 +146,13 @@ export function WarningEvents() {
         </div>
       </div>
 
-      {/* Error Display */}
+      {/* Error Display — bug #9043: error strings must respect language setting */}
       {isFailed && (
         <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-2 mb-3">
-          <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
-            <p className="text-xs font-medium text-red-400">Error loading events</p>
-            <p className="text-2xs text-muted-foreground mt-0.5">Failed to fetch event data ({consecutiveFailures} attempts)</p>
+            <p className="text-xs font-medium text-red-400">{t('warningEvents.errorLoading')}</p>
+            <p className="text-2xs text-muted-foreground mt-0.5">{t('warningEvents.errorFetchAttempts', { count: consecutiveFailures })}</p>
           </div>
         </div>
       )}
@@ -163,45 +164,47 @@ export function WarningEvents() {
         placeholder={t('common.searchWarnings')}
       />
 
-      {/* Warning events list */}
+      {/* Warning events list — filtered by search/cluster may yield 0 even when warningOnly > 0 */}
       {totalItems === 0 ? (
         <div className="text-center py-6">
           <CheckCircle2 className="w-8 h-8 mx-auto mb-2 text-green-400 opacity-50" />
-          <p className="text-sm text-muted-foreground">No warnings</p>
+          <p className="text-sm text-muted-foreground">{t('warningEvents.noMatchingWarnings')}</p>
         </div>
       ) : (
         <div ref={containerRef} className="space-y-2" style={containerStyle}>
-          {displayedEvents.map((event, i) => (
+          {displayedEvents.map((event) => (
             <div
-              key={`${event.object}-${event.reason}-${i}`}
+              key={`${event.cluster}-${event.namespace}-${event.object}-${event.reason}-${event.lastSeen}`}
               className="p-2 rounded-lg bg-yellow-500/5 border border-yellow-500/20"
             >
               <div className="flex items-start gap-2">
-                <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 mt-0.5 flex-shrink-0" />
+                <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 mt-0.5 shrink-0" />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <StatusBadge color="yellow">
                       {event.reason}
                     </StatusBadge>
                     <span className="text-xs text-foreground truncate">{event.object}</span>
+                    {/* Bug #9044: use × (Unicode multiplication) consistently across tabs */}
                     {event.count > 1 && (
                       <span className="text-xs px-1 py-0.5 rounded bg-card text-muted-foreground">
-                        x{event.count}
+                        {t('warningEvents.repeatCount', { count: event.count })}
                       </span>
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground truncate mt-0.5">{event.message}</p>
-                  <div className="flex items-center gap-2 mt-1">
-                    <span className="text-xs text-muted-foreground">{event.namespace}</span>
+                  <div className="flex flex-wrap items-center gap-2 mt-1 min-w-0">
+                    <span className="text-xs text-muted-foreground truncate">{event.namespace}</span>
                     {event.cluster && (
-                      <ClusterBadge cluster={event.cluster.split('/').pop() || event.cluster} size="sm" />
+                      <ClusterBadge cluster={event.cluster.split('/').pop() || event.cluster} size="sm" className="shrink min-w-0" />
                     )}
                     <CardAIActions
                       resource={{ kind: 'Event', name: event.object, namespace: event.namespace, cluster: event.cluster, status: 'Warning' }}
                       issues={[{ name: event.reason, message: event.message }]}
                       showRepair={false}
+                      className="shrink-0"
                     />
-                    <span className="text-xs text-muted-foreground ml-auto">{getTimeAgo(event.lastSeen)}</span>
+                    <span className="text-xs text-muted-foreground ml-auto whitespace-nowrap shrink-0">{formatTimeAgo(event.lastSeen ?? '', { invalidLabel: 'Unknown' })}</span>
                   </div>
                 </div>
               </div>

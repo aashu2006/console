@@ -53,10 +53,12 @@ export const DEFAULT_PRIMARY_NAV: SidebarItem[] = [
   { id: 'clusters', name: 'My Clusters', icon: 'Server', href: '/clusters', type: 'link', order: 1 },
   { id: 'cluster-admin', name: 'Cluster Admin', icon: 'ShieldAlert', href: '/cluster-admin', type: 'link', order: 2 },
   { id: 'compliance', name: 'Sec. Compliance', icon: 'ClipboardCheck', href: '/compliance', type: 'link', order: 2.5 },
+  { id: 'enterprise', name: 'Enterprise', icon: 'Building2', href: '/enterprise', type: 'link', order: 2.7 },
   { id: 'deploy', name: 'Deploy', icon: 'Rocket', href: '/deploy', type: 'link', order: 3 },
   { id: 'insights', name: 'Insights', icon: 'Lightbulb', href: '/insights', type: 'link', order: 3.5 },
   { id: 'ai-ml', name: 'AI/ML', icon: 'Sparkles', href: '/ai-ml', type: 'link', order: 4 },
   { id: 'ai-agents', name: 'AI Agents', icon: 'Bot', href: '/ai-agents', type: 'link', order: 5 },
+  { id: 'acmm', name: 'ACMM', icon: 'BarChart3', href: '/acmm', type: 'link', order: 5.5 },
   { id: 'ci-cd', name: 'CI/CD', icon: 'GitMerge', href: '/ci-cd', type: 'link', order: 6 },
   { id: 'multi-tenancy', name: 'Multi-Tenancy', icon: 'Users', href: '/multi-tenancy', type: 'link', order: 6.5 },
   { id: 'alerts', name: 'Alerts', icon: 'Bell', href: '/alerts', type: 'link', order: 7 },
@@ -80,7 +82,6 @@ export const DISCOVERABLE_DASHBOARDS: SidebarItem[] = [
   { id: 'helm', name: 'Helm', icon: 'Package', href: '/helm', type: 'link', order: 8 },
   { id: 'llm-d-benchmarks', name: 'llm-d Benchmarks', icon: 'TrendingUp', href: '/llm-d-benchmarks', type: 'link', order: 9 },
   { id: 'logs', name: 'Logs', icon: 'FileText', href: '/logs', type: 'link', order: 10 },
-  { id: 'multi-tenancy', name: 'Multi-Tenancy', icon: 'Users', href: '/multi-tenancy', type: 'link', order: 10.5 },
   { id: 'network', name: 'Network', icon: 'Globe', href: '/network', type: 'link', order: 11 },
   { id: 'nodes', name: 'Nodes', icon: 'CircuitBoard', href: '/nodes', type: 'link', order: 12 },
   { id: 'operators', name: 'Operators', icon: 'Cog', href: '/operators', type: 'link', order: 13 },
@@ -179,7 +180,10 @@ export async function fetchEnabledDashboards(): Promise<void> {
   }
 }
 
-// Migrate config to ensure all default routes exist
+// Migrate config to ensure all default routes exist.
+// By design, new routes added to DEFAULT_PRIMARY_NAV (e.g. /acmm) are
+// automatically appended to any stored sidebar config that lacks them,
+// so existing users pick up new dashboards without resetting their layout.
 function migrateConfig(stored: SidebarConfig): SidebarConfig {
   // First, remove deprecated routes
   const primaryNav = stored.primaryNav.filter(item => !DEPRECATED_ROUTES.includes(item.href))

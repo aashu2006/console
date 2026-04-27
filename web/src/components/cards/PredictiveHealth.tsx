@@ -5,6 +5,9 @@ import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { StatusBadge } from '../ui/StatusBadge'
 import { useCardLoadingState } from './CardDataContext'
 
+const RESTART_WARNING_THRESHOLD = 3
+const RESTART_CRITICAL_THRESHOLD = 10
+
 interface Prediction {
   id: string
   cluster: string
@@ -51,8 +54,8 @@ function confidenceFromUsage(usagePct: number): number {
 
 export function PredictiveHealth() {
   const { t } = useTranslation('cards')
-  const { nodes: allNodes, isLoading: nodesLoading, isDemoFallback: nodesDemoFallback, isFailed: nodesFailed, consecutiveFailures: nodesFailures } = useCachedNodes()
-  const { pods: allPods, isLoading: podsLoading, isDemoFallback: podsDemoFallback, isFailed: podsFailed, consecutiveFailures: podsFailures } = useCachedPods()
+  const { nodes: allNodes, isLoading: nodesLoading, isRefreshing: nodesRefreshing, isDemoFallback: nodesDemoFallback, isFailed: nodesFailed, consecutiveFailures: nodesFailures } = useCachedNodes()
+  const { pods: allPods, isLoading: podsLoading, isRefreshing: podsRefreshing, isDemoFallback: podsDemoFallback, isFailed: podsFailed, consecutiveFailures: podsFailures } = useCachedPods()
   const { filterByCluster } = useGlobalFilters()
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
@@ -60,9 +63,11 @@ export function PredictiveHealth() {
   const pods = filterByCluster(allPods)
 
   const isLoading = nodesLoading || podsLoading
+  const hasData = allNodes.length > 0 || allPods.length > 0
   const { showSkeleton } = useCardLoadingState({
-    isLoading,
-    hasAnyData: allNodes.length > 0 || allPods.length > 0,
+    isLoading: isLoading && !hasData,
+    isRefreshing: nodesRefreshing || podsRefreshing,
+    hasAnyData: hasData,
     isDemoData: nodesDemoFallback || podsDemoFallback,
     isFailed: nodesFailed || podsFailed,
     consecutiveFailures: Math.max(nodesFailures, podsFailures) })
@@ -129,12 +134,12 @@ export function PredictiveHealth() {
 
       // Restart storm detection
       const highRestarts = clusterPods.filter(p => (p.restarts || 0) > 5)
-      if (highRestarts.length > 3) {
+      if (highRestarts.length > RESTART_WARNING_THRESHOLD) {
         results.push({
           id: `restarts-${cluster}`,
           cluster,
           resource: 'Stability',
-          severity: highRestarts.length > 10 ? 'critical' : 'warning',
+          severity: highRestarts.length > RESTART_CRITICAL_THRESHOLD ? 'critical' : 'warning',
           message: `${highRestarts.length} pods with high restart counts — potential instability`,
           confidence: 0.78 })
       }
@@ -164,7 +169,7 @@ export function PredictiveHealth() {
   return (
     <div className="space-y-2 p-1">
       {/* Summary */}
-      <div className="flex gap-2 text-xs">
+      <div className="flex flex-wrap gap-x-2 gap-y-1 text-xs">
         <span className="text-red-400">{t('predictiveHealth.criticalCount', { count: predictions.filter(p => p.severity === 'critical').length })}</span>
         <span className="text-yellow-400">{t('predictiveHealth.warningCount', { count: predictions.filter(p => p.severity === 'warning').length })}</span>
         <span className="text-muted-foreground">{t('predictiveHealth.totalPredictions', { count: predictions.length })}</span>
@@ -187,12 +192,12 @@ export function PredictiveHealth() {
                 onClick={() => setExpandedId(isExpanded ? null : pred.id)}
                 className={`w-full text-left px-3 py-2 rounded-lg border transition-all ${style.bg} ${style.border} hover:brightness-110`}
               >
-                <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start justify-between gap-1.5">
                   <div className="flex items-start gap-2 min-w-0">
                     <div className={`w-2 h-2 rounded-full mt-1 shrink-0 ${style.dot}`} />
                     <div className="min-w-0">
                       <div className="text-sm font-medium">{pred.resource}</div>
-                      <div className="text-xs text-muted-foreground truncate">{pred.message}</div>
+                      <div className="text-xs text-muted-foreground wrap-break-word">{pred.message}</div>
                     </div>
                   </div>
                   <div className="flex flex-col items-end gap-0.5 shrink-0">

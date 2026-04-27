@@ -10,7 +10,9 @@ import {
   Package, FileText, ExternalLink
 } from 'lucide-react'
 import { cn } from '../../../lib/cn'
+import { sanitizeUrl } from '../../../lib/utils/sanitizeUrl'
 import { LOCAL_AGENT_WS_URL } from '../../../lib/constants'
+import { appendWsAuthToken } from '../../../lib/utils/wsAuth'
 import { ConsoleAIIcon } from '../../ui/ConsoleAIIcon'
 import {
   AIActionBar,
@@ -127,7 +129,7 @@ export function OperatorDrillDown({ data }: Props) {
   // Helper to run kubectl commands
   const runKubectl = (args: string[]): Promise<string> => {
     return new Promise((resolve) => {
-      const ws = new WebSocket(LOCAL_AGENT_WS_URL)
+      const ws = new WebSocket(appendWsAuthToken(LOCAL_AGENT_WS_URL))
       const requestId = `kubectl-${Date.now()}-${Math.random().toString(36).slice(2)}`
       let output = ''
 
@@ -268,11 +270,14 @@ CSV Information:
 ` : ''}
 
 Please:
-1. Assess the operator health and installation status
-2. Check for version updates or deprecated APIs
-3. Verify the subscription configuration
-4. Identify any issues or misconfigurations
-5. Suggest best practices for operator management`
+1. Assess the operator health — installation status, subscription, and CSV state.
+2. Tell me what you found, then ask:
+   - "Should I fix the issues?"
+   - "Should I upgrade to a newer version?"
+   - "Show me more details first"
+3. If I pick an action, apply and verify. Then ask:
+   - "Should I check other operators on this cluster?"
+   - "All done"`
 
     startMission({
       title: `Diagnose Operator: ${operatorName}`,
@@ -379,7 +384,7 @@ Please:
         {activeTab === 'overview' && (
           <div className="space-y-6">
             {/* Operator Info Card */}
-            <div className="p-4 rounded-lg bg-gradient-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/20">
+            <div className="p-4 rounded-lg bg-linear-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/20">
               <div className="flex items-start gap-3">
                 <Settings className="w-8 h-8 text-purple-400 mt-1" />
                 <div className="flex-1 min-w-0">
@@ -462,7 +467,7 @@ Please:
                   {csvInfo.links.map((link, i) => (
                     <a
                       key={i}
-                      href={link.url}
+                      href={sanitizeUrl(link.url)}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-secondary/50 text-sm text-foreground hover:bg-secondary transition-colors"

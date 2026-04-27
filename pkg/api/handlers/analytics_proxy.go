@@ -14,9 +14,14 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"golang.org/x/sync/singleflight"
 )
 
-var analyticsClient = &http.Client{Timeout: 10 * time.Second}
+// analyticsUpstreamTimeout is the maximum time the proxy waits for a response
+// from the upstream analytics service (Google Analytics, Umami).
+const analyticsUpstreamTimeout = 10 * time.Second
+
+var analyticsClient = &http.Client{Timeout: analyticsUpstreamTimeout}
 
 // allowedOrigins lists hostnames that may send analytics through the proxy.
 var allowedOrigins = map[string]bool{
@@ -37,6 +42,11 @@ const (
 
 	// umamiUpstreamBase is the external Umami instance that the proxy relays to.
 	umamiUpstreamBase = "https://analytics.kubestellar.io"
+
+	// maxProxyResponseBytes is the maximum upstream response body size the proxy
+	// will buffer. Prevents multi-GB memory exhaustion from malicious or
+	// misconfigured upstreams (#7022).
+	maxProxyResponseBytes = 10 * 1024 * 1024 // 10 MB
 )
 
 // gtagCache holds a server-side cache of the gtag.js script to avoid
@@ -48,6 +58,10 @@ var gtagCache struct {
 	fetchedAt   time.Time
 	queryString string // cache key — different measurement IDs get different scripts
 }
+
+// scriptFetchGroup coalesces concurrent cold-cache fetches into a single
+// upstream request, preventing cache stampede on the CDN (#7021).
+var scriptFetchGroup singleflight.Group
 
 // GA4ScriptProxy proxies the gtag.js script through the console's own domain
 // so that ad blockers do not block it. The response is cached server-side
@@ -68,35 +82,48 @@ func GA4ScriptProxy(c *fiber.Ctx) error {
 	}
 	gtagCache.RUnlock()
 
-	// Cache miss — fetch from Google
-	target := "https://www.googletagmanager.com/gtag/js?" + qs
-	resp, err := analyticsClient.Get(target)
+	// Cache miss — use singleflight to coalesce concurrent fetches (#7021)
+	type gtagResult struct {
+		body        []byte
+		contentType string
+		statusCode  int
+	}
+	val, err, _ := scriptFetchGroup.Do("gtag:"+qs, func() (interface{}, error) {
+		target := "https://www.googletagmanager.com/gtag/js?" + qs
+		resp, fetchErr := analyticsClient.Get(target)
+		if fetchErr != nil {
+			slog.Error("[GA4] failed to fetch gtag.js", "error", fetchErr)
+			return nil, fetchErr
+		}
+		defer resp.Body.Close()
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProxyResponseBytes))
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		ct := resp.Header.Get("Content-Type")
+
+		// Update cache on success
+		if resp.StatusCode == http.StatusOK {
+			gtagCache.Lock()
+			gtagCache.body = body
+			gtagCache.contentType = ct
+			gtagCache.fetchedAt = time.Now()
+			gtagCache.queryString = qs
+			gtagCache.Unlock()
+		}
+
+		return &gtagResult{body: body, contentType: ct, statusCode: resp.StatusCode}, nil
+	})
 	if err != nil {
-		slog.Error("[GA4] failed to fetch gtag.js", "error", err)
 		return c.SendStatus(fiber.StatusBadGateway)
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return c.SendStatus(fiber.StatusBadGateway)
-	}
-
-	ct := resp.Header.Get("Content-Type")
-
-	// Update cache
-	if resp.StatusCode == http.StatusOK {
-		gtagCache.Lock()
-		gtagCache.body = body
-		gtagCache.contentType = ct
-		gtagCache.fetchedAt = time.Now()
-		gtagCache.queryString = qs
-		gtagCache.Unlock()
-	}
-
-	c.Set("Content-Type", ct)
+	result := val.(*gtagResult)
+	c.Set("Content-Type", result.contentType)
 	c.Set("Cache-Control", "public, max-age=3600")
-	return c.Status(resp.StatusCode).Send(body)
+	return c.Status(result.statusCode).Send(result.body)
 }
 
 // GA4CollectProxy proxies GA4 event collection requests through the console's
@@ -173,7 +200,7 @@ func GA4CollectProxy(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusBadGateway)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyResponseBytes))
 	if err != nil {
 		return c.SendStatus(fiber.StatusBadGateway)
 	}
@@ -189,45 +216,77 @@ func ga4RealMeasurementID() string {
 	return id
 }
 
+// isAllowedNetlifyHost returns true if host is a KubeStellar Netlify preview
+// deployment. Only the project's own deploy-preview subdomains are accepted;
+// the blanket *.netlify.app wildcard is intentionally NOT used because any
+// attacker-controlled Netlify site would pass that check (#7032).
+func isAllowedNetlifyHost(host string) bool {
+	// Production: kubestellar-console.netlify.app
+	if host == "kubestellar-console.netlify.app" {
+		return true
+	}
+	// Deploy previews: deploy-preview-<N>--kubestellar-console.netlify.app
+	if strings.HasSuffix(host, "--kubestellar-console.netlify.app") {
+		return true
+	}
+	return false
+}
+
 // isAllowedOrigin checks if the request comes from an allowed hostname.
 // In addition to the explicit allowlist, same-origin requests are always
 // permitted — this ensures OpenShift and other dynamic deployments work
 // without maintaining an exhaustive hostname list.
+//
+// Security: only the Origin header is checked — Referer is not used because
+// it is trivially forgeable by non-browser HTTP clients (#7031).
 func isAllowedOrigin(c *fiber.Ctx) bool {
-	requestHost := stripPort(c.Hostname())
-
 	origin := c.Get("Origin")
-	if origin != "" {
-		if u, err := url.Parse(origin); err == nil {
-			host := stripPort(u.Hostname())
-			if allowedOrigins[host] || strings.HasSuffix(host, ".netlify.app") || host == requestHost {
-				return true
-			}
-		}
+	if origin == "" {
+		// Reject requests without an Origin header. Browsers always send Origin
+		// for XHR/fetch cross-origin requests. Requests without it are likely
+		// from non-browser clients attempting to bypass origin checks (#7031).
+		return false
 	}
 
-	referer := c.Get("Referer")
-	if referer != "" {
-		if u, err := url.Parse(referer); err == nil {
-			host := stripPort(u.Hostname())
-			if allowedOrigins[host] || strings.HasSuffix(host, ".netlify.app") || host == requestHost {
-				return true
-			}
-		}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := stripPort(u.Hostname())
+
+	// Explicit allowlist
+	if allowedOrigins[host] {
+		return true
 	}
 
-	// Reject requests with neither Origin nor Referer — browsers always send
-	// at least one for XHR/fetch. Requests without either are likely from
-	// non-browser clients bypassing origin checks.
-	return false
+	// KubeStellar Netlify previews only (#7032)
+	if isAllowedNetlifyHost(host) {
+		return true
+	}
+
+	// Same-origin: the Origin host matches the request's Host header.
+	// This ensures OpenShift and other dynamic deployments work without
+	// maintaining an exhaustive hostname list.
+	requestHost := stripPort(c.Hostname())
+	return host == requestHost
 }
 
 // stripPort removes the port from a hostname (e.g., "localhost:5174" → "localhost").
+// IPv6 addresses (e.g., "::1") are returned unchanged — the colon in an IPv6
+// address is NOT a port separator. net.SplitHostPort is used when the value
+// looks like it contains a port, which handles both IPv4 and IPv6 correctly.
 func stripPort(host string) string {
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		return host[:i]
+	// If the host contains no colon, there is no port to strip.
+	if !strings.Contains(host, ":") {
+		return host
 	}
-	return host
+	// net.SplitHostPort handles "[::1]:port", "host:port", etc.
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		// Not in host:port form — return as-is (bare IPv6 like "::1").
+		return host
+	}
+	return h
 }
 
 // isPrivateIP returns true for loopback, link-local, and RFC-1918 addresses.
@@ -273,34 +332,47 @@ func UmamiScriptProxy(c *fiber.Ctx) error {
 	}
 	umamiScriptCache.RUnlock()
 
-	// Cache miss — fetch from upstream Umami instance
-	target := umamiUpstreamBase + "/ksc"
-	resp, err := analyticsClient.Get(target)
+	// Cache miss — use singleflight to coalesce concurrent fetches (#7021)
+	type umamiResult struct {
+		body        []byte
+		contentType string
+		statusCode  int
+	}
+	val, err, _ := scriptFetchGroup.Do("umami", func() (interface{}, error) {
+		target := umamiUpstreamBase + "/ksc"
+		resp, fetchErr := analyticsClient.Get(target)
+		if fetchErr != nil {
+			slog.Error("[Umami] failed to fetch tracking script", "error", fetchErr)
+			return nil, fetchErr
+		}
+		defer resp.Body.Close()
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProxyResponseBytes))
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		ct := resp.Header.Get("Content-Type")
+
+		// Update cache on success
+		if resp.StatusCode == http.StatusOK {
+			umamiScriptCache.Lock()
+			umamiScriptCache.body = body
+			umamiScriptCache.contentType = ct
+			umamiScriptCache.fetchedAt = time.Now()
+			umamiScriptCache.Unlock()
+		}
+
+		return &umamiResult{body: body, contentType: ct, statusCode: resp.StatusCode}, nil
+	})
 	if err != nil {
-		slog.Error("[Umami] failed to fetch tracking script", "error", err)
 		return c.SendStatus(fiber.StatusBadGateway)
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return c.SendStatus(fiber.StatusBadGateway)
-	}
-
-	ct := resp.Header.Get("Content-Type")
-
-	// Update cache on success
-	if resp.StatusCode == http.StatusOK {
-		umamiScriptCache.Lock()
-		umamiScriptCache.body = body
-		umamiScriptCache.contentType = ct
-		umamiScriptCache.fetchedAt = time.Now()
-		umamiScriptCache.Unlock()
-	}
-
-	c.Set("Content-Type", ct)
+	result := val.(*umamiResult)
+	c.Set("Content-Type", result.contentType)
 	c.Set("Cache-Control", "public, max-age=3600")
-	return c.Status(resp.StatusCode).Send(body)
+	return c.Status(result.statusCode).Send(result.body)
 }
 
 // UmamiCollectProxy relays Umami event payloads to the upstream instance.
@@ -342,7 +414,7 @@ func UmamiCollectProxy(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusBadGateway)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyResponseBytes))
 	if err != nil {
 		return c.SendStatus(fiber.StatusBadGateway)
 	}

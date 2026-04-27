@@ -1,10 +1,10 @@
 import { AlertCircle, Server } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useClusters, useServices } from '../../hooks/useMCP'
+import { useIngresses } from '../../hooks/mcp/networking'
 import { ROUTES } from '../../config/routes'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { StatBlockValue } from '../ui/StatsOverview'
 import { DashboardPage } from '../../lib/dashboards/DashboardPage'
 import { getDefaultCards } from '../../config/dashboards'
@@ -19,10 +19,10 @@ export function Services() {
   const navigate = useNavigate()
   const { clusters, isLoading, isRefreshing: dataRefreshing, lastUpdated, refetch, error: clustersError } = useClusters()
   const { services, error: servicesError } = useServices()
+  const { ingresses } = useIngresses()
   const error = clustersError || servicesError
 
   const { drillToAllServices, drillToAllClusters } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
   const { selectedClusters: globalSelectedClusters, isAllClustersSelected } = useGlobalFilters()
 
   // Filter clusters based on global selection
@@ -66,8 +66,13 @@ export function Services() {
         return { value: nodePortServices, sublabel: 'NodePort', onClick: () => drillToAllServices('nodeport'), isClickable: nodePortServices > 0 }
       case 'clusterip':
         return { value: clusterIPServices, sublabel: 'ClusterIP', onClick: () => drillToAllServices('clusterip'), isClickable: clusterIPServices > 0 }
-      case 'ingresses':
-        return { value: 0, sublabel: 'ingresses', isClickable: false }
+      case 'ingresses': {
+        // Show actual ingress count instead of hardcoded 0 (#7517)
+        const allIngresses = (ingresses || []).filter(i =>
+          isAllClustersSelected || globalSelectedClusters.includes(i.cluster || '')
+        )
+        return { value: allIngresses.length, sublabel: 'ingresses', isClickable: false }
+      }
       case 'endpoints':
         return { value: totalEndpoints, sublabel: 'endpoints', onClick: () => drillToAllServices(), isClickable: totalEndpoints > 0 }
       default:
@@ -75,7 +80,7 @@ export function Services() {
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   return (
     <DashboardPage
@@ -113,7 +118,7 @@ export function Services() {
       {/* Error Display */}
       {error && (
         <div className="mb-4 p-4 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-sm font-medium text-red-400">Error loading service data</p>
             <p className="text-xs text-muted-foreground mt-1">{error}</p>

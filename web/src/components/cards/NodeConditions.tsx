@@ -6,6 +6,8 @@ import { useKubectl } from '../../hooks/useKubectl'
 import { useCardLoadingState } from './CardDataContext'
 import { useDemoMode } from '../../hooks/useDemoMode'
 
+const MAX_VISIBLE_CONDITIONS = 20
+
 type ConditionFilter = 'all' | 'healthy' | 'cordoned' | 'pressure'
 
 /** Confirmation dialog state for cordon/uncordon actions */
@@ -35,42 +37,35 @@ export function NodeConditions() {
   const [confirmAction, setConfirmAction] = useState<PendingAction | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
 
+  // Mutually-exclusive classification so the pill counts always sum to the
+  // total: a node with Ready!=True and no other True conditions (network
+  // partition, NotReady) otherwise lands in no bucket, and a cordoned node
+  // with pressure was being double-counted (#8297). Priority: cordoned >
+  // pressure > healthy.
+  const classify = (n: { unschedulable?: boolean; conditions?: Array<{ type: string; status: string }> }): Exclude<ConditionFilter, 'all'> => {
+    if (n.unschedulable) return 'cordoned'
+    const conditions = n.conditions || []
+    const ready = conditions.find(c => c.type === 'Ready')
+    const isReady = ready?.status === 'True'
+    const hasOtherPressure = conditions.some(c => c.type !== 'Ready' && c.status === 'True')
+    if (!isReady || hasOtherPressure) return 'pressure'
+    return 'healthy'
+  }
+
   const summary = (() => {
-    const cordoned = nodes.filter(n => n.unschedulable)
-    const pressure = nodes.filter(n => {
-      const conditions = n.conditions || []
-      return conditions.some((c: { type: string; status: string }) =>
-        c.type !== 'Ready' && c.status === 'True'
-      )
-    })
-    const healthy = nodes.filter(n => {
-      const conditions = n.conditions || []
-      const ready = conditions.find((c: { type: string }) => c.type === 'Ready')
-      return ready && (ready as { status: string }).status === 'True' && !n.unschedulable
-    })
-    return { total: nodes.length, healthy: healthy.length, cordoned: cordoned.length, pressure: pressure.length }
+    let healthy = 0, cordoned = 0, pressure = 0
+    for (const n of nodes) {
+      const bucket = classify(n)
+      if (bucket === 'healthy') healthy++
+      else if (bucket === 'cordoned') cordoned++
+      else pressure++
+    }
+    return { total: nodes.length, healthy, cordoned, pressure }
   })()
 
   const filtered = useMemo(() => {
-    switch (filter) {
-      case 'healthy':
-        return nodes.filter(n => {
-          const conditions = n.conditions || []
-          const ready = conditions.find((c: { type: string }) => c.type === 'Ready')
-          return ready && (ready as { status: string }).status === 'True' && !n.unschedulable
-        })
-      case 'cordoned':
-        return nodes.filter(n => n.unschedulable)
-      case 'pressure':
-        return nodes.filter(n => {
-          const conditions = n.conditions || []
-          return conditions.some((c: { type: string; status: string }) =>
-            c.type !== 'Ready' && c.status === 'True'
-          )
-        })
-      default:
-        return nodes
-    }
+    if (filter === 'all') return nodes
+    return nodes.filter(n => classify(n) === filter)
   }, [nodes, filter])
 
   /** Show confirmation dialog before executing cordon/uncordon */
@@ -148,7 +143,7 @@ export function NodeConditions() {
 
       {/* Error toast for failed actions */}
       {actionError && (
-        <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400 flex items-center justify-between">
+        <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400 flex flex-wrap items-center justify-between gap-y-2">
           <span>{actionError}</span>
           <button onClick={() => setActionError(null)} className="ml-2 text-red-300 hover:text-red-200">
             ✕
@@ -179,7 +174,11 @@ export function NodeConditions() {
               onClick={() => setFilter(f)}
               title={`${filterLabels[f]}: ${count}`}
               className={`px-2 py-1 rounded-full transition-colors max-w-full truncate ${
-                filter === f ? colors[f] + ' ring-1 ring-current' : 'bg-muted/30 text-muted-foreground hover:bg-muted/50'
+                // ring-inset keeps the selected-state ring inside the pill's
+                // border-box so the parent `overflow-hidden` (kept to guard
+                // against long translated labels overflowing the card per
+                // #6457) doesn't clip the top/bottom 1px of the ring (#7881).
+                filter === f ? colors[f] + ' ring-1 ring-inset ring-current' : 'bg-muted/30 text-muted-foreground hover:bg-muted/50'
               }`}
             >
               {filterLabels[f]}: {count}
@@ -189,14 +188,14 @@ export function NodeConditions() {
       </div>
 
       <div className="space-y-1 max-h-[300px] overflow-y-auto">
-        {filtered.slice(0, 20).map(node => {
+        {filtered.slice(0, MAX_VISIBLE_CONDITIONS).map(node => {
           const conditions = (node.conditions || []) as Array<{ type: string; status: string }>
           const ready = conditions.find(c => c.type === 'Ready')
           const isReady = ready?.status === 'True'
           const pressures = conditions.filter(c => c.type !== 'Ready' && c.status === 'True')
 
           return (
-            <div key={`${node.cluster}-${node.name}`} className="flex items-center justify-between px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+            <div key={`${node.cluster}-${node.name}`} className="flex flex-wrap items-center justify-between gap-y-2 px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <div className={`w-2 h-2 rounded-full shrink-0 ${
                   node.unschedulable ? 'bg-yellow-500' :
@@ -234,9 +233,9 @@ export function NodeConditions() {
             </div>
           )
         })}
-        {filtered.length > 20 && (
+        {filtered.length > MAX_VISIBLE_CONDITIONS && (
           <div className="text-xs text-muted-foreground text-center py-1">
-            {t('nodeConditions.moreNodes', { count: filtered.length - 20 })}
+            {t('nodeConditions.moreNodes', { count: filtered.length - MAX_VISIBLE_CONDITIONS })}
           </div>
         )}
       </div>

@@ -11,6 +11,7 @@ import {
 import { cn } from '../../../lib/cn'
 import { StatusBadge } from '../../ui/StatusBadge'
 import { LOCAL_AGENT_WS_URL } from '../../../lib/constants'
+import { appendWsAuthToken } from '../../../lib/utils/wsAuth'
 import { ConsoleAIIcon } from '../../ui/ConsoleAIIcon'
 import {
   AIActionBar,
@@ -140,7 +141,7 @@ export function CRDDrillDown({ data }: Props) {
   // Helper to run kubectl commands
   const runKubectl = (args: string[]): Promise<string> => {
     return new Promise((resolve) => {
-      const ws = new WebSocket(LOCAL_AGENT_WS_URL)
+      const ws = new WebSocket(appendWsAuthToken(LOCAL_AGENT_WS_URL))
       const requestId = `kubectl-${Date.now()}-${Math.random().toString(36).slice(2)}`
       let output = ''
 
@@ -303,11 +304,13 @@ ${deprecatedVersions.map(v => `- ${v.name}: ${v.deprecationWarning || 'No warnin
 Instances: ${instances?.length || 0} found
 
 Please:
-1. Assess the CRD health and version strategy
-2. Identify deprecated versions and migration paths
-3. Check for API compatibility issues
-4. Analyze the schema for best practices
-5. Suggest improvements for CRD management`
+1. Assess the CRD health — check versions, deprecations, and schema.
+2. Tell me what you found, then ask:
+   - "Should I fix the issues I found?"
+   - "Show me more details first"
+3. If I say fix it, apply changes and verify. Then ask:
+   - "Should I check related CRDs?"
+   - "All done"`
 
     startMission({
       title: `Diagnose CRD: ${crdName}`,
@@ -410,7 +413,7 @@ Please:
         {activeTab === 'overview' && (
           <div className="space-y-6">
             {/* CRD Info Card */}
-            <div className="p-4 rounded-lg bg-gradient-to-r from-purple-500/10 to-purple-500/10 border border-purple-500/20">
+            <div className="p-4 rounded-lg bg-linear-to-r from-purple-500/10 to-purple-500/10 border border-purple-500/20">
               <div className="flex items-start gap-3">
                 <Package className="w-8 h-8 text-purple-400 mt-1" />
                 <div className="flex-1 min-w-0">

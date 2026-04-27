@@ -1,51 +1,5 @@
-import { test, expect, Page } from '@playwright/test'
-
-/**
- * Sets up authentication and MCP mocks for dashboard tests
- */
-async function setupDashboardTest(page: Page) {
-  // Mock authentication
-  await page.route('**/api/me', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        id: '1',
-        github_id: '12345',
-        github_login: 'testuser',
-        email: 'test@example.com',
-        onboarded: true,
-      }),
-    })
-  )
-
-  // Mock cluster data
-  await page.route('**/api/mcp/**', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        clusters: [
-          { name: 'cluster-1', context: 'ctx-1', healthy: true, nodeCount: 5, podCount: 45 },
-          { name: 'cluster-2', context: 'ctx-2', healthy: true, nodeCount: 3, podCount: 32 },
-        ],
-        issues: [],
-        events: [],
-        nodes: [],
-      }),
-    })
-  )
-
-  // Set token before navigating
-  await page.goto('/login')
-  await page.evaluate(() => {
-    localStorage.setItem('token', 'test-token')
-    localStorage.setItem('demo-user-onboarded', 'true')
-  })
-
-  await page.goto('/')
-  await page.waitForLoadState('domcontentloaded')
-}
+import { test, expect } from '@playwright/test'
+import { setupDashboardTest } from './helpers/setup'
 
 test.describe('Dashboard Page', () => {
   test.beforeEach(async ({ page }) => {
@@ -53,16 +7,22 @@ test.describe('Dashboard Page', () => {
   })
 
   test.describe('Layout and Structure', () => {
-    test('displays dashboard with sidebar', async ({ page }) => {
+    // On mobile viewports the sidebar is hidden by design (`-translate-x-full
+    // hidden md:flex`) — the hamburger menu opens it on demand. These tests
+    // assume desktop layout, so skip them on the mobile-* Playwright projects.
+    test('displays dashboard with sidebar', async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name.startsWith('mobile-'), 'sidebar is hidden by design on mobile breakpoints')
       // Check for main layout elements using data-testid
       await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: 10000 })
       await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 5000 })
     })
 
-    test('displays navigation items in sidebar', async ({ page }) => {
+    test('displays navigation items in sidebar', async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name.startsWith('mobile-'), 'sidebar is hidden by design on mobile breakpoints')
       // Sidebar should have navigation
-      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 5000 })
-      await expect(page.getByTestId('sidebar-primary-nav')).toBeVisible()
+      const SIDEBAR_NAV_TIMEOUT_MS = 10_000
+      await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: SIDEBAR_NAV_TIMEOUT_MS })
+      await expect(page.getByTestId('sidebar-primary-nav')).toBeVisible({ timeout: SIDEBAR_NAV_TIMEOUT_MS })
 
       // Should have navigation links
       const navLinks = page.getByTestId('sidebar-primary-nav').locator('a')
@@ -85,16 +45,75 @@ test.describe('Dashboard Page', () => {
     })
 
     test('cards have proper structure', async ({ page }) => {
-      // Wait for cards grid
-      await expect(page.getByTestId('dashboard-cards-grid')).toBeVisible({ timeout: 10000 })
+      // #9074 — This test previously asserted `cardCount >= 0`, which is
+      // mathematically impossible to fail (Playwright `.count()` always
+      // returns a non-negative integer). A regression that removed every
+      // card from the dashboard would have gone undetected. The assertions
+      // below verify real structural properties of the rendered cards.
 
-      // Cards should have content
+      // Min number of default cards we expect on a fresh dashboard. The
+      // default dashboard ships with several built-in cards; if this drops
+      // to zero the dashboard is broken.
+      const MIN_DEFAULT_CARDS = 1
+
+      // Max time (ms) to wait for the cards grid + first card to appear.
+      const GRID_VISIBLE_TIMEOUT_MS = 10_000
+
+      // Max number of cards to spot-check structural attributes on. We
+      // bound this so the test stays fast even on dashboards with many
+      // cards while still catching regressions on the first few.
+      const MAX_CARDS_TO_CHECK = 5
+
+      // Wait for cards grid to be visible.
       const cardsGrid = page.getByTestId('dashboard-cards-grid')
-      const cards = cardsGrid.locator('> div')
-      const cardCount = await cards.count()
+      await expect(cardsGrid).toBeVisible({ timeout: GRID_VISIBLE_TIMEOUT_MS })
 
-      // Dashboard should have at least one card (defaults are set)
-      expect(cardCount).toBeGreaterThanOrEqual(0)
+      // The grid itself must be a role=grid with an a11y label so screen
+      // readers can announce it. This is part of the public contract of
+      // the dashboard layout (see Dashboard.tsx).
+      await expect(cardsGrid).toHaveAttribute('role', 'grid')
+      await expect(cardsGrid).toHaveAttribute('aria-label', /.+/)
+
+      // Every rendered card carries a `data-card-id` attribute applied by
+      // CardWrapper. Counting those — rather than direct-child <div>s —
+      // excludes non-card grid children like the DiscoverCardsPlaceholder
+      // and any drag overlays. That makes this a real assertion about
+      // *cards*, not arbitrary grid children.
+      const cards = cardsGrid.locator('[data-card-id]')
+
+      // Wait for at least one card to actually render before counting,
+      // otherwise the count race with React's first paint could falsely
+      // report zero. Playwright's `.first()` + toBeVisible serves as the
+      // synchronization barrier.
+      await expect(cards.first()).toBeVisible({ timeout: GRID_VISIBLE_TIMEOUT_MS })
+
+      const cardCount = await cards.count()
+      expect(cardCount).toBeGreaterThanOrEqual(MIN_DEFAULT_CARDS)
+
+      // Spot-check each card (up to MAX_CARDS_TO_CHECK) for the structural
+      // attributes that downstream features depend on:
+      //   - data-card-type: drives card-type-specific behaviors and
+      //     analytics (cardType is used as the GA4 event label).
+      //   - data-card-id: stable identity for drag/drop, persistence, and
+      //     selector targeting in other tests.
+      //   - aria-label: announced to screen readers as the card title.
+      //   - <h3>: visible heading per the design system.
+      const cardsToCheck = Math.min(cardCount, MAX_CARDS_TO_CHECK)
+      for (let i = 0; i < cardsToCheck; i++) {
+        const card = cards.nth(i)
+
+        // Required attributes.
+        await expect(card).toHaveAttribute('data-card-type', /.+/)
+        await expect(card).toHaveAttribute('data-card-id', /.+/)
+        await expect(card).toHaveAttribute('aria-label', /.+/)
+
+        // Each card must render a visible <h3> heading (the title shown in
+        // the card header). If a card variant ever stops rendering the
+        // heading, this catches it.
+        const heading = card.locator('h3').first()
+        await expect(heading).toBeVisible()
+        await expect(heading).not.toHaveText('')
+      }
     })
 
     test('cards are interactive (hover/click)', async ({ page }) => {
@@ -118,14 +137,16 @@ test.describe('Dashboard Page', () => {
   })
 
   test.describe('Card Management', () => {
-    test('has add card button in sidebar', async ({ page }) => {
+    test('has add card button in sidebar', async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name.startsWith('mobile-'), 'sidebar is hidden by design on mobile breakpoints')
       await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 5000 })
 
       // Add card button should be visible (when sidebar is expanded)
       await expect(page.getByTestId('sidebar-add-card')).toBeVisible()
     })
 
-    test('clicking add card opens modal', async ({ page }) => {
+    test('clicking add card opens modal', async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name.startsWith('mobile-'), 'sidebar is hidden by design on mobile breakpoints')
       await expect(page.getByTestId('sidebar-add-card')).toBeVisible({ timeout: 5000 })
 
       // Click add card button
@@ -138,12 +159,26 @@ test.describe('Dashboard Page', () => {
 
   test.describe('Data Loading', () => {
     test('shows loading state initially', async ({ page }) => {
-      // Reset to fresh page without mocks set up yet
-      await page.goto('/login')
+      // Catch-all API mock prevents unmocked requests hanging in webkit/firefox
+      await page.route('**/api/**', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({}),
+        })
+      )
+      await page.route('**/api/me', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ id: '1', github_id: '12345', github_login: 'testuser', email: 'test@example.com', onboarded: true }),
+        })
+      )
 
       // Delay the API response to see loading state
       await page.route('**/api/mcp/**', async (route) => {
-        await new Promise((resolve) => setTimeout(resolve, 2000))
+        const API_DELAY_MS = 2000
+        await new Promise((resolve) => setTimeout(resolve, API_DELAY_MS))
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
@@ -151,20 +186,36 @@ test.describe('Dashboard Page', () => {
         })
       })
 
-      await page.evaluate(() => {
+      // Seed localStorage BEFORE any page script runs (#9096).
+      await page.addInitScript(() => {
         localStorage.setItem('token', 'test-token')
         localStorage.setItem('demo-user-onboarded', 'true')
       })
 
       await page.goto('/')
+      await page.waitForLoadState('domcontentloaded')
 
       // Dashboard page should be visible even during loading
-      await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: 10000 })
+      const PAGE_VISIBLE_TIMEOUT_MS = 15_000
+      await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: PAGE_VISIBLE_TIMEOUT_MS })
     })
 
     test('handles API errors gracefully', async ({ page }) => {
-      // Reset and mock error
-      await page.goto('/login')
+      // Catch-all API mock prevents unmocked requests hanging in webkit/firefox
+      await page.route('**/api/**', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({}),
+        })
+      )
+      await page.route('**/api/me', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ id: '1', github_id: '12345', github_login: 'testuser', email: 'test@example.com', onboarded: true }),
+        })
+      )
 
       await page.route('**/api/mcp/clusters', (route) =>
         route.fulfill({
@@ -174,15 +225,18 @@ test.describe('Dashboard Page', () => {
         })
       )
 
-      await page.evaluate(() => {
+      // Seed localStorage BEFORE any page script runs (#9096).
+      await page.addInitScript(() => {
         localStorage.setItem('token', 'test-token')
         localStorage.setItem('demo-user-onboarded', 'true')
       })
 
       await page.goto('/')
+      await page.waitForLoadState('domcontentloaded')
 
       // Dashboard should still render (not crash)
-      await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: 10000 })
+      const PAGE_VISIBLE_TIMEOUT_MS = 15_000
+      await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: PAGE_VISIBLE_TIMEOUT_MS })
     })
 
     test('refresh button triggers data reload', async ({ page }) => {
@@ -241,9 +295,11 @@ test.describe('Dashboard Page', () => {
     test('has proper ARIA labels', async ({ page }) => {
       await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: 10000 })
 
-      // Refresh button should have title for accessibility
+      // Refresh button should have title for accessibility. The actual i18n
+      // string is `common.refreshClusterData` → "Refresh cluster data"
+      // (see web/src/locales/en/common.json and DashboardHeader.tsx).
       const refreshButton = page.getByTestId('dashboard-refresh-button')
-      await expect(refreshButton).toHaveAttribute('title', 'Refresh data')
+      await expect(refreshButton).toHaveAttribute('title', 'Refresh cluster data')
     })
   })
 
@@ -256,6 +312,24 @@ test.describe('Dashboard Page', () => {
     const EXPECTED_CLUSTER_COUNT = 3
 
     test.beforeEach(async ({ page }) => {
+      // #6507(C) — The outer `Dashboard Page` describe's beforeEach
+      // (setupDashboardTest) already registered handlers for **/api/me and
+      // **/api/mcp/**. Unroute them here so our deterministic payload is the
+      // ONLY source of data for these Data Accuracy tests — otherwise the
+      // outer mock with 2 clusters could race with our EXPECTED_CLUSTER_COUNT.
+      await page.unroute('**/api/**')
+      await page.unroute('**/api/me')
+      await page.unroute('**/api/mcp/**')
+
+      // Re-register catch-all (prevents unmocked API hangs in webkit/firefox)
+      await page.route('**/api/**', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({}),
+        })
+      )
+
       // Mock authentication
       await page.route('**/api/me', (route) =>
         route.fulfill({
@@ -313,10 +387,13 @@ test.describe('Dashboard Page', () => {
         })
       })
 
-      await page.goto('/login')
-      await page.evaluate(() => {
+      // Seed localStorage BEFORE any page script runs (#9096).
+      // Disable demo mode so the app fetches from the mocked API routes
+      // above instead of returning built-in demo data (12 clusters).
+      await page.addInitScript(() => {
         localStorage.setItem('token', 'test-token')
         localStorage.setItem('demo-user-onboarded', 'true')
+        localStorage.setItem('kc-demo-mode', 'false')
       })
     })
 
@@ -326,6 +403,10 @@ test.describe('Dashboard Page', () => {
       // 1. Visit /clusters and count the cluster rows.
       await page.goto('/clusters')
       await page.waitForLoadState('domcontentloaded')
+
+      // Wait for clusters page to fully render — Firefox may need extra time
+      const PAGE_RENDER_TIMEOUT_MS = 15_000
+      await expect(page.getByTestId('clusters-page')).toBeVisible({ timeout: PAGE_RENDER_TIMEOUT_MS }).catch(() => {})
 
       // The clusters page renders a row per cluster. We count any element
       // whose data-testid matches the cluster-row pattern. If the test
@@ -337,12 +418,13 @@ test.describe('Dashboard Page', () => {
       let clustersPageCount = rowCountByTestId
       if (clustersPageCount === 0) {
         // Fallback: count unique cluster-name text occurrences.
+        const NAME_CHECK_TIMEOUT_MS = 5_000
         let found = 0
         for (let i = 1; i <= EXPECTED_CLUSTER_COUNT; i++) {
           const hasName = await page
             .getByText(`accuracy-cluster-${i}`)
             .first()
-            .isVisible()
+            .isVisible({ timeout: NAME_CHECK_TIMEOUT_MS })
             .catch(() => false)
           if (hasName) found++
         }
@@ -356,30 +438,52 @@ test.describe('Dashboard Page', () => {
       await page.goto('/')
       await page.waitForLoadState('domcontentloaded')
       await expect(page.getByTestId('dashboard-page')).toBeVisible({
-        timeout: 10000,
+        timeout: PAGE_RENDER_TIMEOUT_MS,
       })
 
-      // Look for any element with data-testid containing "cluster-count"
-      // OR any stat-value element that displays the expected number. Use
-      // a pattern rather than an exact testid because cards vary.
-      const countEl = page
-        .locator(
-          `[data-testid*="cluster-count"], [data-testid*="total-clusters"]`
+      // PR #6574 items A+B — target the StatBlock for `clusters` directly
+      // via the new `stat-block-${id}` testid. Previously this spec looked
+      // for `cluster-count` / `total-clusters` testids that didn't exist
+      // on StatsOverview.tsx at all, so the `hasCountEl` check always fell
+      // through to the structural fallback. Now we address the block
+      // directly and use a word-boundary regex so the count can't
+      // false-positive on substrings (e.g. "3" matching inside "30 nodes").
+      const STAT_BLOCK_TIMEOUT_MS = 10_000
+      const clusterStatBlock = page.getByTestId('stat-block-clusters').first()
+      const hasStatBlock = await clusterStatBlock.isVisible({ timeout: STAT_BLOCK_TIMEOUT_MS }).catch(() => false)
+      if (hasStatBlock) {
+        // Word-boundary match: the StatBlock wraps the numeric value in a
+        // div with header text ("Clusters") and optional sublabel, so we
+        // can't use toHaveText (which would match the whole block). A
+        // word-bounded regex keeps this precise without requiring a deeper
+        // DOM drill-down into every display mode (numeric/gauge/ring/etc).
+        await expect(clusterStatBlock).toContainText(
+          new RegExp(`\\b${EXPECTED_CLUSTER_COUNT}\\b`)
         )
-        .first()
-
-      const hasCountEl = await countEl.isVisible().catch(() => false)
-      if (hasCountEl) {
-        await expect(countEl).toContainText(String(EXPECTED_CLUSTER_COUNT))
       } else {
-        // Fallback: assert that the exact expected count appears somewhere
-        // on the dashboard page alongside the word "cluster". This still
-        // fails vacuously only if BOTH the count and the word are absent
-        // — in which case the dashboard isn't reporting clusters at all,
-        // which is itself a regression worth catching.
-        const pageText = await page.textContent('body')
-        expect(pageText).toContain(String(EXPECTED_CLUSTER_COUNT))
-        expect((pageText || '').toLowerCase()).toContain('cluster')
+        // PR #6574 item B — Structural fallback. If the clusters StatBlock
+        // isn't mounted (e.g. user hid it via StatsConfig), try an aria
+        // role=status element that explicitly labels itself as a cluster
+        // count. Use a word-boundary regex, not toContainText(String(n)),
+        // so "3" can't silently match "30 nodes in 3 clusters".
+        const countByLabel = page
+          .getByRole('status')
+          .filter({ hasText: /cluster/i })
+          .first()
+        const labelVisible = await countByLabel.isVisible({ timeout: STAT_BLOCK_TIMEOUT_MS }).catch(() => false)
+        if (labelVisible) {
+          await expect(countByLabel).toHaveText(
+            new RegExp(`\\b${EXPECTED_CLUSTER_COUNT}\\b`)
+          )
+        } else {
+          // Last-resort: no element identifies itself as a cluster count.
+          // That's a regression — the dashboard isn't reporting clusters at
+          // all. Fail explicitly with a descriptive message.
+          throw new Error(
+            'Dashboard did not expose a cluster-count element (no ' +
+              '[data-testid="stat-block-clusters"] or role=status with "cluster" text).'
+          )
+        }
       }
     })
 

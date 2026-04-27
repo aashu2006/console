@@ -13,6 +13,9 @@ import { useCardLoadingState, useCardDemoState } from './CardDataContext'
 import { isDemoMode as checkIsDemoMode } from '../../lib/demoMode'
 import { DynamicCardErrorBoundary } from './DynamicCardErrorBoundary'
 import { LOCAL_AGENT_HTTP_URL, STORAGE_KEY_OPA_CACHE, STORAGE_KEY_OPA_CACHE_TIME } from '../../lib/constants'
+import { KUBECTL_DEFAULT_TIMEOUT_MS } from '../../lib/constants/network'
+const OPA_LIST_TIMEOUT_MS = 25_000
+const MIN_POLICY_PATH_PARTS = 4
 import { safeGetItem, safeGetJSON, safeSetItem, safeSetJSON } from '../../lib/utils/localStorage'
 import { PolicyDetailModal, ClusterOPAModal, CreatePolicyModal } from './opa'
 import type { Policy, GatekeeperStatus, OPAClusterItem } from './opa'
@@ -69,7 +72,7 @@ async function checkGatekeeperInstalled(clusterName: string): Promise<Gatekeeper
   try {
     const nsResult = await kubectlProxy.exec(
       ['get', 'namespace', 'gatekeeper-system', '--ignore-not-found', '-o', 'name'],
-      { context: clusterName, timeout: 25000, priority: true }
+      { context: clusterName, timeout: OPA_LIST_TIMEOUT_MS, priority: true }
     )
     const installed = !!(nsResult.output && nsResult.output.includes('gatekeeper-system'))
     return { cluster: clusterName, installed, loading: installed } // loading=true means details pending
@@ -88,7 +91,7 @@ async function checkGatekeeperDetails(clusterName: string): Promise<GatekeeperSt
       ['get', 'constraints', '-A',
        '-o', 'custom-columns=NAME:.metadata.name,KIND:.kind,ENFORCEMENT:.spec.enforcementAction,VIOLATIONS:.status.totalViolations',
        '--no-headers'],
-      { context: clusterName, timeout: 10000 }
+      { context: clusterName, timeout: KUBECTL_DEFAULT_TIMEOUT_MS }
     ).catch(() => ({ output: '', error: '' }))
 
     const policies: Policy[] = []
@@ -99,7 +102,7 @@ async function checkGatekeeperDetails(clusterName: string): Promise<GatekeeperSt
       const lines = constraintsResult.output.trim().split('\n').filter((l: string) => l.trim())
       for (const line of lines) {
         const parts = line.trim().split(/\s+/)
-        if (parts.length >= 4) {
+        if (parts.length >= MIN_POLICY_PATH_PARTS) {
           const name = parts[0]
           const kind = parts[1]
           const enforcement = (parts[2] || 'warn').toLowerCase() as Policy['mode']
@@ -132,7 +135,7 @@ async function checkGatekeeperDetails(clusterName: string): Promise<GatekeeperSt
         const violationsResult = await kubectlProxy.exec(
           ['get', policyWithViolations.kind.toLowerCase(), policyWithViolations.name,
            '-o', 'jsonpath={.status.violations[*]}'],
-          { context: clusterName, timeout: 10000 }
+          { context: clusterName, timeout: KUBECTL_DEFAULT_TIMEOUT_MS }
         )
 
         if (violationsResult.output) {
@@ -186,7 +189,7 @@ function createSortComparators(statuses: Record<string, GatekeeperStatus>) {
 function OPAPoliciesInternal({ config: _config }: OPAPoliciesProps) {
   const { t } = useTranslation(['cards', 'common'])
   const { isDemoMode } = useDemoMode()
-  const { deduplicatedClusters: clusters, isLoading } = useClusters()
+  const { deduplicatedClusters: clusters, isLoading, isFailed, consecutiveFailures } = useClusters()
   const { startMission } = useMissions()
   const { shouldUseDemoData } = useCardDemoState({ requires: 'agent' })
 
@@ -468,7 +471,9 @@ function OPAPoliciesInternal({ config: _config }: OPAPoliciesProps) {
     isLoading: shouldUseDemoData ? false : (isLoading || (isOPAChecking && !hasOPAData)),
     isRefreshing,
     hasAnyData: shouldUseDemoData ? true : (clusters.length > 0 && hasOPAData),
-    isDemoData: isDemoMode })
+    isDemoData: isDemoMode,
+    isFailed,
+    consecutiveFailures })
 
   // In demo mode, update statuses with real cluster names when they become available.
   // Initial demo statuses are already provided by useState initializer (via checkIsDemoMode).
@@ -561,13 +566,14 @@ function OPAPoliciesInternal({ config: _config }: OPAPoliciesProps) {
       cluster: clusterName,
       initialPrompt: `I want to install OPA Gatekeeper on the cluster "${clusterName}".
 
-Please help me:
-1. Check if Gatekeeper is already installed
-2. If not, install it using the official Helm chart or manifests
-3. Verify the installation is working
-4. Set up a basic policy (like requiring labels)
-
-Please proceed step by step.`,
+Please:
+1. Check if Gatekeeper is already installed. If not, install it.
+2. After installation, ask:
+   - "Gatekeeper is installed — should I set up a basic policy?"
+   - "Something went wrong — want to see details?"
+3. If I say set up a policy, create one and verify. Then ask:
+   - "Should I create another policy?"
+   - "All done"`,
       context: { clusterName } })
   }
 
@@ -595,23 +601,24 @@ Please proceed step by step.`,
       initialPrompt: basedOnPolicy
         ? `I want to create a new OPA Gatekeeper policy similar to "${basedOnPolicy}".
 
-Please help me:
-1. Explain what the ${basedOnPolicy} policy does
-2. Ask me what modifications I want to make
-3. Generate a ConstraintTemplate and Constraint for my requirements
-4. Help me apply it to the cluster
-5. Test that the policy is working
-
-Let's start by discussing what kind of policy I need.`
+Please:
+1. Explain what the ${basedOnPolicy} policy does and ask what modifications I want.
+2. Generate the ConstraintTemplate and Constraint, then ask:
+   - "Ready to apply this to the cluster?"
+   - "Want to adjust the rules first?"
+3. If I say apply, deploy and test. Then ask:
+   - "Should I create another policy?"
+   - "All done"`
         : `I want to create a new OPA Gatekeeper policy for my Kubernetes cluster.
 
-Please help me:
-1. Ask me what kind of policy I want to enforce (e.g., require labels, restrict images, enforce resource limits)
-2. Generate the appropriate ConstraintTemplate and Constraint
-3. Help me apply it to the cluster
-4. Test that the policy is working
-
-Let's start by discussing what kind of policy I need.`,
+Please:
+1. Ask me what kind of policy I want (e.g., require labels, restrict images, enforce resource limits).
+2. Generate the ConstraintTemplate and Constraint, then ask:
+   - "Ready to apply this to the cluster?"
+   - "Want to adjust the rules first?"
+3. If I say apply, deploy and test. Then ask:
+   - "Should I create another policy?"
+   - "All done"`,
       context: { basedOnPolicy } })
   }
 
@@ -632,7 +639,7 @@ Let's start by discussing what kind of policy I need.`,
   return (
     <div className="h-full flex flex-col min-h-card">
       {/* Controls */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           {installedCount > 0 && (
             <StatusBadge color="green" size="xs">
@@ -731,14 +738,14 @@ Let's start by discussing what kind of policy I need.`,
               <button
                 key={cluster.name}
                 onClick={() => status?.installed && !isOffline && handleShowViolations(cluster.name)}
-                disabled={isOffline || !status?.installed || isInitialLoading}
+                disabled={isOffline || isInitialLoading}
                 className={`w-full text-left p-2.5 rounded-lg bg-secondary/30 transition-colors ${
                   !isOffline && status?.installed && !isInitialLoading
                     ? 'hover:bg-secondary/50 cursor-pointer group'
                     : ''
                 } ${isOffline ? 'opacity-50' : ''}`}
               >
-                <div className="flex items-center justify-between mb-1">
+                <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                   <span className={`text-sm font-medium text-foreground ${!isOffline && status?.installed ? 'group-hover:text-purple-400' : ''}`}>
                     {cluster.name}
                   </span>
@@ -803,7 +810,7 @@ Let's start by discussing what kind of policy I need.`,
                     <span>{status.error}</span>
                   </div>
                 ) : (
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2">
                     <span className="text-xs text-muted-foreground">Not installed</span>
                     <span
                       onClick={(e) => {
@@ -852,7 +859,7 @@ Let's start by discussing what kind of policy I need.`,
                     setSelectedPolicy(policy)
                     openPolicyModal()
                   }}
-                  className="w-full flex items-center justify-between text-xs p-1.5 -mx-1.5 rounded hover:bg-secondary/50 transition-colors group"
+                  className="w-full flex flex-wrap items-center justify-between gap-y-2 text-xs p-1.5 -mx-1.5 rounded hover:bg-secondary/50 transition-colors group"
                 >
                   <span className="text-foreground truncate group-hover:text-purple-400">{policy.name}</span>
                   <div className="flex items-center gap-2">

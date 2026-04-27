@@ -327,7 +327,7 @@ export function ClusterResourceTree({ config: _config }: ClusterResourceTreeProp
   return (
     <div className="h-full flex flex-col min-h-0">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3 flex-shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3 shrink-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-muted-foreground">
             {t('resourceTree.clustersCount', { count: filteredClusters.length })}
@@ -364,7 +364,7 @@ export function ClusterResourceTree({ config: _config }: ClusterResourceTreeProp
       </div>
 
       {/* Search and Lens Filters */}
-      <div className="flex flex-col gap-2 mb-3 flex-shrink-0">
+      <div className="flex flex-col gap-2 mb-3 shrink-0">
         <CardSearchInput
           value={searchFilter}
           onChange={setSearchFilter}
@@ -458,8 +458,22 @@ export function ClusterResourceTree({ config: _config }: ClusterResourceTreeProp
                     </div>
                   )}
 
-                  {/* Nodes section - use cached data */}
-                  {(activeLens === 'all' || activeLens === 'nodes' || activeLens === 'issues') && clusterExpanded && hasData && clusterData.nodes.length > 0 && (
+                  {/* Empty-state hint when the Issues lens has no matching
+                      resources in this cluster. Without this, the tree
+                      collapses to a silent blank after switching from the
+                      All lens (see issue: Resource tree disappears when
+                      filtering by Issues after notification navigation). */}
+                  {clusterExpanded && hasData && activeLens === 'issues' && visibleNs.length === 0 && issueCounts.nodes === 0 && (
+                    <div className="flex items-center gap-2 px-2 py-1.5 ml-8 text-xs text-muted-foreground">
+                      {t('resourceTree.noIssuesFound')}
+                    </div>
+                  )}
+
+                  {/* Nodes section - use cached data. In the Issues lens
+                      we only render this section when there is at least
+                      one unhealthy node, otherwise switching to Issues
+                      would still surface a full Ready-node list. */}
+                  {(activeLens === 'all' || activeLens === 'nodes' || (activeLens === 'issues' && issueCounts.nodes > 0)) && clusterExpanded && hasData && clusterData.nodes.length > 0 && (
                     <TreeNode
                       id={`${clusterId}:nodes`}
                       label={t('resourceTree.nodes')}

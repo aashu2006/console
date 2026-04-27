@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   X, Plus, Code, Layers, Wand2, Eye, Save, Sparkles,
-  AlertTriangle, CheckCircle, Loader2, Trash2, LayoutTemplate } from 'lucide-react'
+  AlertTriangle, CheckCircle, Loader2 } from 'lucide-react'
 import { BaseModal, ConfirmDialog } from '../../lib/modals'
 import { cn } from '../../lib/cn'
 import { saveDynamicCard, deleteDynamicCard, getAllDynamicCards } from '../../lib/dynamic-cards'
@@ -12,14 +12,21 @@ import type {
   DynamicCardDefinition_T1,
   DynamicCardColumn } from '../../lib/dynamic-cards/types'
 import { registerDynamicCardType } from '../cards/cardRegistry'
-import { AiGenerationPanel } from './AiGenerationPanel'
 import { LivePreviewPanel } from './LivePreviewPanel'
 import { InlineAIAssist } from './InlineAIAssist'
-import { CARD_T1_SYSTEM_PROMPT, CARD_T2_SYSTEM_PROMPT, CARD_INLINE_ASSIST_PROMPT, CODE_INLINE_ASSIST_PROMPT } from '../../lib/ai/prompts'
-import { generateSampleData, detectFieldFormat } from '../../lib/ai/sampleData'
-import { useAIMode } from '../../hooks/useAIMode'
-import { StatusBadge } from '../ui/StatusBadge'
-import { wrapAbbreviations } from '../shared/TechnicalAcronym'
+import { CARD_INLINE_ASSIST_PROMPT, CODE_INLINE_ASSIST_PROMPT } from '../../lib/ai/prompts'
+import { generateSampleData } from '../../lib/ai/sampleData'
+import { T1_TEMPLATES, type T1Template } from './cardFactoryTemplates'
+import { T2_TEMPLATES, type T2Template } from './cardFactoryTemplatesT2'
+import { TemplateDropdown } from './cardFactoryPreviews'
+import { FieldSuggestChips } from './FieldSuggestChips'
+import { AiCardTab } from './cardFactoryAiTab'
+import { ManageCardsTab } from './cardFactoryManageTab'
+import {
+  validateT1AssistResult,
+  validateT2AssistResult,
+  type T1AssistResult,
+  type T2AssistResult } from './cardFactoryAssistTypes'
 
 interface CardFactoryModalProps {
   isOpen: boolean
@@ -32,7 +39,13 @@ interface CardFactoryModalProps {
 type Tab = 'declarative' | 'code' | 'ai' | 'manage'
 
 const SAVE_MESSAGE_TIMEOUT_MS = 3000 // Duration to display save/error messages before auto-clearing
-const COPY_FEEDBACK_TIMEOUT_MS = 2000 // Duration to show "copied" feedback before resetting
+
+// #9061 — Initial sample JSON shown in the Tier 1 "Data (JSON array)" field.
+// Exported as a constant so the field's first-focus auto-select can compare
+// against the EXACT default string and skip auto-select once the user has
+// edited the value (typed/pasted their own content).
+const T1_SAMPLE_DATA_JSON =
+  '[\n  { "name": "item-1", "status": "healthy" },\n  { "name": "item-2", "status": "error" }\n]'
 
 const EXAMPLE_TSX = `// Example: Simple counter card
 export default function MyCard({ config }) {
@@ -52,694 +65,6 @@ export default function MyCard({ config }) {
 }
 `
 
-// ============================================================================
-// Declarative Templates
-// ============================================================================
-
-interface T1Template {
-  name: string
-  title: string
-  description: string
-  layout: 'list' | 'stats' | 'stats-and-list'
-  width: number
-  columns: DynamicCardColumn[]
-  data: Record<string, unknown>[]
-}
-
-const T1_TEMPLATES: T1Template[] = [
-  {
-    name: 'Pod Status',
-    title: 'Pod Status',
-    description: 'Pod health across clusters',
-    layout: 'list',
-    width: 6,
-    columns: [
-      { field: 'name', label: 'Pod Name' },
-      { field: 'namespace', label: 'Namespace' },
-      { field: 'status', label: 'Status', format: 'badge', badgeColors: { Running: 'bg-green-500/20 text-green-400', Pending: 'bg-yellow-500/20 text-yellow-400', Failed: 'bg-red-500/20 text-red-400' } },
-      { field: 'restarts', label: 'Restarts', format: 'number' },
-    ],
-    data: [
-      { name: 'api-server-1', namespace: 'default', status: 'Running', restarts: 0 },
-      { name: 'worker-2', namespace: 'production', status: 'Running', restarts: 2 },
-      { name: 'cache-1', namespace: 'default', status: 'Pending', restarts: 0 },
-      { name: 'scheduler-3', namespace: 'kube-system', status: 'Running', restarts: 1 },
-      { name: 'ingress-5', namespace: 'ingress-nginx', status: 'Failed', restarts: 8 },
-    ] },
-  {
-    name: 'Deployment Health',
-    title: 'Deployment Health',
-    description: 'Deployment status and readiness',
-    layout: 'list',
-    width: 6,
-    columns: [
-      { field: 'name', label: 'Deployment' },
-      { field: 'replicas', label: 'Replicas', format: 'number' },
-      { field: 'available', label: 'Available', format: 'number' },
-      { field: 'status', label: 'Status', format: 'badge', badgeColors: { Healthy: 'bg-green-500/20 text-green-400', Degraded: 'bg-yellow-500/20 text-yellow-400', Critical: 'bg-red-500/20 text-red-400' } },
-    ],
-    data: [
-      { name: 'api-gateway', replicas: 3, available: 3, status: 'Healthy' },
-      { name: 'auth-service', replicas: 2, available: 2, status: 'Healthy' },
-      { name: 'worker-pool', replicas: 5, available: 3, status: 'Degraded' },
-      { name: 'cache-layer', replicas: 2, available: 0, status: 'Critical' },
-    ] },
-  {
-    name: 'Node Resources',
-    title: 'Node Resources',
-    description: 'Node CPU and memory utilization',
-    layout: 'list',
-    width: 8,
-    columns: [
-      { field: 'node', label: 'Node' },
-      { field: 'cpu', label: 'CPU' },
-      { field: 'memory', label: 'Memory' },
-      { field: 'status', label: 'Status', format: 'badge', badgeColors: { Ready: 'bg-green-500/20 text-green-400', NotReady: 'bg-red-500/20 text-red-400' } },
-    ],
-    data: [
-      { node: 'worker-1', cpu: '45%', memory: '3.2Gi / 8Gi', status: 'Ready' },
-      { node: 'worker-2', cpu: '72%', memory: '5.8Gi / 8Gi', status: 'Ready' },
-      { node: 'worker-3', cpu: '18%', memory: '1.1Gi / 4Gi', status: 'Ready' },
-      { node: 'control-1', cpu: '31%', memory: '2.4Gi / 16Gi', status: 'Ready' },
-    ] },
-  {
-    name: 'Service Status',
-    title: 'Service Status',
-    description: 'Kubernetes services and their endpoints',
-    layout: 'list',
-    width: 6,
-    columns: [
-      { field: 'name', label: 'Service' },
-      { field: 'type', label: 'Type', format: 'badge', badgeColors: { ClusterIP: 'bg-blue-500/20 text-blue-400', LoadBalancer: 'bg-purple-500/20 text-purple-400', NodePort: 'bg-cyan-500/20 text-cyan-400' } },
-      { field: 'port', label: 'Port', format: 'number' },
-      { field: 'namespace', label: 'Namespace' },
-    ],
-    data: [
-      { name: 'api-gateway', type: 'LoadBalancer', port: 443, namespace: 'default' },
-      { name: 'auth-service', type: 'ClusterIP', port: 8080, namespace: 'default' },
-      { name: 'monitoring', type: 'NodePort', port: 9090, namespace: 'monitoring' },
-    ] },
-  {
-    name: 'Namespace Summary',
-    title: 'Namespace Summary',
-    description: 'Resource counts per namespace',
-    layout: 'stats-and-list',
-    width: 8,
-    columns: [
-      { field: 'namespace', label: 'Namespace' },
-      { field: 'pods', label: 'Pods', format: 'number' },
-      { field: 'deployments', label: 'Deployments', format: 'number' },
-      { field: 'services', label: 'Services', format: 'number' },
-    ],
-    data: [
-      { namespace: 'default', pods: 12, deployments: 4, services: 3 },
-      { namespace: 'production', pods: 45, deployments: 12, services: 8 },
-      { namespace: 'monitoring', pods: 8, deployments: 3, services: 5 },
-      { namespace: 'kube-system', pods: 15, deployments: 6, services: 4 },
-    ] },
-]
-
-// ============================================================================
-// Code Templates
-// ============================================================================
-
-interface T2Template {
-  name: string
-  title: string
-  description: string
-  width: number
-  source: string
-}
-
-const T2_TEMPLATES: T2Template[] = [
-  {
-    name: 'Animated Gauge',
-    title: 'Cluster CPU Gauge',
-    description: 'Animated circular gauge showing utilization',
-    width: 4,
-    source: `export default function GaugeCard({ config }) {
-  const [value, setValue] = useState(67)
-  
-  // Gauge dimensions
-  const GAUGE_RADIUS = 45
-  const GAUGE_CENTER_X = 60
-  const GAUGE_CENTER_Y = 60
-  const circumference = 2 * Math.PI * GAUGE_RADIUS
-  const offset = circumference - (value / 100) * circumference
-  
-  // Utilization thresholds for color coding
-  const HIGH_THRESHOLD = 80  // Red: high utilization
-  const MED_THRESHOLD = 60   // Yellow: medium utilization
-  const color = value > HIGH_THRESHOLD ? 'text-red-400' : value > MED_THRESHOLD ? 'text-yellow-400' : 'text-green-400'
-
-  return (
-    <div className="h-full flex flex-col items-center justify-center gap-3">
-      <svg width="120" height="120" className="-rotate-90">
-        <circle cx={GAUGE_CENTER_X} cy={GAUGE_CENTER_Y} r={GAUGE_RADIUS} fill="none" strokeWidth="8"
-          className="stroke-secondary" />
-        <circle cx={GAUGE_CENTER_X} cy={GAUGE_CENTER_Y} r={GAUGE_RADIUS} fill="none" strokeWidth="8"
-          strokeLinecap="round"
-          className={\`\${color.replace('text-', 'stroke-')} transition-all duration-700\`}
-          style={{ strokeDasharray: circumference, strokeDashoffset: offset }} />
-      </svg>
-      <div className="absolute">
-        <p className={\`text-2xl font-bold \${color}\`}>{value}%</p>
-      </div>
-      <p className="text-xs text-muted-foreground">Average CPU Usage</p>
-    </div>
-  )
-}` },
-  {
-    name: 'Status Heatmap',
-    title: 'Cluster Status Heatmap',
-    description: 'Grid heatmap of cluster health',
-    width: 6,
-    source: `export default function HeatmapCard({ config }) {
-  const clusters = [
-    { name: 'us-east-1', health: 98 }, { name: 'eu-west-1', health: 85 },
-    { name: 'ap-south-1', health: 45 }, { name: 'us-west-2', health: 100 },
-    { name: 'eu-central-1', health: 72 }, { name: 'ap-east-1', health: 91 },
-  ]
-  
-  // Health thresholds for color coding
-  const HEALTHY_THRESHOLD = 90  // Green: healthy
-  const WARNING_THRESHOLD = 70  // Yellow: warning, Red: critical
-  const getColor = (h) => h >= HEALTHY_THRESHOLD ? 'bg-green-500/30' : h >= WARNING_THRESHOLD ? 'bg-yellow-500/30' : 'bg-red-500/30'
-  const getTextColor = (h) => h >= HEALTHY_THRESHOLD ? 'text-green-400' : h >= WARNING_THRESHOLD ? 'text-yellow-400' : 'text-red-400'
-
-  return (
-    <div className="h-full flex flex-col p-1">
-      <div className="flex items-center gap-2 mb-3">
-        <Globe className="w-4 h-4 text-purple-400" />
-        <span className="text-sm font-medium text-foreground">Cluster Health</span>
-      </div>
-      <div className="grid grid-cols-3 gap-2 flex-1">
-        {clusters.map(c => (
-          <div key={c.name} className={\`rounded-lg \${getColor(c.health)} p-3 flex flex-col items-center justify-center\`}>
-            <span className={\`text-xl font-bold \${getTextColor(c.health)}\`}>{c.health}%</span>
-            <span className="text-xs text-muted-foreground mt-1">{c.name}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}` },
-  {
-    name: 'Live Counter',
-    title: 'Live Resource Counter',
-    description: 'Animated counters for resource types',
-    width: 4,
-    source: `export default function CounterCard({ config }) {
-  const [counts] = useState({ pods: 142, deployments: 38, services: 24, nodes: 12 })
-  const items = [
-    { label: 'Pods', count: counts.pods, icon: Box, color: 'text-blue-400' },
-    { label: 'Deploys', count: counts.deployments, icon: Layers, color: 'text-purple-400' },
-    { label: 'Services', count: counts.services, icon: Globe, color: 'text-cyan-400' },
-    { label: 'Nodes', count: counts.nodes, icon: Server, color: 'text-green-400' },
-  ]
-
-  return (
-    <div className="h-full flex flex-col gap-2 p-1">
-      {items.map(item => (
-        <div key={item.label} className="flex items-center gap-3 rounded-lg bg-secondary/30 px-3 py-2">
-          <item.icon className={\`w-4 h-4 \${item.color} shrink-0\`} />
-          <span className="text-xs text-muted-foreground flex-1">{item.label}</span>
-          <span className={\`text-lg font-bold \${item.color}\`}>{item.count}</span>
-        </div>
-      ))}
-    </div>
-  )
-}` },
-  {
-    name: 'Donut Chart',
-    title: 'Resource Distribution',
-    description: 'Donut chart showing distribution',
-    width: 4,
-    source: `export default function DonutCard({ config }) {
-  const data = [
-    { label: 'Running', value: 72, color: 'var(--color-success)' },
-    { label: 'Pending', value: 15, color: 'var(--color-pending)' },
-    { label: 'Failed', value: 8, color: 'var(--color-error)' },
-    { label: 'Unknown', value: 5, color: 'var(--color-neutral)' },
-  ]
-  const total = data.reduce((s, d) => s + d.value, 0)
-  
-  // Donut chart dimensions
-  const DONUT_RADIUS = 40
-  const DONUT_CENTER_X = 60
-  const DONUT_CENTER_Y = 60
-  let cumulative = 0
-
-  return (
-    <div className="h-full flex flex-col items-center justify-center gap-2">
-      <svg width="120" height="120" viewBox="0 0 120 120">
-        {data.map((d, i) => {
-          const pct = d.value / total
-          const dashArray = 2 * Math.PI * DONUT_RADIUS
-          const dashOffset = dashArray * (1 - pct)
-          const rotation = cumulative * 360 - 90
-          cumulative += pct
-          return (
-            <circle key={i} cx={DONUT_CENTER_X} cy={DONUT_CENTER_Y} r={DONUT_RADIUS} fill="none" strokeWidth="16"
-              stroke={d.color} strokeDasharray={dashArray} strokeDashoffset={dashOffset}
-              transform={\`rotate(\${rotation} \${DONUT_CENTER_X} \${DONUT_CENTER_Y})\`} />
-          )
-        })}
-        <text x={DONUT_CENTER_X} y={DONUT_CENTER_Y} textAnchor="middle" dy="0.35em" className="fill-foreground text-lg font-bold">{total}</text>
-      </svg>
-      <div className="flex gap-3">
-        {data.map(d => (
-          <div key={d.label} className="flex items-center gap-1">
-            <div className="w-2 h-2 rounded-full" style={{ background: d.color }} />
-            <span className="text-xs text-muted-foreground">{d.label}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}` },
-  {
-    name: 'Activity Timeline',
-    title: 'Recent Events',
-    description: 'Timeline of recent cluster events',
-    width: 6,
-    source: `export default function TimelineCard({ config }) {
-  const events = [
-    { time: '2m ago', msg: 'Pod api-server-1 restarted', type: 'warning' },
-    { time: '5m ago', msg: 'Deployment worker-pool scaled to 5', type: 'info' },
-    { time: '12m ago', msg: 'Node worker-3 joined cluster', type: 'success' },
-    { time: '1h ago', msg: 'Certificate renewed for ingress', type: 'info' },
-    { time: '3h ago', msg: 'PVC storage-1 bound successfully', type: 'success' },
-  ]
-  const colors = { warning: 'bg-yellow-400', info: 'bg-blue-400', success: 'bg-green-400' }
-
-  return (
-    <div className="h-full flex flex-col p-1">
-      <div className="flex items-center gap-2 mb-3">
-        <Activity className="w-4 h-4 text-purple-400" />
-        <span className="text-sm font-medium text-foreground">Recent Events</span>
-      </div>
-      <div className="flex-1 overflow-y-auto space-y-0">
-        {events.map((e, i) => (
-          <div key={i} className="flex gap-3 py-1.5">
-            <div className="flex flex-col items-center">
-              <div className={\`w-2 h-2 rounded-full \${colors[e.type]} shrink-0 mt-1.5\`} />
-              {i < events.length - 1 && <div className="w-px flex-1 bg-border/50" />}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs text-foreground truncate">{e.msg}</p>
-              <p className="text-xs text-muted-foreground">{e.time}</p>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}` },
-  {
-    name: 'Auto-Refresh Timer',
-    title: 'Live Refresh Demo',
-    description: 'Demonstrates setInterval for periodic data refresh',
-    width: 4,
-    source: `export default function TimerCard({ config }) {
-  const [tick, setTick] = useState(0)
-  const [items, setItems] = useState([
-    { id: 1, name: 'api-gateway', latency: 42 },
-    { id: 2, name: 'auth-service', latency: 18 },
-    { id: 3, name: 'data-pipeline', latency: 95 },
-    { id: 4, name: 'cache-layer', latency: 7 },
-  ])
-
-  // Refresh interval in ms — setInterval is safe in the Card Factory sandbox.
-  // The sandbox clamps intervals to a 1-second minimum and auto-cleans on unmount.
-  const REFRESH_MS = 3000
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setTick(t => t + 1)
-      setItems(prev => prev.map(item => ({
-        ...item,
-        latency: Math.max(1, item.latency + Math.floor(Math.random() * 21) - 10) })))
-    }, REFRESH_MS)
-    return () => clearInterval(timer)
-  }, [])
-
-  const WARN_THRESHOLD = 50
-  const HIGH_THRESHOLD = 80
-
-  return (
-    <div className="h-full flex flex-col p-1">
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <Timer className="w-4 h-4 text-purple-400" />
-          <span className="text-sm font-medium text-foreground">Service Latency</span>
-        </div>
-        <span className="text-xs text-muted-foreground">tick #{tick}</span>
-      </div>
-      <div className="flex-1 space-y-2">
-        {items.map(item => {
-          const color = item.latency > HIGH_THRESHOLD ? 'text-red-400' : item.latency > WARN_THRESHOLD ? 'text-yellow-400' : 'text-green-400'
-          const barColor = item.latency > HIGH_THRESHOLD ? 'bg-red-400/30' : item.latency > WARN_THRESHOLD ? 'bg-yellow-400/30' : 'bg-green-400/30'
-          const BAR_MAX = 120
-          const barWidth = Math.min(100, (item.latency / BAR_MAX) * 100)
-          return (
-            <div key={item.id} className="flex items-center gap-3">
-              <span className="text-xs text-muted-foreground w-24 truncate">{item.name}</span>
-              <div className="flex-1 h-4 bg-secondary/30 rounded-full overflow-hidden">
-                <div className={\`h-full \${barColor} rounded-full transition-all duration-500\`} style={{ width: \`\${barWidth}%\` }} />
-              </div>
-              <span className={\`text-xs font-mono w-10 text-right \${color}\`}>{item.latency}ms</span>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}` },
-  {
-    name: 'Image from URL',
-    title: 'Image Viewer',
-    description: 'Display and auto-refresh an image from any URL or API endpoint',
-    width: 6,
-    source: `export default function ImageCard({ config }) {
-  const [url, setUrl] = useState(config?.url || '')
-  const [editUrl, setEditUrl] = useState('')
-  const [editing, setEditing] = useState(!config?.url)
-  const [error, setError] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [refreshKey, setRefreshKey] = useState(0)
-
-  // Auto-refresh interval (0 = disabled). Sandbox clamps to 1s minimum.
-  const REFRESH_INTERVAL_MS = config?.refreshMs || 0
-
-  useEffect(() => {
-    if (REFRESH_INTERVAL_MS > 0 && url) {
-      const timer = setInterval(() => setRefreshKey(k => k + 1), REFRESH_INTERVAL_MS)
-      return () => clearInterval(timer)
-    }
-  }, [REFRESH_INTERVAL_MS, url])
-
-  const handleSet = () => {
-    if (editUrl.trim()) {
-      setUrl(editUrl.trim())
-      setEditing(false)
-      setError(null)
-      setLoading(true)
-    }
-  }
-
-  if (editing || !url) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center gap-3 p-4">
-        <Image className="w-8 h-8 text-purple-400/70" />
-        <p className="text-xs text-muted-foreground text-center">Enter an image URL or API endpoint</p>
-        <div className="flex gap-2 w-full max-w-sm">
-          <input
-            type="text"
-            value={editUrl}
-            onChange={e => setEditUrl(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSet()}
-            placeholder="https://example.com/image.png"
-            className="flex-1 text-xs px-2 py-1.5 rounded bg-secondary text-foreground"
-          />
-          <button onClick={handleSet} className="text-xs px-3 py-1.5 rounded bg-purple-500/20 text-purple-400 hover:bg-purple-500/30">
-            Load
-          </button>
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="h-full flex flex-col p-2">
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <Image className="w-3.5 h-3.5 text-purple-400" />
-          <span className="text-xs text-muted-foreground truncate max-w-[200px]">{url}</span>
-        </div>
-        <div className="flex gap-1">
-          <button onClick={() => { setLoading(true); setRefreshKey(k => k + 1) }} className="min-h-11 min-w-11 flex items-center justify-center rounded hover:bg-secondary/50" title="Refresh">
-            <RefreshCw className={cn('w-3 h-3 text-muted-foreground', loading && 'animate-spin')} />
-          </button>
-          <button onClick={() => { setEditing(true); setEditUrl(url) }} className="min-h-11 min-w-11 flex items-center justify-center rounded hover:bg-secondary/50" title="Change URL">
-            <Settings className="w-3 h-3 text-muted-foreground" />
-          </button>
-        </div>
-      </div>
-      <div className="flex-1 flex items-center justify-center overflow-auto rounded bg-secondary/10">
-        {error ? (
-          <div className="flex flex-col items-center gap-2 p-4">
-            <AlertTriangle className="w-5 h-5 text-red-400" />
-            <p className="text-xs text-red-400">Failed to load image</p>
-            <button onClick={() => { setError(null); setLoading(true); setRefreshKey(k => k + 1) }}
-              className="min-h-11 min-w-11 flex items-center justify-center text-xs text-purple-400 hover:underline">{t('common.retry')}</button>
-          </div>
-        ) : (
-          <>
-            {loading && <Loader2 className="w-5 h-5 text-purple-400 animate-spin absolute" />}
-            <img
-              key={refreshKey}
-              src={url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now()}
-              alt="Card image"
-              className="max-w-full max-h-full object-contain"
-              onLoad={() => setLoading(false)}
-              onError={() => { setError(true); setLoading(false) }}
-            />
-          </>
-        )}
-      </div>
-    </div>
-  )
-}` },
-  {
-    name: 'Port Forward Tracker',
-    title: 'Port Forwards',
-    description: 'Track and manage kubectl port-forward sessions',
-    width: 6,
-    source: `export default function PortForwardCard({ config }) {
-  const STORAGE_KEY = 'kc-port-forwards'
-  const [forwards, setForwards] = useState(() => {
-    try {
-      const saved = window?.localStorage?.getItem?.(STORAGE_KEY)
-      return saved ? JSON.parse(saved) : []
-    } catch { return [] }
-  })
-  const [adding, setAdding] = useState(false)
-  const [form, setForm] = useState({ namespace: 'default', resource: '', localPort: '', remotePort: '', protocol: 'TCP' })
-  const [copied, setCopied] = useState(null)
-
-  // Persist forwards
-  useEffect(() => {
-    try { window?.localStorage?.setItem?.(STORAGE_KEY, JSON.stringify(forwards)) } catch {}
-  }, [forwards])
-
-  const addForward = () => {
-    if (!form.resource || !form.localPort || !form.remotePort) return
-    setForwards(prev => [...prev, {
-      id: Date.now(),
-      ...form,
-      active: true,
-      addedAt: new Date().toLocaleString() }])
-    setForm({ namespace: 'default', resource: '', localPort: '', remotePort: '', protocol: 'TCP' })
-    setAdding(false)
-  }
-
-  const toggleActive = (id) => {
-    setForwards(prev => prev.map(f => f.id === id ? { ...f, active: !f.active } : f))
-  }
-
-  const removeForward = (id) => {
-    setForwards(prev => prev.filter(f => f.id !== id))
-  }
-
-  const getCommand = (f) =>
-    \`kubectl port-forward -n \${f.namespace} \${f.resource} \${f.localPort}:\${f.remotePort}\`
-
-  const copyCommand = (f) => {
-    // #6229: catch the dropped Promise so a failed write (clipboard
-    // permission denied, blocked iframe, etc.) doesn't surface as an
-    // unhandled rejection in the generated card. The optional chain
-    // already guards undefined.
-    navigator?.clipboard?.writeText?.(getCommand(f))?.catch?.(() => {})
-    setCopied(f.id)
-    setTimeout(() => setCopied(null), ${COPY_FEEDBACK_TIMEOUT_MS})
-  }
-
-  return (
-    <div className="h-full flex flex-col p-1">
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <Cable className="w-4 h-4 text-purple-400" />
-          <span className="text-sm font-medium text-foreground">Port Forwards</span>
-          <span className="text-xs px-1.5 py-0.5 rounded-full bg-secondary text-muted-foreground">
-            {forwards.filter(f => f.active).length} active
-          </span>
-        </div>
-        <button onClick={() => setAdding(!adding)}
-          className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-purple-500/20 text-purple-400 hover:bg-purple-500/30">
-          {adding ? <X className="w-3 h-3" /> : <Plus className="w-3 h-3" />}
-          {adding ? 'Cancel' : 'Add'}
-        </button>
-      </div>
-
-      {adding && (
-        <div className="grid grid-cols-2 gap-2 mb-3 p-2 rounded bg-secondary/20 border border-border/50">
-          <input placeholder="Namespace" value={form.namespace}
-            onChange={e => setForm(p => ({...p, namespace: e.target.value}))}
-            className="text-xs px-2 py-1 rounded bg-secondary text-foreground" />
-          <input placeholder="pod/name or svc/name" value={form.resource}
-            onChange={e => setForm(p => ({...p, resource: e.target.value}))}
-            className="text-xs px-2 py-1 rounded bg-secondary text-foreground" />
-          <input placeholder="Local port" value={form.localPort} type="number"
-            onChange={e => setForm(p => ({...p, localPort: e.target.value}))}
-            className="text-xs px-2 py-1 rounded bg-secondary text-foreground" />
-          <input placeholder="Remote port" value={form.remotePort} type="number"
-            onChange={e => setForm(p => ({...p, remotePort: e.target.value}))}
-            className="text-xs px-2 py-1 rounded bg-secondary text-foreground" />
-          <button onClick={addForward}
-            className="col-span-2 text-xs py-1.5 rounded bg-purple-500/20 text-purple-400 hover:bg-purple-500/30">
-            Add Port Forward
-          </button>
-        </div>
-      )}
-
-      <div className="flex-1 overflow-y-auto space-y-1.5">
-        {forwards.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-2 text-muted-foreground">
-            <Cable className="w-6 h-6 opacity-30" />
-            <p className="text-xs">No port forwards configured</p>
-            <p className="text-xs">Click Add to track a kubectl port-forward session</p>
-          </div>
-        ) : forwards.map(f => (
-          <div key={f.id} className={\`flex items-center gap-2 px-2 py-1.5 rounded \${f.active ? 'bg-green-500/10 border border-green-500/20' : 'bg-secondary/20 border border-border/30'}\`}>
-            <button onClick={() => toggleActive(f.id)} title={f.active ? 'Mark inactive' : 'Mark active'}>
-              {f.active
-                ? <CircleDot className="w-3.5 h-3.5 text-green-400" />
-                : <Circle className="w-3.5 h-3.5 text-muted-foreground" />}
-            </button>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs font-medium text-foreground truncate">{f.resource}</span>
-                <span className="text-xs text-muted-foreground">({f.namespace})</span>
-              </div>
-              <span className="text-xs text-muted-foreground font-mono">
-                :{f.localPort} → :{f.remotePort}
-              </span>
-            </div>
-            <button onClick={() => copyCommand(f)} title="Copy kubectl command"
-              className="p-1 rounded hover:bg-secondary/50">
-              {copied === f.id
-                ? <Check className="w-3 h-3 text-green-400" />
-                : <Copy className="w-3 h-3 text-muted-foreground" />}
-            </button>
-            <button onClick={() => removeForward(f.id)} title="Remove"
-              className="p-1 rounded hover:bg-secondary/50">
-              <Trash2 className="w-3 h-3 text-muted-foreground hover:text-red-400" />
-            </button>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}` },
-]
-
-// ============================================================================
-// Field Auto-Suggest Chips
-// ============================================================================
-
-function FieldSuggestChips({
-  dataJson,
-  existingFields,
-  onAddColumn }: {
-  dataJson: string
-  existingFields: Set<string>
-  onAddColumn: (col: DynamicCardColumn) => void
-}) {
-  const { isFeatureEnabled } = useAIMode()
-  const enabled = isFeatureEnabled('naturalLanguage')
-
-  const suggestedFields = useMemo(() => {
-    if (!enabled) return []
-    try {
-      const parsed = JSON.parse(dataJson)
-      if (!Array.isArray(parsed) || parsed.length === 0) return []
-      const allKeys = new Set<string>()
-      for (const row of parsed.slice(0, 10)) {
-        if (typeof row === 'object' && row) {
-          Object.keys(row).forEach(k => allKeys.add(k))
-        }
-      }
-      return [...allKeys].filter(k => !existingFields.has(k))
-    } catch {
-      return []
-    }
-  }, [dataJson, existingFields, enabled])
-
-  if (!enabled || suggestedFields.length === 0) return null
-
-  return (
-    <div className="flex items-center gap-1.5 flex-wrap">
-      <span className="text-xs text-muted-foreground/50">Fields:</span>
-      {suggestedFields.map(field => {
-        const sampleValues = (() => {
-          try {
-            const parsed = JSON.parse(dataJson)
-            return parsed.slice(0, 5).map((row: Record<string, unknown>) => row[field])
-          } catch { return [] }
-        })()
-        const detected = detectFieldFormat(field, sampleValues)
-
-        return (
-          <button
-            key={field}
-            onClick={() => onAddColumn({
-              field,
-              label: field.charAt(0).toUpperCase() + field.slice(1).replace(/([A-Z])/g, ' $1'),
-              format: detected.format,
-              badgeColors: detected.badgeColors,
-            })}
-            className="text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-400/70 hover:bg-purple-500/20 hover:text-purple-400 transition-colors"
-          >
-            + {field}
-          </button>
-        )
-      })}
-    </div>
-  )
-}
-
-// ============================================================================
-// Inline AI Assist Result Types
-// ============================================================================
-
-interface T1AssistResult {
-  title?: string
-  description?: string
-  layout?: 'list' | 'stats' | 'stats-and-list'
-  width?: number
-  columns?: DynamicCardColumn[]
-  data?: Record<string, unknown>[]
-}
-
-interface T2AssistResult {
-  title?: string
-  description?: string
-  width?: number
-  sourceCode?: string
-}
-
-function validateT1AssistResult(data: unknown): { valid: true; result: T1AssistResult } | { valid: false; error: string } {
-  const obj = data as Record<string, unknown>
-  if (!obj.columns && !obj.data && !obj.title) return { valid: false, error: 'Response must include title, columns, or data' }
-  return { valid: true, result: obj as T1AssistResult }
-}
-
-function validateT2AssistResult(data: unknown): { valid: true; result: T2AssistResult } | { valid: false; error: string } {
-  const obj = data as Record<string, unknown>
-  if (!obj.sourceCode && !obj.title) return { valid: false, error: 'Response must include sourceCode or title' }
-  return { valid: true, result: obj as T2AssistResult }
-}
 
 // ============================================================================
 // Main Component
@@ -755,9 +80,15 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
   const [t1Layout, setT1Layout] = useState<'list' | 'stats' | 'stats-and-list'>('list')
   const [t1Columns, setT1Columns] = useState<DynamicCardColumn[]>([
     { field: 'name', label: 'Name' },
-    { field: 'status', label: 'Status', format: 'badge', badgeColors: { healthy: 'bg-green-500/20 text-green-400', error: 'bg-red-500/20 text-red-400' } },
+    // #9881 — Use design-system default shade (bg-*-500/10 + text-*-400) so generated cards match built-in cards.
+    { field: 'status', label: 'Status', format: 'badge', badgeColors: { healthy: 'bg-green-500/10 text-green-400', error: 'bg-red-500/10 text-red-400' } },
   ])
-  const [t1DataJson, setT1DataJson] = useState('[\n  { "name": "item-1", "status": "healthy" },\n  { "name": "item-2", "status": "error" }\n]')
+  const [t1DataJson, setT1DataJson] = useState(T1_SAMPLE_DATA_JSON)
+  // #9061 — Track whether the user has already focused the JSON textarea
+  // at least once. On the FIRST focus we auto-select the pre-filled sample
+  // so that typing replaces it cleanly instead of appending to the sample
+  // (which produced invalid concatenated JSON like `[sample][new]`).
+  const t1DataJsonFirstFocusRef = useRef(true)
   const [t1Width, setT1Width] = useState(6)
 
   // Code (Tier 2) state
@@ -1046,7 +377,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                       value={t1Title}
                       onChange={e => setT1Title(e.target.value)}
                       placeholder={t('dashboard.cardFactory.titlePlaceholder')}
-                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                     />
                   </div>
                   <div>
@@ -1054,7 +385,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                     <select
                       value={t1Width}
                       onChange={e => setT1Width(Number(e.target.value))}
-                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                     >
                       <option value={3}>{t('dashboard.cardFactory.widthSmall')}</option>
                       <option value={4}>{t('dashboard.cardFactory.widthMedium')}</option>
@@ -1072,7 +403,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                     value={t1Description}
                     onChange={e => setT1Description(e.target.value)}
                     placeholder={t('dashboard.cardFactory.descPlaceholder')}
-                    className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                    className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                   />
                 </div>
 
@@ -1116,19 +447,19 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                           value={col.field}
                           onChange={e => updateColumn(idx, 'field', e.target.value)}
                           placeholder={t('dashboard.cardFactory.fieldPlaceholder')}
-                          className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                          className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                         />
                         <input
                           type="text"
                           value={col.label}
                           onChange={e => updateColumn(idx, 'label', e.target.value)}
                           placeholder={t('dashboard.cardFactory.labelPlaceholder')}
-                          className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                          className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                         />
                         <select
                           value={col.format || 'text'}
                           onChange={e => updateColumn(idx, 'format', e.target.value)}
-                          className="w-20 text-xs px-2 py-1.5 rounded-lg bg-secondary text-foreground focus:outline-none"
+                          className="w-20 text-xs px-2 py-1.5 rounded-lg bg-secondary text-foreground focus:outline-hidden"
                         >
                           <option value="text">{t('cardFactory.formatText')}</option>
                           <option value="badge">{t('cardFactory.formatBadge')}</option>
@@ -1158,9 +489,27 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                   <label className="text-xs text-muted-foreground block mb-1">{t('dashboard.cardFactory.dataLabel')}</label>
                   <textarea
                     value={t1DataJson}
-                    onChange={e => setT1DataJson(e.target.value)}
+                    onChange={e => {
+                      // After the first user edit, stop treating the field as "pristine
+                      // sample" so a re-focus after editing never re-selects their work.
+                      t1DataJsonFirstFocusRef.current = false
+                      setT1DataJson(e.target.value)
+                    }}
+                    onFocus={e => {
+                      // #9061 — On first focus, if the field still contains the
+                      // pristine sample JSON, select it all so typing replaces
+                      // the sample instead of appending to it.
+                      if (
+                        t1DataJsonFirstFocusRef.current &&
+                        t1DataJson === T1_SAMPLE_DATA_JSON
+                      ) {
+                        t1DataJsonFirstFocusRef.current = false
+                        e.currentTarget.select()
+                      }
+                    }}
                     rows={6}
-                    className="w-full text-xs px-3 py-2 rounded-lg bg-secondary text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                    placeholder={T1_SAMPLE_DATA_JSON}
+                    className="w-full text-xs px-3 py-2 rounded-lg bg-secondary text-foreground font-mono focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                   />
                 </div>
 
@@ -1221,7 +570,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                       value={t2Title}
                       onChange={e => setT2Title(e.target.value)}
                       placeholder={t('dashboard.cardFactory.titlePlaceholder')}
-                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                     />
                   </div>
                   <div>
@@ -1229,7 +578,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                     <select
                       value={t2Width}
                       onChange={e => setT2Width(Number(e.target.value))}
-                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                      className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                     >
                       <option value={3}>{t('dashboard.cardFactory.widthSmall')}</option>
                       <option value={4}>{t('dashboard.cardFactory.widthMedium')}</option>
@@ -1247,7 +596,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                     value={t2Description}
                     onChange={e => setT2Description(e.target.value)}
                     placeholder={t('dashboard.cardFactory.codeDescPlaceholder')}
-                    className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
+                    className="w-full text-sm px-3 py-2 rounded-lg bg-secondary text-foreground focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50"
                   />
                 </div>
 
@@ -1267,7 +616,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
                     value={t2Source}
                     onChange={e => { setT2Source(e.target.value); setCompileStatus('idle') }}
                     rows={14}
-                    className="w-full text-xs px-3 py-2 rounded-lg bg-secondary text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-inset focus:ring-purple-500/50 leading-relaxed"
+                    className="w-full text-xs px-3 py-2 rounded-lg bg-secondary text-foreground font-mono focus:outline-hidden focus:ring-1 focus:ring-inset focus:ring-purple-500/50 leading-relaxed"
                     spellCheck={false}
                   />
 
@@ -1342,46 +691,10 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
 
           {/* Manage */}
           {tab === 'manage' && (
-            <div className="space-y-3">
-              {existingCards.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-8 text-center">
-                  <Wand2 className="w-8 h-8 text-muted-foreground/40 mb-2" />
-                  <p className="text-sm text-muted-foreground">{t('dashboard.cardFactory.noCustomCards')}</p>
-                  <p className="text-xs text-muted-foreground/70 mt-1">
-                    {t('dashboard.cardFactory.useDeclarativeOrCode')}
-                  </p>
-                </div>
-              ) : (
-                existingCards.map(card => (
-                  <div key={card.id} className="rounded-lg bg-card/50 border border-border p-3 flex items-start gap-3">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium text-foreground">{wrapAbbreviations(card.title)}</span>
-                        <span className={cn(
-                          'text-xs px-1.5 py-0.5 rounded',
-                          card.tier === 'tier1' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400',
-                        )}>
-                          {card.tier === 'tier1' ? t('dashboard.cardFactory.declarativeBadge') : t('dashboard.cardFactory.customCodeBadge')}
-                        </span>
-                      </div>
-                      {card.description && (
-                        <p className="text-xs text-muted-foreground mt-0.5">{wrapAbbreviations(card.description)}</p>
-                      )}
-                      <p className="text-xs text-muted-foreground/70 mt-1">
-                        ID: {card.id} · Created: {new Date(card.createdAt).toLocaleDateString()}
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => setDeleteConfirmId(card.id)}
-                      className="p-1.5 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors shrink-0"
-                      title={t('dashboard.cardFactory.deleteCard')}
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
+            <ManageCardsTab
+              existingCards={existingCards}
+              onDeleteRequest={setDeleteConfirmId}
+            />
           )}
         </div>
       </div>
@@ -1426,268 +739,5 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
       </BaseModal.Content>
       {confirmDialog}
     </BaseModal>
-  )
-}
-
-// ============================================================================
-// Template Dropdown (generic)
-// ============================================================================
-
-function TemplateDropdown<T extends { name: string }>({
-  templates,
-  onSelect,
-  label }: {
-  templates: T[]
-  onSelect: (tpl: T) => void
-  label: string
-}) {
-  const [open, setOpen] = useState(false)
-
-  return (
-    <div className="relative">
-      <button
-        onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg bg-secondary text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <LayoutTemplate className="w-3 h-3" />
-        {label}
-      </button>
-      {open && (
-        <div className="absolute z-dropdown top-full mt-1 left-0 bg-card border border-border rounded-lg shadow-lg p-1.5 min-w-[200px]">
-          {templates.map(tpl => (
-            <button
-              key={tpl.name}
-              onClick={() => { onSelect(tpl); setOpen(false) }}
-              className="w-full text-left px-3 py-1.5 rounded-lg text-xs text-foreground hover:bg-secondary transition-colors"
-            >
-              {tpl.name}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ============================================================================
-// AI Create Tab
-// ============================================================================
-
-interface AiCardT1Result {
-  title: string
-  description: string
-  layout: 'list' | 'stats' | 'stats-and-list'
-  defaultWidth: number
-  defaultLimit: number
-  columns: DynamicCardColumn[]
-  searchFields: string[]
-  staticData: Record<string, unknown>[]
-}
-
-interface AiCardT2Result {
-  title: string
-  description: string
-  defaultWidth: number
-  sourceCode: string
-}
-
-type AiMode = 'tier1' | 'tier2'
-
-function validateT1Result(data: unknown): { valid: true; result: AiCardT1Result } | { valid: false; error: string } {
-  const obj = data as Record<string, unknown>
-  if (!obj.title || typeof obj.title !== 'string') return { valid: false, error: 'Missing or invalid "title"' }
-  if (!obj.columns || !Array.isArray(obj.columns)) return { valid: false, error: 'Missing or invalid "columns" array' }
-  if (!['list', 'stats', 'stats-and-list'].includes(obj.layout as string)) {
-    (obj as Record<string, unknown>).layout = 'list' // default
-  }
-  return { valid: true, result: obj as unknown as AiCardT1Result }
-}
-
-function validateT2Result(data: unknown): { valid: true; result: AiCardT2Result } | { valid: false; error: string } {
-  const obj = data as Record<string, unknown>
-  if (!obj.title || typeof obj.title !== 'string') return { valid: false, error: 'Missing or invalid "title"' }
-  if (!obj.sourceCode || typeof obj.sourceCode !== 'string') return { valid: false, error: 'Missing or invalid "sourceCode"' }
-  return { valid: true, result: obj as unknown as AiCardT2Result }
-}
-
-function T1Preview({ result }: { result: AiCardT1Result }) {
-  return (
-    <div>
-      <div className="flex items-center gap-2 mb-3">
-        <Layers className="w-4 h-4 text-purple-400" />
-        <span className="text-sm font-medium text-foreground">{result.title}</span>
-        <StatusBadge color="blue" size="xs">
-          {result.layout}
-        </StatusBadge>
-      </div>
-      {result.description && (
-        <p className="text-xs text-muted-foreground mb-3">{wrapAbbreviations(result.description)}</p>
-      )}
-      {result.columns && result.columns.length > 0 && (
-        <div className="text-xs">
-          <div className="flex gap-2 border-b border-border pb-1 mb-1">
-            {result.columns.map(col => (
-              <span key={col.field} className="flex-1 text-muted-foreground font-medium truncate">
-                {wrapAbbreviations(col.label)}
-              </span>
-            ))}
-          </div>
-          {(result.staticData || []).slice(0, 3).map((row, i) => (
-            <div key={i} className="flex gap-2 py-0.5">
-              {result.columns.map(col => {
-                const val = String(row[col.field] ?? '')
-                if (col.format === 'badge' && col.badgeColors) {
-                  const badgeClass = col.badgeColors[val] || 'bg-gray-500/20 text-muted-foreground dark:bg-gray-900/30 dark:text-muted-foreground'
-                  return (
-                    <span key={col.field} className={cn('flex-1 truncate text-xs px-1 py-0.5 rounded', badgeClass)}>
-                      {val}
-                    </span>
-                  )
-                }
-                return (
-                  <span key={col.field} className="flex-1 text-foreground truncate">
-                    {val}
-                  </span>
-                )
-              })}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function T2Preview({ result }: { result: AiCardT2Result }) {
-  return (
-    <div>
-      <div className="flex items-center gap-2 mb-3">
-        <Code className="w-4 h-4 text-purple-400" />
-        <span className="text-sm font-medium text-foreground">{result.title}</span>
-        <StatusBadge color="purple" size="xs">
-          Custom Code
-        </StatusBadge>
-      </div>
-      {result.description && (
-        <p className="text-xs text-muted-foreground mb-2">{wrapAbbreviations(result.description)}</p>
-      )}
-      <pre className="text-xs px-3 py-2 rounded-lg bg-secondary text-foreground font-mono max-h-48 overflow-y-auto whitespace-pre-wrap">
-        {result.sourceCode}
-      </pre>
-    </div>
-  )
-}
-
-function AiCardTab({ onCardCreated }: { onCardCreated: (id: string) => void }) {
-  const [aiMode, setAiMode] = useState<AiMode>('tier1')
-
-  const handleSaveT1 = (result: AiCardT1Result) => {
-    const id = `dynamic_${Date.now()}`
-    const now = new Date().toISOString()
-
-    const cardDef: DynamicCardDefinition_T1 = {
-      dataSource: 'static',
-      staticData: result.staticData || [],
-      columns: result.columns,
-      layout: result.layout || 'list',
-      searchFields: result.searchFields || result.columns.map(c => c.field),
-      defaultLimit: result.defaultLimit || 5 }
-
-    const def: DynamicCardDefinition = {
-      id,
-      title: result.title,
-      tier: 'tier1',
-      description: result.description || undefined,
-      defaultWidth: result.defaultWidth || 6,
-      createdAt: now,
-      updatedAt: now,
-      cardDefinition: cardDef }
-
-    saveDynamicCard(def)
-    registerDynamicCardType(id, result.defaultWidth || 6)
-    onCardCreated(id)
-  }
-
-  const handleSaveT2 = async (result: AiCardT2Result) => {
-    const compileResult = await compileCardCode(result.sourceCode)
-    if (compileResult.error) {
-      throw new Error(`Compile error: ${compileResult.error}`)
-    }
-
-    const id = `dynamic_${Date.now()}`
-    const now = new Date().toISOString()
-
-    const def: DynamicCardDefinition = {
-      id,
-      title: result.title,
-      tier: 'tier2',
-      description: result.description || undefined,
-      defaultWidth: result.defaultWidth || 6,
-      createdAt: now,
-      updatedAt: now,
-      sourceCode: result.sourceCode,
-      compiledCode: compileResult.code! }
-
-    saveDynamicCard(def)
-    registerDynamicCardType(id, result.defaultWidth || 6)
-    onCardCreated(id)
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Mode toggle */}
-      <div>
-        <label className="text-xs text-muted-foreground block mb-1">Card Type</label>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setAiMode('tier1')}
-            className={cn(
-              'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors',
-              aiMode === 'tier1'
-                ? 'bg-blue-500/20 text-blue-400'
-                : 'bg-secondary text-muted-foreground hover:text-foreground',
-            )}
-          >
-            <Layers className="w-3 h-3" />
-            Declarative (table/list)
-          </button>
-          <button
-            onClick={() => setAiMode('tier2')}
-            className={cn(
-              'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors',
-              aiMode === 'tier2'
-                ? 'bg-purple-500/20 text-purple-400'
-                : 'bg-secondary text-muted-foreground hover:text-foreground',
-            )}
-          >
-            <Code className="w-3 h-3" />
-            Custom Code (React)
-          </button>
-        </div>
-      </div>
-
-      {/* AI Generation Panel */}
-      {aiMode === 'tier1' ? (
-        <AiGenerationPanel<AiCardT1Result>
-          systemPrompt={CARD_T1_SYSTEM_PROMPT}
-          placeholder="Describe the card you want, e.g., 'A card showing deployment status across clusters with name, namespace, replicas, and status columns'"
-          missionTitle="AI Card Generation (Declarative)"
-          validateResult={validateT1Result}
-          renderPreview={(result) => <T1Preview result={result} />}
-          onSave={handleSaveT1}
-          saveLabel="Create Declarative Card"
-        />
-      ) : (
-        <AiGenerationPanel<AiCardT2Result>
-          systemPrompt={CARD_T2_SYSTEM_PROMPT}
-          placeholder="Describe the card you want, e.g., 'A card with animated donut chart showing cluster health percentages with color-coded segments'"
-          missionTitle="AI Card Generation (Custom Code)"
-          validateResult={validateT2Result}
-          renderPreview={(result) => <T2Preview result={result} />}
-          onSave={handleSaveT2}
-          saveLabel="Create Custom Code Card"
-        />
-      )}
-    </div>
   )
 }

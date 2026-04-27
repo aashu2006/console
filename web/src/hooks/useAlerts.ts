@@ -1,5 +1,6 @@
 import { useState, useEffect, useContext } from 'react'
 import { AlertsContext } from '../contexts/AlertsContext'
+import { FETCH_DEFAULT_TIMEOUT_MS } from '../lib/constants'
 import type {
   Alert,
   AlertRule,
@@ -120,7 +121,7 @@ export function useAlerts() {
       acknowledgeAlerts: () => {},
       resolveAlert: () => {},
       deleteAlert: () => {},
-      runAIDiagnosis: (() => null) as (alertId: string) => string | null,
+      runAIDiagnosis: (() => null) as (alertId: string) => Promise<string | null> | string | null,
       evaluateConditions: () => {},
       isLoadingData: false,
       dataError: null as string | null }
@@ -205,7 +206,8 @@ export function useSlackNotification() {
         // Route through backend notification service (#5713, Copilot followup)
         const response = await fetch('/api/notifications/send', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+          signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
           body: JSON.stringify({
             alert: {
               id: alert.id,

@@ -20,7 +20,7 @@ function StatusBadge({ status }: { status: string }) {
           ? 'bg-yellow-500/15 text-yellow-400 border-yellow-500/20'
           : status === 'Failed'
             ? 'bg-red-500/15 text-red-400 border-red-500/20'
-            : 'bg-gray-500/15 text-muted-foreground border-gray-500/20'
+            : 'bg-gray-500/15 dark:bg-gray-400/15 text-muted-foreground border-gray-500/20 dark:border-gray-400/20'
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 text-2xs font-medium rounded border ${classes}`}>
       {status}
@@ -31,7 +31,7 @@ function StatusBadge({ status }: { status: string }) {
 function TypeBadge({ agentType }: { agentType: string }) {
   const classes = agentType === 'Declarative'
     ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
-    : 'bg-gray-500/10 text-gray-400 border-gray-500/20'
+    : 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20'
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 text-2xs font-medium rounded border ${classes}`}>
       {agentType}
@@ -65,6 +65,7 @@ function KagentAgentFleetInternal({ config }: KagentAgentFleetProps) {
   const {
     data: agents,
     isLoading,
+    isRefreshing,
     isDemoFallback,
     consecutiveFailures,
   } = useKagentCRDAgents({ cluster: config?.cluster })
@@ -72,6 +73,7 @@ function KagentAgentFleetInternal({ config }: KagentAgentFleetProps) {
   const hasAnyData = agents.length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
     isLoading: isLoading && !hasAnyData,
+    isRefreshing,
     hasAnyData,
     isFailed: consecutiveFailures >= 3,
     consecutiveFailures,
@@ -179,7 +181,9 @@ function KagentAgentFleetInternal({ config }: KagentAgentFleetProps) {
             <TypeBadge agentType={agent.agentType} />
             <RuntimeBadge runtime={agent.runtime} />
             <div className="text-xs text-muted-foreground">
-              {agent.readyReplicas}/{agent.replicas}
+              {agent.replicas != null && agent.readyReplicas != null
+                ? `${agent.readyReplicas}/${agent.replicas}`
+                : 'N/A'}
             </div>
             <StatusBadge status={agent.status} />
             <ChevronRight className="w-3 h-3 text-muted-foreground/20 group-hover:text-muted-foreground" />

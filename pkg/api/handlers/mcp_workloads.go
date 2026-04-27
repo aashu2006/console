@@ -94,7 +94,7 @@ func (h *MCPHandlers) GetPods(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"pods": pods, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // FindPodIssues returns pods with issues
@@ -136,6 +136,7 @@ func (h *MCPHandlers) FindPodIssues(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allIssues := make([]k8s.PodIssue, 0)
 			clusterTimeout := mcpExtendedTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -148,7 +149,9 @@ func (h *MCPHandlers) FindPodIssues(c *fiber.Ctx) error {
 					defer cancel()
 
 					issues, err := h.k8sClient.FindPodIssues(ctx, clusterName, namespace)
-					if err == nil && len(issues) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(issues) > 0 {
 						mu.Lock()
 						allIssues = append(allIssues, issues...)
 						mu.Unlock()
@@ -157,7 +160,7 @@ func (h *MCPHandlers) FindPodIssues(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"issues": allIssues, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"issues": allIssues, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -173,7 +176,7 @@ func (h *MCPHandlers) FindPodIssues(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"issues": issues, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // FindDeploymentIssues returns deployments with issues
@@ -203,6 +206,7 @@ func (h *MCPHandlers) FindDeploymentIssues(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allIssues := make([]k8s.DeploymentIssue, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -215,7 +219,9 @@ func (h *MCPHandlers) FindDeploymentIssues(c *fiber.Ctx) error {
 					defer cancel()
 
 					issues, err := h.k8sClient.FindDeploymentIssues(ctx, clusterName, namespace)
-					if err == nil && len(issues) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(issues) > 0 {
 						mu.Lock()
 						allIssues = append(allIssues, issues...)
 						mu.Unlock()
@@ -224,7 +230,7 @@ func (h *MCPHandlers) FindDeploymentIssues(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"issues": allIssues, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"issues": allIssues, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -239,7 +245,7 @@ func (h *MCPHandlers) FindDeploymentIssues(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"issues": issues, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetDeployments returns deployments with rollout status
@@ -304,7 +310,7 @@ func (h *MCPHandlers) GetDeployments(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"deployments": deployments, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetServices returns services from clusters
@@ -356,6 +362,7 @@ func (h *MCPHandlers) GetServices(c *fiber.Ctx) error {
 
 					services, err := h.k8sClient.GetServices(ctx, clusterName, namespace)
 					if err != nil {
+						slog.Warn("[GetServices] failed to fetch services for cluster", "cluster", clusterName, "error", err)
 						return
 					}
 					mu.Lock()
@@ -405,7 +412,7 @@ func (h *MCPHandlers) GetServices(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"services": services, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetJobs returns jobs from clusters
@@ -470,7 +477,7 @@ func (h *MCPHandlers) GetJobs(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"jobs": jobs, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetHPAs returns HPAs from clusters
@@ -535,7 +542,7 @@ func (h *MCPHandlers) GetHPAs(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"hpas": hpas, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetReplicaSets returns ReplicaSets from clusters
@@ -600,7 +607,7 @@ func (h *MCPHandlers) GetReplicaSets(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"replicasets": items, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetStatefulSets returns StatefulSets from clusters
@@ -665,7 +672,7 @@ func (h *MCPHandlers) GetStatefulSets(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"statefulsets": items, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetDaemonSets returns DaemonSets from clusters
@@ -730,7 +737,7 @@ func (h *MCPHandlers) GetDaemonSets(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"daemonsets": items, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetCronJobs returns CronJobs from clusters
@@ -795,7 +802,7 @@ func (h *MCPHandlers) GetCronJobs(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"cronjobs": items, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetWorkloads returns an aggregate view of workloads (Deployments, StatefulSets,
@@ -807,7 +814,7 @@ func (h *MCPHandlers) GetWorkloads(c *fiber.Ctx) error {
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Query("cluster")

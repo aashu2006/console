@@ -13,10 +13,24 @@ const ALLOWED_ORIGINS = [
   "https://console-deploy-preview.kubestellar.io",
 ];
 
+/**
+ * Returns a CORS origin header value for the given request origin.
+ * Uses exact match or parsed-hostname suffix check — not substring matching —
+ * to prevent bypass via crafted origins like "evil.com?origin=kubestellar.io"
+ * (CodeQL js/incomplete-url-substring-sanitization, #9119).
+ */
 function corsOrigin(origin: string | null): string {
   if (!origin) return ALLOWED_ORIGINS[0];
-  if (ALLOWED_ORIGINS.some((o) => origin.startsWith(o) || origin.endsWith(".kubestellar.io"))) {
-    return origin;
+  // Exact match against allowlist
+  if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  // Allow any subdomain of kubestellar.io via parsed hostname check
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    if (host === "kubestellar.io" || host.endsWith(".kubestellar.io")) {
+      return origin;
+    }
+  } catch {
+    // Malformed origin — fall through to default
   }
   return ALLOWED_ORIGINS[0];
 }
@@ -72,31 +86,70 @@ export default async (req: Request) => {
   }
 
   try {
+    // Primary: Invidious API (reliable, no auth required)
+    const invidiousInstances = [
+      "https://inv.nadeko.net",
+      "https://invidious.fdn.fr",
+      "https://vid.puffyan.us",
+    ];
+
+    for (const instance of invidiousInstances) {
+      try {
+        const invResp = await fetch(
+          `${instance}/api/v1/playlists/${PLAYLIST_ID}`,
+          { signal: AbortSignal.timeout(8000) }
+        );
+        if (invResp.ok) {
+          const data = (await invResp.json()) as { videos?: Array<{ videoId: string; title: string }> };
+          if (data.videos && data.videos.length > 0) {
+            const videos: PlaylistVideo[] = data.videos.map((v) => ({
+              id: v.videoId,
+              title: v.title,
+            }));
+            return new Response(
+              JSON.stringify({
+                videos,
+                playlistId: PLAYLIST_ID,
+                playlistUrl: `https://www.youtube.com/playlist?list=${PLAYLIST_ID}`,
+              }),
+              { status: 200, headers }
+            );
+          }
+        }
+      } catch {
+        // try next instance
+      }
+    }
+
+    // Fallback: RSS feed
     const resp = await fetch(FEED_URL, {
       headers: { "User-Agent": "KubeStellar-Console/1.0" },
     });
 
-    if (!resp.ok) {
-      return new Response(
-        JSON.stringify({ error: "YouTube returned " + resp.status }),
-        { status: 502, headers }
-      );
+    if (resp.ok) {
+      const xml = await resp.text();
+      const videos = parseAtomFeed(xml);
+      if (videos.length > 0) {
+        return new Response(
+          JSON.stringify({
+            videos,
+            playlistId: PLAYLIST_ID,
+            playlistUrl: `https://www.youtube.com/playlist?list=${PLAYLIST_ID}`,
+          }),
+          { status: 200, headers }
+        );
+      }
     }
 
-    const xml = await resp.text();
-    const videos = parseAtomFeed(xml);
-
+    // All sources failed
     return new Response(
-      JSON.stringify({
-        videos,
-        playlistId: PLAYLIST_ID,
-        playlistUrl: `https://www.youtube.com/playlist?list=${PLAYLIST_ID}`,
-      }),
-      { status: 200, headers }
+      JSON.stringify({ error: "All video sources unavailable", videos: [] }),
+      { status: 502, headers }
     );
   } catch (err) {
+    console.error("Failed to fetch YouTube playlist:", err);
     return new Response(
-      JSON.stringify({ error: "Failed to fetch playlist", detail: String(err) }),
+      JSON.stringify({ error: "Internal server error" }),
       { status: 502, headers }
     );
   }

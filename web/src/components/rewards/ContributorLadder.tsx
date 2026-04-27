@@ -2,10 +2,10 @@
  * ContributorLadder — shows current level, progress to next, and the full ladder
  */
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Telescope, Compass, Map, Rocket, Shield, Star, Crown, Sparkles,
-  Coins, ChevronDown, ChevronUp,
+  Coins, ChevronDown, ChevronUp, Copy, Check,
 } from 'lucide-react'
 import { Linkedin } from '@/lib/icons'
 import { useRewards } from '../../hooks/useRewards'
@@ -65,7 +65,7 @@ export function ContributorBanner() {
             {totalCoins > 0 && (
               <button
                 onClick={handleLinkedInShare}
-                className="p-1 rounded hover:bg-secondary/50 text-muted-foreground hover:text-[#0A66C2] transition-colors"
+                className="p-1 rounded hover:bg-secondary/50 text-muted-foreground hover:text-linkedin transition-colors"
                 title={`Share your ${current.name} status on LinkedIn`}
               >
                 <Linkedin className="w-3.5 h-3.5" />
@@ -121,6 +121,7 @@ export function ContributorBanner() {
       {/* Expandable ladder */}
       {showLadder && (
         <div className="px-3 pb-3 pt-1">
+          <BadgeSnippet />
           <div className="space-y-1">
             {CONTRIBUTOR_LEVELS.map((level) => {
               const isCurrentLevel = level.rank === current.rank
@@ -136,7 +137,7 @@ export function ContributorBanner() {
                         : 'opacity-40'
                   }`}
                 >
-                  <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 ${
+                  <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${
                     isUnlocked ? level.bgClass : 'bg-secondary'
                   }`}>
                     <LevelIcon
@@ -165,6 +166,62 @@ export function ContributorBanner() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/** How long the "copied" check icon stays visible after click (ms) */
+const COPY_CONFIRM_MS = 1500
+/** Public badge endpoint documented in RFC #8862 */
+const BADGE_URL_BASE = 'https://console.kubestellar.io/api/rewards/badge/'
+/** Placeholder login the user replaces with their own GitHub handle */
+const BADGE_LOGIN_PLACEHOLDER = 'YOUR-LOGIN'
+
+/**
+ * BadgeSnippet — compact copy-paste helper for the public contributor badge
+ * endpoint (RFC #8862 Phase 3). Subtle; lives inside the expandable ladder
+ * so it doesn't clutter the main banner.
+ */
+function BadgeSnippet() {
+  const [copied, setCopied] = useState(false)
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const snippet = `![Contributor Badge](${BADGE_URL_BASE}${BADGE_LOGIN_PLACEHOLDER})`
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    }
+  }, [])
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(snippet)
+      setCopied(true)
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+      copyTimerRef.current = setTimeout(() => setCopied(false), COPY_CONFIRM_MS)
+    } catch {
+      // Clipboard API can fail in insecure contexts; fail silently.
+    }
+  }
+
+  return (
+    <div className="mb-2 p-2 rounded-lg border border-border/40 bg-secondary/20">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <span className="text-2xs font-semibold text-muted-foreground uppercase tracking-wider">
+          Get your badge
+        </span>
+        <button
+          onClick={handleCopy}
+          className="flex items-center gap-1 text-2xs text-muted-foreground hover:text-foreground transition-colors"
+          title="Copy markdown snippet"
+        >
+          {copied ? <Check className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3" />}
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <code className="block text-[10px] font-mono text-muted-foreground break-all leading-relaxed">
+        {snippet}
+      </code>
     </div>
   )
 }

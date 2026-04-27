@@ -13,6 +13,7 @@ import { StatusBadge } from '../ui/StatusBadge'
 import { useCardLoadingState } from './CardDataContext'
 import type { PodInfo } from '../../hooks/useMCP'
 import { useTranslation } from 'react-i18next'
+import { hasGPUResourceRequest, normalizeClusterName } from '../../lib/gpu'
 
 interface GPUWorkloadsProps {
   config?: Record<string, unknown>
@@ -41,21 +42,6 @@ const GPU_SORT_COMPARATORS: Record<SortByOption, (a: PodInfo, b: PodInfo) => num
   name: commonComparators.string<PodInfo>('name'),
   namespace: commonComparators.string<PodInfo>('namespace'),
   cluster: commonComparators.string<PodInfo>('cluster') }
-
-// Check if any container in the pod requests GPUs
-function hasGPUResourceRequest(containers?: { gpuRequested?: number }[]): boolean {
-  if (!containers) return false
-  return containers.some(c => (c.gpuRequested ?? 0) > 0)
-}
-
-// Normalize cluster name for matching (handle kubeconfig/xxx format)
-function normalizeClusterName(cluster: string): string {
-  if (!cluster) return ''
-  // If it's a path like "kubeconfig/cluster-name", extract just the cluster name
-  const parts = cluster.split('/')
-  return parts[parts.length - 1] || cluster
-}
-
 
 export function GPUWorkloads({ config: _config }: GPUWorkloadsProps) {
   const { t } = useTranslation(['cards', 'common'])
@@ -189,11 +175,11 @@ export function GPUWorkloads({ config: _config }: GPUWorkloadsProps) {
   if (isLoading && gpuWorkloadSource.length === 0) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <Skeleton variant="text" width={100} height={16} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
-        <div className="grid grid-cols-4 gap-2 mb-3">
+        <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-3">
           {[1, 2, 3, 4].map(i => (
             <Skeleton key={i} variant="rounded" height={50} />
           ))}
@@ -225,14 +211,14 @@ export function GPUWorkloads({ config: _config }: GPUWorkloadsProps) {
 
   return (
     <div className="h-full flex flex-col content-loaded">
-      {/* Controls */}
-      <div className="flex items-center justify-between mb-3">
+      {/* Controls — @container responsive */}
+      <div className="flex flex-wrap @lg:flex-nowrap items-center justify-between gap-y-2 mb-3">
         {summary.failed > 0 ? (
           <StatusBadge color="red">
             {t('gpuWorkloads.failedCount', { count: summary.failed })}
           </StatusBadge>
         ) : <div />}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 @xs:flex-wrap">
           {/* Cluster count indicator */}
           {filters.localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -272,8 +258,8 @@ export function GPUWorkloads({ config: _config }: GPUWorkloadsProps) {
         placeholder={t('gpuWorkloads.searchPlaceholder')}
       />
 
-      {/* Summary stats */}
-      <div className="grid grid-cols-4 gap-2 mb-3">
+      {/* Summary stats — @container responsive grid */}
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-3">
         <div className="p-2 rounded-lg bg-secondary/30 text-center" title={t('gpuWorkloads.totalGPUWorkloads', { count: summary.total })}>
           <p className="text-lg font-bold text-foreground">{summary.total}</p>
           <p className="text-xs text-muted-foreground">{t('common:common.total')}</p>
@@ -319,7 +305,7 @@ export function GPUWorkloads({ config: _config }: GPUWorkloadsProps) {
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Box className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+                      <Box className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                       <span className="text-sm font-medium text-foreground truncate">{pod.name}</span>
                     </div>
                     <div className="flex items-center gap-2 mt-1 text-xs text-muted-foreground">
@@ -338,7 +324,7 @@ export function GPUWorkloads({ config: _config }: GPUWorkloadsProps) {
                       issues={[{ name: t('gpuWorkloads.podStatusName', { status: pod.status }), message: t('gpuWorkloads.podStatusMessage', { status: pod.status }) }]}
                     />
                   )}
-                  <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0" />
+                  <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
                 </div>
               </div>
             )

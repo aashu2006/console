@@ -2,7 +2,10 @@ package k8s
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -21,8 +24,8 @@ import (
 	"github.com/kubestellar/console/pkg/models"
 )
 
-// maxConcurrentClusterRBACQueries bounds how many clusters GetAllPermissionsSummaries
-// fans out to at once. A plain unbounded errgroup would let 50+ clusters each
+// maxConcurrentClusterRBACQueries bounds how many clusters GetAllClusterPermissions
+// and GetAllPermissionsSummaries fan out to at once. A plain unbounded errgroup would let 50+ clusters each
 // hammer the kube-apiserver with five SelfSubjectAccessReview calls
 // concurrently, which can saturate a control plane. 5 is a deliberate
 // compromise — high enough that a typical 5-10 cluster setup sees near-zero
@@ -37,6 +40,12 @@ const maxConcurrentClusterRBACQueries = 5
 // long enough that a healthy cluster with 5 SelfSubjectAccessReview calls
 // finishes comfortably within budget.
 const perClusterRBACTimeout = 15 * time.Second
+
+// RBACDefaultTimeout is the per-cluster timeout for standard RBAC queries.
+// Used by both pkg/api/handlers/rbac.go and pkg/agent/server_rbac.go for
+// single-cluster permission checks and RBAC data fetches. Centralized here
+// to prevent drift between API and agent timeout values.
+const RBACDefaultTimeout = 15 * time.Second
 
 // ListServiceAccounts returns all service accounts in a cluster
 func (m *MultiClusterClient) ListServiceAccounts(ctx context.Context, contextName, namespace string) ([]models.K8sServiceAccount, error) {
@@ -63,13 +72,21 @@ func (m *MultiClusterClient) ListServiceAccounts(ctx context.Context, contextNam
 		key := sa.Namespace + "/" + sa.Name
 		roles := saRolesMap[key]
 
+		// Leave CreatedAt nil when CreationTimestamp is zero so the JSON
+		// `omitempty` tag drops the field instead of emitting
+		// "0001-01-01T00:00:00Z" (fake clientset, partial metadata). See #6764.
+		var saCreatedAtPtr *time.Time
+		if !sa.CreationTimestamp.Time.IsZero() {
+			saCreatedAt := sa.CreationTimestamp.Time
+			saCreatedAtPtr = &saCreatedAt
+		}
 		result = append(result, models.K8sServiceAccount{
 			Name:      sa.Name,
 			Namespace: sa.Namespace,
 			Cluster:   contextName,
 			Secrets:   secrets,
 			Roles:     roles,
-			CreatedAt: sa.CreationTimestamp.Format(time.RFC3339),
+			CreatedAt: saCreatedAtPtr,
 		})
 	}
 
@@ -325,6 +342,78 @@ func (m *MultiClusterClient) CheckPermission(ctx context.Context, contextName, v
 	return result.Status.Allowed, nil
 }
 
+// podExecResource, podExecSubresource, and podExecVerb describe the
+// Kubernetes RBAC tuple required to open a shell inside a pod. Centralised so
+// the authorization check for the /ws/exec handler (#8120) and any future
+// caller stay in lockstep with the kubelet's own RBAC enforcement for
+// `pods/exec`. Do not inline these as string literals — see CLAUDE.md "No
+// Magic Numbers/Strings" rule.
+const (
+	podExecResource    = "pods"
+	podExecSubresource = "exec"
+	podExecVerb        = "create"
+)
+
+// CheckPodExecPermissionForUser runs a SubjectAccessReview against the target
+// cluster's apiserver asking whether the end user (identified by `username`
+// plus optional group memberships) is allowed to `create` on
+// `pods/exec` for a specific pod in a namespace.
+//
+// Why SAR (not SelfSAR):
+// The backend's clientset authenticates to the target cluster as the pod
+// ServiceAccount (or whatever identity the loaded kubeconfig carries), not as
+// the logged-in console user. A SelfSubjectAccessReview therefore reflects
+// the pod SA's permissions, which is exactly the privilege-escalation path
+// described in issue #8120. SubjectAccessReview lets us ask the apiserver
+// about a *different* user — the end user whose JWT we just validated — so
+// the authorization decision is made by Kubernetes RBAC against the user's
+// own subject, not against the backend SA.
+//
+// Fail-closed semantics: the caller MUST treat (false, nil) AND any non-nil
+// error as a denial. A SAR request that errors out (apiserver unreachable,
+// permission to create SARs denied, etc.) is returned verbatim so the caller
+// can log it; the caller must not open the exec stream in either case.
+func (m *MultiClusterClient) CheckPodExecPermissionForUser(
+	ctx context.Context,
+	contextName, username string,
+	groups []string,
+	namespace, podName string,
+) (bool, string, error) {
+	if username == "" {
+		// Fail-closed: a missing user identity must never authorize an exec.
+		return false, "missing user identity", nil
+	}
+	if namespace == "" || podName == "" {
+		return false, "missing namespace or pod name", nil
+	}
+
+	client, err := m.GetClient(contextName)
+	if err != nil {
+		return false, "", err
+	}
+
+	review := &authv1.SubjectAccessReview{
+		Spec: authv1.SubjectAccessReviewSpec{
+			User:   username,
+			Groups: groups,
+			ResourceAttributes: &authv1.ResourceAttributes{
+				Verb:        podExecVerb,
+				Resource:    podExecResource,
+				Subresource: podExecSubresource,
+				Namespace:   namespace,
+				Name:        podName,
+			},
+		},
+	}
+
+	result, err := client.AuthorizationV1().SubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
+	if err != nil {
+		return false, "", fmt.Errorf("failed to perform pods/exec SubjectAccessReview: %w", err)
+	}
+
+	return result.Status.Allowed, result.Status.Reason, nil
+}
+
 // GetClusterPermissions returns the current user's permissions on a cluster
 func (m *MultiClusterClient) GetClusterPermissions(ctx context.Context, contextName string) (*models.ClusterPermissions, error) {
 	perms := &models.ClusterPermissions{
@@ -369,11 +458,19 @@ func (m *MultiClusterClient) CreateServiceAccount(ctx context.Context, contextNa
 		return nil, err
 	}
 
+	// Leave CreatedAt nil when CreationTimestamp is zero so the JSON
+	// `omitempty` tag drops the field instead of emitting
+	// "0001-01-01T00:00:00Z" (fake clientset, partial metadata). See #6764.
+	var createdAtPtr *time.Time
+	if !created.CreationTimestamp.Time.IsZero() {
+		createdAt := created.CreationTimestamp.Time
+		createdAtPtr = &createdAt
+	}
 	return &models.K8sServiceAccount{
 		Name:      created.Name,
 		Namespace: created.Namespace,
 		Cluster:   contextName,
-		CreatedAt: created.CreationTimestamp.Format(time.RFC3339),
+		CreatedAt: createdAtPtr,
 	}, nil
 }
 
@@ -457,18 +554,29 @@ func (m *MultiClusterClient) GetAllClusterPermissions(ctx context.Context) ([]mo
 		return nil, err
 	}
 
-	var result []models.ClusterPermissions
-	for _, cluster := range clusters {
-		perms, err := m.GetClusterPermissions(ctx, cluster.Name)
-		if err != nil {
-			// Include error info in the result
-			result = append(result, models.ClusterPermissions{
-				Cluster: cluster.Name,
-			})
-			continue
-		}
-		result = append(result, *perms)
+	result := make([]models.ClusterPermissions, len(clusters))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrentClusterRBACQueries)
+
+	for i, cluster := range clusters {
+		i, cluster := i, cluster // capture per-iteration
+		g.Go(func() error {
+			clusterCtx, cancel := context.WithTimeout(gctx, perClusterRBACTimeout)
+			defer cancel()
+
+			perms, err := m.GetClusterPermissions(clusterCtx, cluster.Name)
+			if err != nil {
+				// Partial info on error — same contract as the old code.
+				result[i] = models.ClusterPermissions{Cluster: cluster.Name}
+				return nil
+			}
+			result[i] = *perms
+			return nil
+		})
 	}
+
+	_ = g.Wait()
 
 	return result, nil
 }
@@ -526,7 +634,8 @@ func (m *MultiClusterClient) CountServiceAccountsAllClusters(ctx context.Context
 			defer wg.Done()
 			count, err := m.countServiceAccountsInCluster(ctx, name)
 			if err != nil {
-				return // skip unreachable clusters, same as before
+				slog.Warn("[RBAC] service account count skipped for unreachable cluster", "cluster", name, "error", err)
+				return
 			}
 			mu.Lock()
 			total += count
@@ -771,6 +880,13 @@ type userNamespaceCtxKey struct{}
 // calling into k8s client helpers so namespace probing prefers the user's
 // own namespace (#6512).
 func WithUserNamespace(ctx context.Context, ns string) context.Context {
+	// Guard against a nil parent ctx — context.WithValue panics on nil.
+	// userNamespaceFromContext already tolerates a nil ctx, so stay
+	// symmetric and fall back to a background context if a caller hands
+	// us nil (#6547).
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if ns == "" {
 		return ctx
 	}
@@ -881,7 +997,7 @@ func (m *MultiClusterClient) ListNamespacesWithDetails(ctx context.Context, cont
 			Cluster:   contextName,
 			Status:    string(ns.Status.Phase),
 			Labels:    ns.Labels,
-			CreatedAt: ns.CreationTimestamp.Format(time.RFC3339),
+			CreatedAt: ns.CreationTimestamp.Time,
 		})
 	}
 	return namespaces, nil
@@ -911,7 +1027,7 @@ func (m *MultiClusterClient) CreateNamespace(ctx context.Context, contextName, n
 		Cluster:   contextName,
 		Status:    string(created.Status.Phase),
 		Labels:    created.Labels,
-		CreatedAt: created.CreationTimestamp.Format(time.RFC3339),
+		CreatedAt: created.CreationTimestamp.Time,
 	}, nil
 }
 
@@ -965,9 +1081,13 @@ func parseOpenShiftUser(item unstructured.Unstructured, cluster string) models.O
 		user.Name = name
 	}
 
-	// Get creationTimestamp from metadata
+	// Get creationTimestamp from metadata (parsed from RFC3339 string).
+	// CreatedAt is a *time.Time so it stays nil on absence or parse failure,
+	// and `omitempty` in the JSON tag then actually omits it. See issue #6759.
 	if createdAt, found, _ := unstructured.NestedString(item.Object, "metadata", "creationTimestamp"); found {
-		user.CreatedAt = createdAt
+		if parsed, err := time.Parse(time.RFC3339, createdAt); err == nil {
+			user.CreatedAt = &parsed
+		}
 	}
 
 	// Get fullName
@@ -1006,10 +1126,26 @@ func (m *MultiClusterClient) GrantNamespaceAccess(ctx context.Context, contextNa
 	}
 	// Otherwise, use the role name as-is (custom role)
 
-	// Generate binding name
-	bindingName := fmt.Sprintf("%s-%s-%s", req.SubjectName, roleName, namespace)
-	// Sanitize the binding name (remove special characters)
-	bindingName = sanitizeK8sName(bindingName)
+	// Generate binding name with a hash suffix to avoid collisions after sanitization (#7608).
+	// Different inputs (e.g. "admin@foo.com" vs "admin-foo-com") can normalize to the same
+	// sanitized string, so we append a short hash of the raw components.
+	rawBindingKey := fmt.Sprintf("%s-%s-%s", req.SubjectName, roleName, namespace)
+	const hashSuffixLen = 8  // Length of the hex hash suffix appended to binding names
+	const k8sNameMaxLen = 63 // Maximum length of a Kubernetes resource name
+	hash := sha256.Sum256([]byte(rawBindingKey))
+	hashSuffix := hex.EncodeToString(hash[:])[:hashSuffixLen]
+	sanitized := sanitizeK8sName(rawBindingKey)
+	// Leave room for "-" separator + hash suffix so the final name stays within k8sNameMaxLen
+	hashSuffixTotalLen := 1 + hashSuffixLen // dash separator + hex hash
+	maxBaseLen := k8sNameMaxLen - hashSuffixTotalLen
+	if len(sanitized) > maxBaseLen {
+		sanitized = sanitized[:maxBaseLen]
+		// Trim trailing dashes/dots left by truncation
+		for len(sanitized) > 0 && (sanitized[len(sanitized)-1] == '-' || sanitized[len(sanitized)-1] == '.') {
+			sanitized = sanitized[:len(sanitized)-1]
+		}
+	}
+	bindingName := sanitized + "-" + hashSuffix
 
 	subject := rbacv1.Subject{
 		Kind: req.SubjectKind,

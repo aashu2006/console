@@ -48,6 +48,10 @@ export function NPSSurvey() {
       setShowThankYou(true)
       showToast(t('nps.thankYou'), 'success')
       thankYouTimerRef.current = setTimeout(() => setShowThankYou(false), THANK_YOU_DISPLAY_MS)
+    } catch {
+      // Keep the widget open so the user can retry — don't claim success
+      // when the POST never reached the backend.
+      showToast(t('nps.submitError'), 'error')
     } finally {
       setIsSubmitting(false)
     }
@@ -114,7 +118,7 @@ export function NPSSurvey() {
             onChange={e => setFeedback(e.target.value)}
             placeholder={t('nps.feedbackPlaceholder')}
             rows={2}
-            className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-secondary/30 resize-none focus:outline-none focus:ring-2 focus:ring-primary/50 placeholder:text-muted-foreground/40"
+            className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-secondary/30 resize-none focus:outline-hidden focus:ring-2 focus:ring-primary/50 placeholder:text-muted-foreground/40"
           />
         </div>
       )}

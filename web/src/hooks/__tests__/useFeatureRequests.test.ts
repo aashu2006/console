@@ -1,12 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 
-vi.mock('../../lib/api', () => ({
-  api: {
-    get: vi.fn(),
-    post: vi.fn(),
-  },
-}))
+vi.mock('../../lib/api', async (importOriginal) => {
+  const actual = await importOriginal() as Record<string, unknown>
+  return {
+    ...actual,
+    api: {
+      get: vi.fn(),
+      post: vi.fn(),
+    },
+  }
+})
 
 vi.mock('../../lib/constants', async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>
@@ -271,8 +275,12 @@ describe('useFeatureRequests', () => {
     localStorage.setItem('kc-auth-token', 'real-jwt-token')
     vi.mocked(api.get).mockResolvedValue({ data: [] })
 
-    // Use a deferred promise so we can inspect isSubmitting mid-flight
-    let resolvePost!: (val: { data: unknown }) => void
+    // Use a deferred promise so we can inspect isSubmitting mid-flight.
+    // Issue 9246: `createRequest` awaits a dynamic `import('../lib/clientCtx')`
+    // before calling `api.post`, so the mock (and therefore `resolvePost`) is
+    // not assigned synchronously. We must wait for `api.post` to have been
+    // invoked before asserting in-flight state and resolving it.
+    let resolvePost: ((val: { data: unknown }) => void) | undefined
     vi.mocked(api.post).mockImplementation(() =>
       new Promise(resolve => { resolvePost = resolve })
     )
@@ -287,15 +295,61 @@ describe('useFeatureRequests', () => {
       createPromise = result.current.createRequest({ title: 'T', description: 'd', request_type: 'feature' })
     })
 
-    // isSubmitting should be true while the promise is pending
-    expect(result.current.isSubmitting).toBe(true)
+    // Wait for the dynamic-import chain to reach `api.post` so `resolvePost`
+    // is assigned and the hook has committed `isSubmitting = true`.
+    await waitFor(() => expect(api.post).toHaveBeenCalled())
+    await waitFor(() => expect(result.current.isSubmitting).toBe(true))
 
     // Resolve the API call
     await act(async () => {
-      resolvePost({ data: { id: 'new1', title: 'T', description: 'd', request_type: 'feature', user_id: 'u1', status: 'open', created_at: '2024-01-01' } })
+      resolvePost!({ data: { id: 'new1', title: 'T', description: 'd', request_type: 'feature', user_id: 'u1', status: 'open', created_at: '2024-01-01' } })
       await createPromise!
     })
     expect(result.current.isSubmitting).toBe(false)
+  })
+
+  // PR #6573 item C — the navbar button uses `{ countOnly: true }` to fetch
+  // a lean `{id, status}` payload. Verify the hook hits the count_only URL
+  // and exposes the lean list via `summaries`, separately from the full
+  // `requests` state (which must stay empty in count_only mode so nothing
+  // accidentally reads hallucinated title/description fields).
+  it('countOnly option fetches count_only URL and populates summaries, not requests', async () => {
+    localStorage.setItem('kc-auth-token', 'real-jwt-token')
+    const countPayload = [
+      { id: 'gh-console-42', status: 'closed' },
+      { id: 'gh-console-56', status: 'feasibility_study' },
+      { id: 'gh-docs-17', status: 'open' },
+    ]
+    vi.mocked(api.get).mockResolvedValue({ data: countPayload })
+
+    const { result } = renderHook(() => useFeatureRequests(undefined, { countOnly: true }))
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    // Must have hit the lean URL — NOT the full queue URL.
+    expect(api.get).toHaveBeenCalledWith('/api/feedback/queue?count_only=true')
+    // Lean results land in summaries, typed as {id, status}.
+    expect(result.current.summaries).toHaveLength(3)
+    expect(result.current.summaries[0]).toEqual({ id: 'gh-console-42', status: 'closed' })
+    // Full requests stays empty so no consumer reads stale/empty title fields.
+    expect(result.current.requests).toEqual([])
+  })
+
+  it('countOnly derives closed-id set consumers can use for navbar badge filter', async () => {
+    localStorage.setItem('kc-auth-token', 'real-jwt-token')
+    const countPayload = [
+      { id: 'gh-console-1', status: 'closed' },
+      { id: 'gh-console-2', status: 'open' },
+      { id: 'gh-console-3', status: 'closed' },
+    ]
+    vi.mocked(api.get).mockResolvedValue({ data: countPayload })
+
+    const { result } = renderHook(() => useFeatureRequests(undefined, { countOnly: true }))
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    const closedIds = new Set(result.current.summaries.filter(r => r.status === 'closed').map(r => r.id))
+    expect(closedIds.has('gh-console-1')).toBe(true)
+    expect(closedIds.has('gh-console-2')).toBe(false)
+    expect(closedIds.has('gh-console-3')).toBe(true)
   })
 
   it('closeRequest only updates the matching request, leaves others unchanged', async () => {

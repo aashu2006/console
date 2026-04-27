@@ -26,7 +26,10 @@ interface Invite {
 function loadInvites(): Invite[] {
   try {
     const stored = safeGetItem(INVITES_STORAGE_KEY)
-    return stored ? JSON.parse(stored) : []
+    if (!stored) return []
+    const parsed: unknown = JSON.parse(stored)
+    // Validate parsed data is actually an array (#7601)
+    return Array.isArray(parsed) ? parsed as Invite[] : []
   } catch {
     return []
   }
@@ -59,13 +62,15 @@ export function GitHubInviteModal({ isOpen, onClose }: GitHubInviteProps) {
     setError('')
 
     try {
+      // Trim first, then validate (#7600)
+      const trimmedUsername = username.trim()
+
       // Validate GitHub username format
-      if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$/.test(username)) {
+      if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$/.test(trimmedUsername)) {
         throw new Error('Invalid GitHub username format')
       }
 
       // Save the invite
-      const trimmedUsername = username.trim()
       saveInvite(trimmedUsername)
 
       // Award coins (one-time only)
@@ -128,7 +133,7 @@ export function GitHubInviteModal({ isOpen, onClose }: GitHubInviteProps) {
           <>
             {/* Reward info */}
             <div className="flex items-center gap-3 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 mb-4">
-              <Coins className="w-5 h-5 text-yellow-500 flex-shrink-0" />
+              <Coins className="w-5 h-5 text-yellow-500 shrink-0" />
               <div>
                 <p className="text-sm font-medium text-yellow-400">
                   {alreadyInvited ? 'Invite more friends!' : 'Earn +500 coins'}
@@ -153,7 +158,7 @@ export function GitHubInviteModal({ isOpen, onClose }: GitHubInviteProps) {
                     value={username}
                     onChange={(e) => setUsername(e.target.value)}
                     placeholder="username"
-                    className="w-full pl-8 pr-4 py-2.5 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                    className="w-full pl-8 pr-4 py-2.5 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                     autoFocus
                   />
                 </div>

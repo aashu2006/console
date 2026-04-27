@@ -76,10 +76,10 @@ const STATUS_ORDER: Record<string, number> = { fail: 0, warning: 1, pass: 2, man
 
 function StatusIcon({ status }: { status: string }) {
   switch (status) {
-    case 'pass': return <CheckCircle2 className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
-    case 'fail': return <XCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
-    case 'warning': return <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 flex-shrink-0" />
-    default: return <MinusCircle className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+    case 'pass': return <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+    case 'fail': return <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+    case 'warning': return <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 shrink-0" />
+    default: return <MinusCircle className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
   }
 }
 
@@ -188,14 +188,25 @@ export function ISO27001Audit({ config }: ISO27001AuditProps) {
     return <CardSkeleton rows={5} showHeader showSearch />
   }
 
-  // 9. Empty state
+  // 9. Error state — shown when fetch failed, even if there's stale data (#6772)
+  if (isFailed && !hasData) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-center p-4">
+        <AlertTriangle className="w-8 h-8 text-red-400 mb-2" />
+        <p className="text-sm font-medium text-foreground">{t('cards:iso27001Audit.failedToLoad', 'Failed to load audit data')}</p>
+        <p className="text-xs text-muted-foreground mt-1">{t('cards:iso27001Audit.checkAgent', 'Check agent connectivity and cluster access')}</p>
+      </div>
+    )
+  }
+
+  // 10. Empty state
   if (showEmptyState || (!isLoading && rawFindings.length === 0)) {
     if (isFailed) {
       return (
         <div className="h-full flex flex-col items-center justify-center text-center p-4">
           <AlertTriangle className="w-8 h-8 text-red-400 mb-2" />
-          <p className="text-sm font-medium text-foreground">Failed to load audit data</p>
-          <p className="text-xs text-muted-foreground mt-1">Check agent connectivity and cluster access</p>
+          <p className="text-sm font-medium text-foreground">{t('cards:iso27001Audit.failedToLoad', 'Failed to load audit data')}</p>
+          <p className="text-xs text-muted-foreground mt-1">{t('cards:iso27001Audit.checkAgent', 'Check agent connectivity and cluster access')}</p>
         </div>
       )
     }
@@ -211,7 +222,7 @@ export function ISO27001Audit({ config }: ISO27001AuditProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header: stats + controls */}
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1">
             <Shield className="w-4 h-4 text-blue-400" />

@@ -24,6 +24,8 @@ import { useDemoMode } from '../../hooks/useDemoMode'
 import { emitUserRoleChanged, emitUserRemoved } from '../../lib/analytics'
 import { ConfirmDialog } from '../../lib/modals'
 
+const MAX_VISIBLE_GROUPS = 3
+
 interface UserManagementProps {
   config?: Record<string, unknown>
 }
@@ -75,8 +77,8 @@ export function UserManagement({ config: _config }: UserManagementProps) {
 
   const { drillToRBAC } = useDrillDownActions()
   const { user: currentUser } = useAuth()
-  const { users: allUsers, isLoading: usersLoading, error: usersError, updateUserRole, deleteUser } = useConsoleUsers()
-  const { deduplicatedClusters: allClusters, isLoading: clustersLoading } = useClusters()
+  const { users: allUsers, isLoading: usersLoading, isRefreshing: usersRefreshing, error: usersError, updateUserRole, deleteUser } = useConsoleUsers()
+  const { deduplicatedClusters: allClusters, isLoading: clustersLoading, isRefreshing: clustersRefreshing } = useClusters()
   const { isDemoMode } = useDemoMode()
   // Fetch ALL SAs from ALL clusters upfront, filter locally
   const { serviceAccounts: allServiceAccounts, isLoading: sasInitialLoading } = useAllK8sServiceAccounts(allClusters)
@@ -90,6 +92,7 @@ export function UserManagement({ config: _config }: UserManagementProps) {
   // Report loading state to CardWrapper for skeleton/refresh behavior
   const { showSkeleton, showEmptyState } = useCardLoadingState({
     isLoading: clustersLoading || usersLoading || sasInitialLoading || openshiftInitialLoading,
+    isRefreshing: usersRefreshing || clustersRefreshing,
     hasAnyData: allClusters.length > 0 || allUsers.length > 0 || allServiceAccounts.length > 0,
     isFailed: Boolean(usersError),
     consecutiveFailures: usersError ? 1 : 0,
@@ -98,13 +101,13 @@ export function UserManagement({ config: _config }: UserManagementProps) {
   const { selectedClusters, isAllClustersSelected } = useGlobalFilters()
 
   // Filter clusters by global filter (already deduplicated from hook)
-  const clusters = (() => {
+  const clusters = useMemo(() => {
     if (isAllClustersSelected) return allClusters
     return allClusters.filter(c => selectedClusters.includes(c.name))
-  })()
+  }, [isAllClustersSelected, allClusters, selectedClusters])
 
   // Ensure current user is always included from auth context
-  const usersWithCurrent = (() => {
+  const usersWithCurrent = useMemo(() => {
     let result = [...allUsers]
     if (currentUser && !result.some(u => u.github_id === currentUser.github_id)) {
       const authUser: ConsoleUser = {
@@ -119,7 +122,7 @@ export function UserManagement({ config: _config }: UserManagementProps) {
       result = [authUser, ...result]
     }
     return result
-  })()
+  }, [allUsers, currentUser])
 
   // Extract unique namespaces from service accounts (filtered by cluster if selected)
   const namespaces = useMemo(() => {
@@ -131,13 +134,13 @@ export function UserManagement({ config: _config }: UserManagementProps) {
   }, [allServiceAccounts, selectedCluster])
 
   // Pre-filter OpenShift users by in-tab cluster dropdown (before passing to useCardData)
-  const openshiftUsersPreFiltered = (() => {
+  const openshiftUsersPreFiltered = useMemo(() => {
     if (!selectedCluster) return allOpenshiftUsers
     return allOpenshiftUsers.filter(u => u.cluster === selectedCluster)
-  })()
+  }, [selectedCluster, allOpenshiftUsers])
 
   // Pre-filter service accounts by in-tab cluster and namespace dropdowns
-  const serviceAccountsPreFiltered = (() => {
+  const serviceAccountsPreFiltered = useMemo(() => {
     let result = allServiceAccounts
     if (selectedCluster) {
       result = result.filter(sa => sa.cluster === selectedCluster)
@@ -146,10 +149,10 @@ export function UserManagement({ config: _config }: UserManagementProps) {
       result = result.filter(sa => sa.namespace === selectedNamespace)
     }
     return result
-  })()
+  }, [allServiceAccounts, selectedCluster, selectedNamespace])
 
   // Console user comparators (pins current user to top)
-  const consoleUserComparators: Record<ConsoleUserSortBy, (a: ConsoleUser, b: ConsoleUser) => number> = {
+  const consoleUserComparators: Record<ConsoleUserSortBy, (a: ConsoleUser, b: ConsoleUser) => number> = useMemo(() => ({
     name: (a, b) => {
       if (a.github_id === currentUser?.github_id) return -1
       if (b.github_id === currentUser?.github_id) return 1
@@ -164,7 +167,7 @@ export function UserManagement({ config: _config }: UserManagementProps) {
       if (a.github_id === currentUser?.github_id) return -1
       if (b.github_id === currentUser?.github_id) return 1
       return (a.email || '').localeCompare(b.email || '')
-    } }
+    } }), [currentUser?.github_id])
 
   // ---------- useCardData for OpenShift users tab ----------
   const {
@@ -275,23 +278,29 @@ export function UserManagement({ config: _config }: UserManagementProps) {
   const handleRoleChange = async (userId: string, newRole: UserRole) => {
     try {
       await updateUserRole(userId, newRole)
-      showToast('User role updated successfully', 'success')
+      // Issue 9285: route toast text through i18n so non-English users see
+      // the message translated (previously hardcoded English).
+      showToast(t('userManagement.toast.roleUpdateSuccess'), 'success')
       emitUserRoleChanged(newRole)
-    } catch (error) {
-      console.error('Failed to update role:', error)
-      showToast('Failed to update user role', 'error')
+    } catch {
+      // User-visible toast already surfaces the failure (#8816)
+      showToast(t('userManagement.toast.roleUpdateError'), 'error')
     }
   }
 
+  // Issue 9284: the ConsoleUsersTab already wraps this handler in a
+  // ConfirmDialog (the app-styled modal). The extra window.confirm() call
+  // here caused a double-confirm flow AND fell back to a native browser
+  // popup that's blockable. Rely on the dialog-based confirmation.
   const handleDeleteUser = async (userId: string) => {
-    if (!confirm(t('userManagement.confirmDelete'))) return
     try {
       await deleteUser(userId)
-      showToast('User deleted successfully', 'success')
+      // Issue 9285: i18n for success/error toasts.
+      showToast(t('userManagement.toast.deleteSuccess'), 'success')
       emitUserRemoved()
-    } catch (error) {
-      console.error('Failed to delete user:', error)
-      showToast('Failed to delete user', 'error')
+    } catch {
+      // User-visible toast already surfaces the failure (#8816)
+      showToast(t('userManagement.toast.deleteError'), 'error')
     }
   }
 
@@ -310,7 +319,7 @@ export function UserManagement({ config: _config }: UserManagementProps) {
     return (
       <div className="h-full flex flex-col min-h-card">
         {/* Header skeleton */}
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <div className="flex gap-2">
             <Skeleton variant="rounded" width={100} height={28} />
             <Skeleton variant="rounded" width={120} height={28} />
@@ -341,7 +350,7 @@ export function UserManagement({ config: _config }: UserManagementProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Row 1: Header with count badge and controls */}
-      <div className="flex items-center justify-between mb-2 flex-shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 shrink-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-muted-foreground">
             {currentTabCount} {currentTabLabel}
@@ -393,11 +402,11 @@ export function UserManagement({ config: _config }: UserManagementProps) {
           activeTab === 'serviceAccounts' ? t('userManagement.searchServiceAccounts') :
           t('userManagement.searchConsoleUsers')
         }
-        className="mb-2 flex-shrink-0"
+        className="mb-2 shrink-0"
       />
 
       {/* Row 3: Tab filter pills */}
-      <div className="flex items-center gap-1 mb-3 flex-shrink-0">
+      <div className="flex items-center gap-1 mb-3 shrink-0">
         <button
           onClick={() => setActiveTab('clusterUsers')}
           className={cn(
@@ -577,8 +586,8 @@ function ConsoleUsersTab({
             )}
           >
             <div className={cn(
-              'flex items-center justify-between',
-              isBlurred && 'blur-sm select-none pointer-events-none'
+              'flex flex-wrap items-center justify-between gap-y-2',
+              isBlurred && 'blur-xs select-none pointer-events-none'
             )}>
               <div className="flex items-center gap-3">
                 {user.avatar_url ? (
@@ -634,7 +643,7 @@ function ConsoleUsersTab({
             {/* Expanded actions */}
             {isAdmin && expandedUser === user.id && !isCurrentUser && (
               <div className="mt-3 pt-3 border-t border-border/50">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-y-2">
                   <div className="flex gap-2">
                     {(['admin', 'editor', 'viewer'] as UserRole[]).map((role) => (
                       <button
@@ -741,7 +750,7 @@ function ClusterUsersTab({
               onClick={() => onDrillToUser(user.cluster, user.name)}
               className="p-2 rounded bg-secondary/30 text-sm hover:bg-secondary/50 transition-colors cursor-pointer group"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-y-2">
                 <div className="flex items-center gap-2">
                   <span className="text-foreground font-medium group-hover:text-purple-400">{user.name}</span>
                   {user.fullName && (
@@ -762,7 +771,7 @@ function ClusterUsersTab({
               )}
               {user.groups && user.groups.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
-                  {user.groups.slice(0, 3).map((group, i) => (
+                  {user.groups.slice(0, MAX_VISIBLE_GROUPS).map((group, i) => (
                     <span
                       key={i}
                       className="px-1.5 py-0.5 rounded text-xs bg-blue-500/20 text-blue-400"
@@ -770,8 +779,8 @@ function ClusterUsersTab({
                       {group}
                     </span>
                   ))}
-                  {user.groups.length > 3 && (
-                    <span className="text-xs text-muted-foreground">+{user.groups.length - 3} more</span>
+                  {user.groups.length > MAX_VISIBLE_GROUPS && (
+                    <span className="text-xs text-muted-foreground">+{user.groups.length - MAX_VISIBLE_GROUPS} more</span>
                   )}
                 </div>
               )}
@@ -871,7 +880,7 @@ function ServiceAccountsTab({
               onClick={() => onDrillToServiceAccount(sa.cluster, sa.namespace, sa.name, sa.roles)}
               className="p-2 rounded bg-secondary/30 text-sm hover:bg-secondary/50 transition-colors cursor-pointer group"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-y-2">
                 <div className="flex items-center gap-2">
                   <span className="text-foreground font-medium group-hover:text-purple-400">{sa.name}</span>
                   {showClusterBadge && (

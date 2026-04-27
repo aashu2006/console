@@ -60,6 +60,8 @@ export interface ProjectNodeProps {
   glow?: boolean
   /** Whether something else is glowing and this node should fade */
   dimmed?: boolean
+  /** Set when the project was imported from Kubara Platform Catalog (#8484) */
+  kubaraChart?: { repoPath: string; valuesUrl?: string }
   onHover?: (info: ProjectHoverInfo | null) => void
   onDragStart?: (name: string) => void
   onDragEnd?: () => void
@@ -110,6 +112,7 @@ export function ProjectNode({
   overlay = 'architecture',
   glow = false,
   dimmed = false,
+  kubaraChart,
   onHover,
   onDragStart: _onDragStart,
   onDragEnd: _onDragEnd,
@@ -149,6 +152,13 @@ export function ProjectNode({
     }
   }, [name, _onDragStart, _onDragEnd])
 
+  // issue 6744 — Memoized hover info so focus/blur/keydown handlers can share a stable payload
+  const hoverInfo = {
+    name, displayName, category, status, isRequired, installed,
+    reason, dependencies, kbPath, maturity, priority,
+    cx, cy, radius,
+  }
+
   return (
     <motion.g
       ref={dragRef}
@@ -160,11 +170,21 @@ export function ProjectNode({
         opacity: { duration: 0.1 },
       }}
       style={{ transformOrigin: `${cx}px ${cy}px`, pointerEvents: 'all' as const }}
-      onMouseEnter={() => onHover?.({
-        name, displayName, category, status, isRequired, installed,
-        reason, dependencies, kbPath, maturity, priority,
-        cx, cy, radius,
-      })}
+      /* issue 6744 — SVG nodes must opt in to keyboard focus explicitly. tabIndex=0
+         makes the group focusable; role=button + aria-label expose it to AT;
+         Enter/Space surfaces the same hover payload mouse users see. */
+      tabIndex={0}
+      role="button"
+      aria-label={`${displayName} — ${category}${installed ? ', installed' : ''}${isRequired ? ', required' : ''}`}
+      onFocus={() => onHover?.(hoverInfo)}
+      onBlur={() => onHover?.(null)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onHover?.(hoverInfo)
+        }
+      }}
+      onMouseEnter={() => onHover?.(hoverInfo)}
       onMouseLeave={() => onHover?.(null)}
     >
       {/* Invisible hit target — ensures mouse events fire even when dimmed */}
@@ -272,6 +292,31 @@ export function ProjectNode({
           animate={{ pathLength: 1 }}
           transition={{ duration: 0.3 }}
         />
+      )}
+
+      {/* Kubara badge — small "K✓" indicator at bottom-right of node (#8484) */}
+      {kubaraChart && (
+        <g>
+          <circle
+            cx={cx + radius - 1}
+            cy={cy + radius - 1}
+            r={4}
+            fill="#065f46"
+            stroke="#10b981"
+            strokeWidth={0.5}
+          />
+          <text
+            x={cx + radius - 1}
+            y={cy + radius + 0.5}
+            textAnchor="middle"
+            fill="#6ee7b7"
+            fontSize={4}
+            fontWeight="bold"
+            fontFamily="system-ui, sans-serif"
+          >
+            K
+          </text>
+        </g>
       )}
 
       {/* Name label — shown on hover (glow) or when completed so project names are always visible */}

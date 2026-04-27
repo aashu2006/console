@@ -1,10 +1,11 @@
 import { useMemo, useState, useEffect, useRef } from 'react'
 import { TrendingUp, Clock, Server } from 'lucide-react'
 import { CardClusterFilter } from '../../lib/cards/CardComponents'
+import { useGPUTaintFilter, GPUTaintFilterControl } from './GPUTaintFilter'
 import { Skeleton, SkeletonStats } from '../ui/Skeleton'
 import { RefreshIndicator } from '../ui/RefreshIndicator'
 import { useCardLoadingState } from './CardDataContext'
-import ReactECharts from 'echarts-for-react'
+import { LazyEChart } from '../charts/LazyEChart'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedGPUNodes } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
@@ -15,7 +16,14 @@ import {
   CHART_GRID_STROKE,
   CHART_AXIS_STROKE,
   CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TICK_COLOR } from '../../lib/constants'
+  CHART_TICK_COLOR,
+  CHART_MARK_LINE_LABEL,
+  CHART_MARK_LINE_STROKE,
+  CHART_AXIS_FONT_SIZE_SM,
+  CHART_LEGEND_FONT_SIZE } from '../../lib/constants'
+import { PURPLE_600, hexToRgba } from '../../lib/theme/chartColors'
+
+const GPU_RING_SIZE_PX = 80
 
 interface GPUPoint {
   time: string
@@ -23,6 +31,13 @@ interface GPUPoint {
   available: number
   total: number
 }
+
+/** Opacity at the top of area-fill gradients */
+const AREA_GRADIENT_TOP_ALPHA = 0.4
+/** Opacity at the bottom of area-fill gradients (fully transparent) */
+const AREA_GRADIENT_BOTTOM_ALPHA = 0
+/** Font size for mark-line labels on the chart */
+const MARK_LINE_FONT_SIZE = 9
 
 type TimeRange = '15m' | '1h' | '6h' | '24h'
 
@@ -61,6 +76,19 @@ export function GPUUtilization() {
   const [localClusterFilter, setLocalClusterFilter] = useState<string[]>([])
   const [showClusterFilter, setShowClusterFilter] = useState(false)
   const clusterFilterRef = useRef<HTMLDivElement>(null)
+  // Taint-aware filtering (taint-filter). Computed from the full raw node list so
+  // the set of distinct taints shown to the user is stable across cluster
+  // filter changes — otherwise toggling a cluster off would "hide" a taint
+  // that still exists in the fleet.
+  const {
+    distinctTaints,
+    toleratedKeys: toleratedTaintKeys,
+    toggle: toggleTaintTolerance,
+    clear: clearTaintTolerance,
+    isVisible: nodeToleratedByTaints,
+  } = useGPUTaintFilter(gpuNodes)
+  const [showTaintFilter, setShowTaintFilter] = useState(false)
+  const taintFilterRef = useRef<HTMLDivElement>(null)
 
   const reachableClusters = clusters.filter(c => c.reachable !== false)
   const availableClustersForFilter = (() => {
@@ -106,6 +134,8 @@ export function GPUUtilization() {
     if (localClusterFilter.length > 0) {
       result = result.filter(n => localClusterFilter.some(c => (n.cluster ?? '').startsWith(c)))
     }
+    // Drop nodes whose scheduling-gating taints are not tolerated (taint-filter).
+    result = result.filter(nodeToleratedByTaints)
     return result
   })()
 
@@ -161,7 +191,7 @@ export function GPUUtilization() {
     xAxis: {
       type: 'category' as const,
       data: history.map(d => d.time),
-      axisLabel: { color: CHART_TICK_COLOR, fontSize: 9 },
+      axisLabel: { color: CHART_TICK_COLOR, fontSize: CHART_AXIS_FONT_SIZE_SM },
       axisLine: { lineStyle: { color: CHART_AXIS_STROKE } },
       axisTick: { show: false },
     },
@@ -170,7 +200,7 @@ export function GPUUtilization() {
       min: 0,
       max: currentStats.total || undefined,
       minInterval: 1,
-      axisLabel: { color: CHART_TICK_COLOR, fontSize: 9 },
+      axisLabel: { color: CHART_TICK_COLOR, fontSize: CHART_AXIS_FONT_SIZE_SM },
       axisLine: { show: false },
       axisTick: { show: false },
       splitLine: { lineStyle: { color: CHART_GRID_STROKE, type: 'dashed' as const } },
@@ -179,7 +209,7 @@ export function GPUUtilization() {
       trigger: 'axis' as const,
       backgroundColor: (CHART_TOOLTIP_CONTENT_STYLE as Record<string, unknown>).backgroundColor as string,
       borderColor: (CHART_TOOLTIP_CONTENT_STYLE as Record<string, unknown>).borderColor as string,
-      textStyle: { color: CHART_TICK_COLOR, fontSize: 11 },
+      textStyle: { color: CHART_TICK_COLOR, fontSize: CHART_LEGEND_FONT_SIZE },
     },
     series: [
       {
@@ -187,16 +217,16 @@ export function GPUUtilization() {
         type: 'line',
         step: 'end' as const,
         data: history.map(d => d.allocated),
-        lineStyle: { color: '#9333ea', width: 2 },
-        itemStyle: { color: '#9333ea' },
+        lineStyle: { color: PURPLE_600, width: 2 },
+        itemStyle: { color: PURPLE_600 },
         areaStyle: {
           color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: 'rgba(147,51,234,0.4)' }, { offset: 1, color: 'rgba(147,51,234,0)' }] },
+            colorStops: [{ offset: 0, color: hexToRgba(PURPLE_600, AREA_GRADIENT_TOP_ALPHA) }, { offset: 1, color: hexToRgba(PURPLE_600, AREA_GRADIENT_BOTTOM_ALPHA) }] },
         },
         showSymbol: false,
         markLine: {
           silent: true,
-          data: [{ yAxis: currentStats.total, label: { formatter: 'Total', position: 'end', color: '#888', fontSize: 9 }, lineStyle: { color: '#666', type: 'dashed' } }],
+          data: [{ yAxis: currentStats.total, label: { formatter: 'Total', position: 'end', color: CHART_MARK_LINE_LABEL, fontSize: MARK_LINE_FONT_SIZE }, lineStyle: { color: CHART_MARK_LINE_STROKE, type: 'dashed' } }],
         },
       },
     ],
@@ -205,7 +235,7 @@ export function GPUUtilization() {
   if (isLoading && history.length === 0 && hasReachableClusters) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
           <Skeleton variant="text" width={120} height={16} />
           <Skeleton variant="rounded" width={28} height={28} />
         </div>
@@ -218,7 +248,7 @@ export function GPUUtilization() {
   if (!hasReachableClusters || (!hookLoading && currentStats.total === 0)) {
     return (
       <div className="h-full flex flex-col content-loaded">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <div className="flex items-center gap-2">
             {localClusterFilter.length > 0 && (
               <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -251,6 +281,15 @@ export function GPUUtilization() {
               containerRef={clusterFilterRef}
               minClusters={1}
             />
+            <GPUTaintFilterControl
+              distinctTaints={distinctTaints}
+              toleratedKeys={toleratedTaintKeys}
+              onToggle={toggleTaintTolerance}
+              onClear={clearTaintTolerance}
+              isOpen={showTaintFilter}
+              setIsOpen={setShowTaintFilter}
+              containerRef={taintFilterRef}
+            />
           </div>
         </div>
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">
@@ -262,7 +301,7 @@ export function GPUUtilization() {
 
   return (
     <div className="h-full flex flex-col content-loaded">
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           {localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -308,10 +347,10 @@ export function GPUUtilization() {
 
       {/* Stats and pie chart row */}
       <div className="flex items-center gap-4 mb-4">
-        <div className="w-20 h-20 relative" style={{ minWidth: 80, minHeight: 80 }}>
-          <ReactECharts
+        <div className="w-20 h-20 relative" style={{ minWidth: GPU_RING_SIZE_PX, minHeight: GPU_RING_SIZE_PX }}>
+          <LazyEChart
             option={pieOption}
-            style={{ height: 80, width: 80 }}
+            style={{ height: GPU_RING_SIZE_PX, width: GPU_RING_SIZE_PX }}
             notMerge={true}
             opts={{ renderer: 'svg' }}
           />
@@ -319,7 +358,7 @@ export function GPUUtilization() {
             <span className="text-sm font-bold text-foreground">{currentStats.utilization}%</span>
           </div>
         </div>
-        <div className="flex-1 grid grid-cols-3 gap-2">
+        <div className="flex-1 grid grid-cols-2 @md:grid-cols-3 gap-2">
           <div className="p-2 rounded-lg bg-purple-500/10 border border-purple-500/20">
             <div className="text-xs text-purple-400 mb-1">{t('common.allocated')}</div>
             <span className="text-lg font-bold text-foreground">{currentStats.allocated}</span>
@@ -347,7 +386,7 @@ export function GPUUtilization() {
           </div>
         ) : (
           <div style={{ width: '100%', minHeight: CHART_HEIGHT_COMPACT, height: CHART_HEIGHT_COMPACT }}>
-            <ReactECharts
+            <LazyEChart
               option={trendOption}
               style={{ height: CHART_HEIGHT_COMPACT, width: '100%' }}
               notMerge={true}

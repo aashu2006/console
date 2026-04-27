@@ -53,7 +53,7 @@ export function ArgoCDSyncStatus({ config: _config }: ArgoCDSyncStatusProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={130} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -115,7 +115,7 @@ export function ArgoCDSyncStatus({ config: _config }: ArgoCDSyncStatusProps) {
       {/* Integration notice — only shown in demo/fallback mode (#4201) */}
       {isDemoData && (
         <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-orange-500/10 border border-orange-500/20 text-xs">
-          <AlertCircle className="w-4 h-4 text-orange-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-orange-400 shrink-0 mt-0.5" />
           <div>
             <p className="text-orange-400 font-medium">{t('argoCDSyncStatus.argocdIntegration')}</p>
             <p className="text-muted-foreground">
@@ -177,21 +177,21 @@ export function ArgoCDSyncStatus({ config: _config }: ArgoCDSyncStatusProps) {
 
       {/* Legend */}
       <div className="space-y-2">
-        <div className="flex items-center justify-between p-2 rounded-lg bg-green-500/10">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 p-2 rounded-lg bg-green-500/10">
           <div className="flex items-center gap-2">
             <CheckCircle className="w-4 h-4 text-green-400" />
             <span className="text-sm text-foreground">{t('argoCDSyncStatus.synced')}</span>
           </div>
           <span className="text-sm font-bold text-green-400">{stats.synced}</span>
         </div>
-        <div className="flex items-center justify-between p-2 rounded-lg bg-yellow-500/10">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 p-2 rounded-lg bg-yellow-500/10">
           <div className="flex items-center gap-2">
             <RefreshCw className="w-4 h-4 text-yellow-400" />
             <span className="text-sm text-foreground">{t('argoCDSyncStatus.outOfSync')}</span>
           </div>
           <span className="text-sm font-bold text-yellow-400">{stats.outOfSync}</span>
         </div>
-        <div className="flex items-center justify-between p-2 rounded-lg bg-secondary/30">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 p-2 rounded-lg bg-secondary/30">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-muted-foreground" />
             <span className="text-sm text-foreground">{t('argoCDSyncStatus.unknown')}</span>

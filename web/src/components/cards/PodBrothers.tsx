@@ -2,10 +2,12 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 
 import { Play, RotateCcw, Pause, Trophy, Heart, Star } from 'lucide-react'
 
+import { useTranslation } from 'react-i18next'
 import { useCardExpanded } from './CardWrapper'
 import { useReportCardDataState } from './CardDataContext'
 import { emitGameStarted, emitGameEnded } from '../../lib/analytics'
 import { useGameKeyTracking } from '../../hooks/useGameKeys'
+import { safeGet, safeSet } from '../../lib/safeLocalStorage'
 
 // Game constants
 const CANVAS_WIDTH = 480
@@ -77,7 +79,12 @@ interface Coin {
   collected: boolean
 }
 
+// High-score storage key — safeGet/safeSet tolerate private-mode
+// browsers where localStorage access throws (issue #8938).
+const POD_BROTHERS_HIGHSCORE_KEY = 'podBrothersHighScore'
+
 export function PodBrothers() {
+  const { t } = useTranslation('cards')
   useReportCardDataState({ hasData: true, isFailed: false, consecutiveFailures: 0, isDemoData: false })
   const { isExpanded } = useCardExpanded()
   const gameContainerRef = useRef<HTMLDivElement>(null)
@@ -86,7 +93,7 @@ export function PodBrothers() {
   const [score, setScore] = useState(0)
   const [lives, setLives] = useState(3)
   const [highScore, setHighScore] = useState(() => {
-    const saved = localStorage.getItem('podBrothersHighScore')
+    const saved = safeGet(POD_BROTHERS_HIGHSCORE_KEY)
     return saved ? parseInt(saved, 10) : 0
   })
 
@@ -146,19 +153,19 @@ export function PodBrothers() {
     invincibilityRef.current = INVINCIBILITY_FRAMES
   }, [])
 
-  // Collision detection
-  const getTileAt = (x: number, y: number): number => {
+  // Collision detection — wrapped in useCallback for stable update() deps
+  const getTileAt = useCallback((x: number, y: number): number => {
     const col = Math.floor(x / TILE_SIZE)
     const row = Math.floor(y / TILE_SIZE)
     if (row < 0 || row >= levelRef.current.length || col < 0 || col >= levelRef.current[0].length) {
       return EMPTY
     }
     return levelRef.current[row][col]
-  }
+  }, [])
 
-  const isSolid = (tile: number): boolean => {
+  const isSolid = useCallback((tile: number): boolean => {
     return tile === BRICK || tile === GROUND || tile === PIPE || tile === QUESTION
-  }
+  }, [])
 
   // Game loop
   const update = useCallback(() => {
@@ -334,7 +341,7 @@ export function PodBrothers() {
           const finalScore = s + 1000
           if (finalScore > highScore) {
             setHighScore(finalScore)
-            localStorage.setItem('podBrothersHighScore', finalScore.toString())
+            safeSet(POD_BROTHERS_HIGHSCORE_KEY, finalScore.toString())
           }
           emitGameEnded('pod_brothers', 'win', finalScore)
           return finalScore
@@ -483,6 +490,8 @@ export function PodBrothers() {
   const startGame = () => {
     // Cancel any in-flight animation frame to prevent stale updates
     cancelAnimationFrame(animationRef.current)
+    // Clear held keys so stale presses don't carry into the new game
+    keysRef.current.clear()
     initLevel()
     setScore(0)
     livesRef.current = 3
@@ -499,7 +508,7 @@ export function PodBrothers() {
     <div ref={gameContainerRef} className="h-full flex flex-col">
       <div className={`flex flex-col items-center gap-3 ${isExpanded ? 'flex-1 min-h-0' : ''}`}>
         {/* Stats bar */}
-        <div className="flex items-center justify-between w-full max-w-[480px] text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 w-full max-w-[480px] text-sm">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-1">
               <Star className="w-4 h-4 text-yellow-400" />
@@ -530,27 +539,27 @@ export function PodBrothers() {
           {/* Overlays */}
           {gameState === 'idle' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded">
-              <h3 className="text-2xl font-bold text-orange-400 mb-2">Pod Brothers</h3>
-              <p className="text-sm text-muted-foreground mb-4">Arrow keys or WASD to move, Space to jump</p>
+              <h3 className="text-2xl font-bold text-orange-400 mb-2">{t('podBrothers.title')}</h3>
+              <p className="text-sm text-muted-foreground mb-4">{t('podBrothers.instructions')}</p>
               <button
                 onClick={startGame}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-white"
               >
                 <Play className="w-4 h-4" />
-                Start Game
+                {t('podBrothers.startGame')}
               </button>
             </div>
           )}
 
           {gameState === 'paused' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded">
-              <h3 className="text-xl font-bold text-white mb-4">Paused</h3>
+              <h3 className="text-xl font-bold text-white mb-4">{t('podBrothers.paused')}</h3>
               <button
                 onClick={togglePause}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
               >
                 <Play className="w-4 h-4" />
-                Resume
+                {t('podBrothers.resume')}
               </button>
             </div>
           )}
@@ -558,28 +567,28 @@ export function PodBrothers() {
           {gameState === 'won' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded">
               <Trophy className="w-12 h-12 text-yellow-400 mb-2" />
-              <h3 className="text-2xl font-bold text-green-400 mb-2">Level Complete!</h3>
-              <p className="text-lg text-white mb-4">Score: {score}</p>
+              <h3 className="text-2xl font-bold text-green-400 mb-2">{t('podBrothers.levelComplete')}</h3>
+              <p className="text-lg text-white mb-4">{t('podBrothers.scoreLabel', { score })}</p>
               <button
                 onClick={startGame}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-white"
               >
                 <RotateCcw className="w-4 h-4" />
-                Play Again
+                {t('podBrothers.playAgain')}
               </button>
             </div>
           )}
 
           {gameState === 'lost' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded">
-              <h3 className="text-2xl font-bold text-red-400 mb-2">Game Over</h3>
-              <p className="text-lg text-white mb-4">Score: {score}</p>
+              <h3 className="text-2xl font-bold text-red-400 mb-2">{t('podBrothers.gameOver')}</h3>
+              <p className="text-lg text-white mb-4">{t('podBrothers.scoreLabel', { score })}</p>
               <button
                 onClick={startGame}
                 className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-700 rounded text-white"
               >
                 <RotateCcw className="w-4 h-4" />
-                Try Again
+                {t('podBrothers.tryAgain')}
               </button>
             </div>
           )}
@@ -593,7 +602,7 @@ export function PodBrothers() {
               className="flex items-center gap-1 px-3 py-1 bg-secondary hover:bg-secondary/80 rounded text-sm"
             >
               <Pause className="w-4 h-4" />
-              Pause
+              {t('podBrothers.pause')}
             </button>
           </div>
         )}

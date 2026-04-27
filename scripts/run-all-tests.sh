@@ -118,15 +118,17 @@ declare -A SUITE_STATUS=()  # Tracks actual pass/fail/skip per suite name
 extract_failure_reason() {
   local log_file="$1"
   local reason
-  # Strip ANSI codes, grab last 5 non-empty lines, join with \n
+  # Strip ANSI codes, grab last 5 non-empty lines, join with newlines,
+  # then use jq to produce a properly JSON-escaped string (handles
+  # backslashes, tabs, control chars, quotes — all of which broke the
+  # hand-rolled sed escaping and caused jq parse errors in the nightly
+  # comparison step, see #9346).
   reason=$(sed 's/\x1b\[[0-9;]*m//g' "$log_file" 2>/dev/null \
     | grep -v '^\s*$' \
     | tail -5 \
-    | tr '\n' '|' \
-    | sed 's/|$//' \
-    | sed 's/|/\\n/g' \
-    | sed 's/"/\\"/g' \
-    | cut -c1-500) || true
+    | head -c 500 \
+    | jq -Rs '.' 2>/dev/null \
+    | sed 's/^"//;s/"$//') || true
   echo "$reason"
 }
 
@@ -286,6 +288,46 @@ if [ -z "$FAST_MODE" ]; then
         # Export PLAYWRIGHT_BASE_URL so Playwright configs skip their own webServer
         export PLAYWRIGHT_BASE_URL="http://127.0.0.1:${PREVIEW_PORT}"
 
+        # Per-suite wall-clock cap (seconds). Prevents a single hanging suite
+        # (e.g. benchmark retries against unresponsive external services) from
+        # consuming the entire nightly workflow budget. 5 minutes is the default
+        # and is generous for most Playwright suites. A handful of heavier
+        # suites exceed this routinely (#8981, #8986, #8987) — they get an
+        # explicit override below. Keep the default tight so a genuinely hung
+        # suite still fails fast.
+        PLAYWRIGHT_SUITE_TIMEOUT_SECS=300
+
+        # Per-suite timeout overrides (seconds). Only list suites that need
+        # MORE time than the default. See:
+        #   #8981 console-error-scan: 38+ routes × ~5s settle ≈ 250-270s, right
+        #     at the 300s cap. Bumping to 600s gives headroom for additional
+        #     routes without re-firing nightly regressions.
+        #   #8984 ui-compliance-test: renders every registered card type; total
+        #     card count keeps growing as we add cards.
+        #   #8985 cache-test: renders all cards via the same compliance harness.
+        #   #8986 benchmark-test: 12 tests × up to 60s each ≈ 720s worst case.
+        #   #8987 ai-ml-test: 15 tests × up to 300s each in pathological cases.
+        #   #9098 nav-test: 6 serial scenarios (warmup/cold/warm/from-main/
+        #     from-clusters/rapid-nav) × ~60-120s each ≈ 480-720s total.
+        #     Default 300s cap killed it mid-run after warm-nav completed.
+        #   #9099 perf-test: same serial scenario structure as nav-test.
+        #   #9346 nav-test, perf-test, ai-ml-test: 600s not enough — all 3
+        #     consistently hit the cap mid-run with work remaining (nav-test
+        #     completes 5/6 scenarios, perf-test still iterating dashboards,
+        #     ai-ml-test retries consuming budget). 900s matches their
+        #     Playwright-level timeout (900_000ms) and fits within the 120m
+        #     workflow backstop. perf-test bumped to 1200s — 29 dashboard
+        #     variants all pass but exceed 900s wall-clock (#nightly-fix).
+        declare -A PLAYWRIGHT_SUITE_TIMEOUT_OVERRIDES=(
+          ["console-error-scan"]=600
+          ["ui-compliance-test"]=600
+          ["cache-test"]=600
+          ["benchmark-test"]=600
+          ["ai-ml-test"]=900
+          ["nav-test"]=900
+          ["perf-test"]=1200
+        )
+
         for script in "${PLAYWRIGHT_SCRIPTS[@]}"; do
           SUITE_NAME=$(basename "$script" .sh)
           TOTAL=$((TOTAL + 1))
@@ -298,13 +340,23 @@ if [ -z "$FAST_MODE" ]; then
             continue
           fi
 
+          # Resolve the per-suite timeout (override wins, else default).
+          SUITE_TIMEOUT_SECS="${PLAYWRIGHT_SUITE_TIMEOUT_OVERRIDES[$SUITE_NAME]:-$PLAYWRIGHT_SUITE_TIMEOUT_SECS}"
+
           echo -e "  ${BOLD}▶ ${SUITE_NAME}${NC}"
           SUITE_START=$(date +%s)
           SUITE_OUTPUT="/tmp/suite-${SUITE_NAME}.log"
           SUITE_EXIT=0
-          bash "$script" > "$SUITE_OUTPUT" 2>&1 || SUITE_EXIT=$?
+          timeout "${SUITE_TIMEOUT_SECS}" bash "$script" > "$SUITE_OUTPUT" 2>&1 || SUITE_EXIT=$?
           SUITE_END=$(date +%s)
           SUITE_DURATION=$((SUITE_END - SUITE_START))
+
+          # timeout(1) returns 124 when the command is killed by the timer
+          TIMEOUT_EXIT_CODE=124
+          if [ "$SUITE_EXIT" -eq "$TIMEOUT_EXIT_CODE" ]; then
+            echo -e "    ${RED}⏱  TIMEOUT${NC} after ${SUITE_TIMEOUT_SECS}s"
+            echo "Suite killed after ${SUITE_TIMEOUT_SECS}s wall-clock timeout" >> "$SUITE_OUTPUT"
+          fi
 
           if [ "$SUITE_EXIT" -eq 0 ]; then
             echo -e "    ${GREEN}✓ PASS${NC}  (${SUITE_DURATION}s)"
@@ -348,19 +400,34 @@ echo ""
 
 RESULTS="${RESULTS%,}"
 
-cat > "$REPORT_JSON" << EOF
-{
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "fastMode": $([ -n "$FAST_MODE" ] && echo "true" || echo "false"),
-  "summary": {
-    "total": ${TOTAL},
-    "passed": ${PASSED_SUITES},
-    "failed": ${FAILED_SUITES},
-    "skipped": ${SKIPPED_SUITES}
+# Build JSON report, validating with jq to catch malformed failure_reason
+# strings (unescaped chars, shell-expanded $variables, etc.)
+CANDIDATE_JSON="{
+  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+  \"fastMode\": $([ -n "$FAST_MODE" ] && echo "true" || echo "false"),
+  \"summary\": {
+    \"total\": ${TOTAL},
+    \"passed\": ${PASSED_SUITES},
+    \"failed\": ${FAILED_SUITES},
+    \"skipped\": ${SKIPPED_SUITES}
   },
-  "results": [${RESULTS}]
-}
-EOF
+  \"results\": [${RESULTS}]
+}"
+
+if echo "$CANDIDATE_JSON" | jq . > "$REPORT_JSON" 2>/dev/null; then
+  : # valid JSON written
+else
+  echo "WARNING: Generated JSON was malformed — writing minimal report" >&2
+  jq -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson fm "$([ -n "$FAST_MODE" ] && echo "true" || echo "false")" \
+    --argjson total "$TOTAL" \
+    --argjson passed "$PASSED_SUITES" \
+    --argjson failed "$FAILED_SUITES" \
+    --argjson skipped "$SKIPPED_SUITES" \
+    '{timestamp: $ts, fastMode: $fm, summary: {total: $total, passed: $passed, failed: $failed, skipped: $skipped}, results: []}' \
+    > "$REPORT_JSON"
+fi
 
 cat > "$REPORT_MD" << EOF
 # KubeStellar Console — Full Test Suite

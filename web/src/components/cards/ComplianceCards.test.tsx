@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen} from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ComplianceScore } from './ComplianceCards'
 import { ComplianceScoreBreakdownModal } from './compliance/ComplianceScoreBreakdownModal'
@@ -394,9 +394,15 @@ describe('ComplianceScoreBreakdownModal', () => {
     expect(tabs[1]).toHaveTextContent('82%')
     expect(tabs[2]).toHaveTextContent('78%')
 
-    // Overview tab content: per-tool bars
-    expect(screen.getByText('Kubescape')).toBeInTheDocument()
-    expect(screen.getByText('Kyverno')).toBeInTheDocument()
+    // Overview tab content: per-tool bars. Scope the assertion to the "By tool"
+    // section so it survives refactors that change other parts of the modal
+    // (#7908 — Copilot review on #7905 flagged the prior getAllByText as too
+    // broad). The `<h4>By tool</h4>` heading sits next to the bar list inside
+    // the same parent container.
+    const byToolHeading = screen.getByText('By tool')
+    const byToolSection = byToolHeading.parentElement!
+    expect(within(byToolSection).getByText('Kubescape')).toBeInTheDocument()
+    expect(within(byToolSection).getByText('Kyverno')).toBeInTheDocument()
   })
 
   it('renders Kubescape tab with controls stats and framework scores', async () => {
@@ -463,8 +469,8 @@ describe('ComplianceScoreBreakdownModal', () => {
     expect(screen.getByText(/Based on 4 violations across 20 policies/)).toBeInTheDocument()
   })
 
-  it('shows fallback message when tool data is not provided', async () => {
-    const _user = userEvent.setup()
+  it('shows fallback message when tool data is not provided (after clicking tool tab)', async () => {
+    const user = userEvent.setup()
 
     render(
       <ComplianceScoreBreakdownModal
@@ -476,13 +482,18 @@ describe('ComplianceScoreBreakdownModal', () => {
       />,
     )
 
-    // With only one tool, no Overview tab — Kubescape tab is active by default
-    // Since kubescapeData is undefined, should show fallback
+    // Since #7893, Overview is always the default landing tab — so the
+    // fallback for the Kubescape tool is only reached after the user clicks
+    // the Kubescape tab explicitly.
+    const kubescapeTab = screen.getByRole('tab', { name: /Kubescape/ })
+    await user.click(kubescapeTab)
+
+    // With kubescapeData undefined, the tool tab renders the fallback
     expect(screen.getByText('Kubescape data not available')).toBeInTheDocument()
     expect(screen.getByText('No data from connected clusters')).toBeInTheDocument()
   })
 
-  it('renders single-tool modal without Overview tab', () => {
+  it('renders single-tool modal with Overview + tool tabs (Overview landing)', () => {
     render(
       <ComplianceScoreBreakdownModal
         isOpen={true}
@@ -493,12 +504,21 @@ describe('ComplianceScoreBreakdownModal', () => {
       />,
     )
 
-    // Only 1 tool => no tabs rendered (tabs.length === 1 means no Overview added, and tabs only show if > 1)
-    expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+    // Since #7893, Overview is always present — so a single-tool modal has
+    // 2 tabs (Overview + Kubescape), not 0.
+    const tabs = screen.getAllByRole('tab')
+    expect(tabs).toHaveLength(2)
+    expect(tabs[0]).toHaveTextContent('Overview')
+    expect(tabs[1]).toHaveTextContent('Kubescape')
 
-    // Content should show Kubescape data directly
-    expect(screen.getByText('Total Controls')).toBeInTheDocument()
-    expect(screen.getByText('100')).toBeInTheDocument()
+    // Overview tab is active by default — it shows aggregate stats derived
+    // from kubescapeData (100 controls / 82 passed / 18 failed). Assert the
+    // value-label pairing inside the Total Checks StatBox rather than a bare
+    // `getByText('100')` (#7908 — Copilot review on #7905 flagged the bare
+    // match as too broad; many elements could render "100").
+    const totalChecksLabel = screen.getByText('Total Checks')
+    const totalChecksStatBox = totalChecksLabel.parentElement!
+    expect(within(totalChecksStatBox).getByText('100')).toBeInTheDocument()
   })
 
   it('does not render anything when isOpen is false', () => {
@@ -512,5 +532,71 @@ describe('ComplianceScoreBreakdownModal', () => {
     )
 
     expect(screen.queryByText('Compliance Score Breakdown')).not.toBeInTheDocument()
+  })
+
+  // Regression test for #8974: earlier versions of the Overview tab summed
+  // Kubescape's pass/fail/total counts with Kyverno's policies/violations into
+  // a single "Total Checks / Passing / Failing" row. Because Kyverno violations
+  // are event counts (one per offending resource, not per policy), the numbers
+  // didn't add up — users saw totals like "126 checks, 121 passing, 167 failing".
+  //
+  // Invariant to pin: within each tool's section on the Overview tab, the
+  // bucket values must be internally consistent with the labels shown.
+  // Kubescape's section uses a checks/passed/failed model where passed + failed
+  // == total. Kyverno's section uses a policies/violations model (no pass/fail
+  // relationship is implied or displayed).
+  it('overview tab shows per-tool counts that reconcile without mixing Kubescape checks and Kyverno violations (#8974)', () => {
+    // Kubescape with a much smaller totalControls than Kyverno's violations.
+    // Before the fix, "Total Checks" would have been 116 + 10 = 126, "Passing"
+    // would have been 110 + max(0, 10 - 167) = 110, and "Failing" would have
+    // been 6 + 167 = 173 — mirroring the shape of the issue.
+    const kubescapeSmall = {
+      totalControls: 116,
+      passedControls: 110,
+      failedControls: 6,
+      frameworks: [],
+    }
+    const kyvernoManyViolations = {
+      totalPolicies: 10,
+      totalViolations: 167,
+      enforcingCount: 4,
+      auditCount: 6,
+    }
+
+    render(
+      <ComplianceScoreBreakdownModal
+        isOpen={true}
+        onClose={vi.fn()}
+        score={70}
+        breakdown={defaultBreakdown}
+        kubescapeData={kubescapeSmall}
+        kyvernoData={kyvernoManyViolations}
+      />,
+    )
+
+    // Kubescape section: passed + failed == total, so 110 + 6 == 116.
+    const kubescapeHeading = screen.getByText('Kubescape checks')
+    const kubescapeSection = kubescapeHeading.parentElement!
+    const totalChecksLabel = within(kubescapeSection).getByText('Total Checks')
+    expect(within(totalChecksLabel.parentElement!).getByText('116')).toBeInTheDocument()
+    const passingLabel = within(kubescapeSection).getByText('Passing')
+    expect(within(passingLabel.parentElement!).getByText('110')).toBeInTheDocument()
+    const failingLabel = within(kubescapeSection).getByText('Failing')
+    expect(within(failingLabel.parentElement!).getByText('6')).toBeInTheDocument()
+
+    // Kyverno section: uses its native vocabulary (policies + violations).
+    // The violation count is NOT summed with Kubescape failures, and is NOT
+    // labeled "Failing".
+    const kyvernoHeading = screen.getByText('Kyverno policies')
+    const kyvernoSection = kyvernoHeading.parentElement!
+    const policiesLabel = within(kyvernoSection).getByText('Policies')
+    expect(within(policiesLabel.parentElement!).getByText('10')).toBeInTheDocument()
+    const violationsLabel = within(kyvernoSection).getByText('Violations')
+    expect(within(violationsLabel.parentElement!).getByText('167')).toBeInTheDocument()
+
+    // And the pre-fix aggregate row must no longer exist.
+    expect(screen.queryByText((_, el) =>
+      !!el && el.tagName === 'P' && el.textContent === '126',
+    )).not.toBeInTheDocument()
   })
 })

@@ -1,8 +1,10 @@
 import { useCache } from '../../../lib/cache'
 import { useCardLoadingState } from '../CardDataContext'
+import { useDemoMode } from '../../../hooks/useDemoMode'
 import { KEDA_DEMO_DATA, type KedaDemoData, type KedaScaledObject, type KedaTriggerType } from './demoData'
 import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/constants'
 import { authFetch } from '../../../lib/api'
+import { LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 
 export type KedaStatus = KedaDemoData
 
@@ -74,7 +76,7 @@ function isPodReady(pod: BackendPodInfo): boolean {
 async function fetchCR(group: string, version: string, resource: string): Promise<CRItem[]> {
   try {
     const params = new URLSearchParams({ group, version, resource })
-    const resp = await authFetch(`/api/mcp/custom-resources?${params}`, {
+    const resp = await authFetch(`${LOCAL_AGENT_HTTP_URL}/custom-resources?${params}`, {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
     })
@@ -172,11 +174,11 @@ async function fetchPods(url: string): Promise<BackendPodInfo[]> {
 async function fetchKedaStatus(): Promise<KedaStatus> {
   // Step 1: Detect operator pods (label-filtered first, then unfiltered fallback)
   const labeledPods = await fetchPods(
-    '/api/mcp/pods?labelSelector=app.kubernetes.io%2Fpart-of%3Dkeda-operator',
+    `${LOCAL_AGENT_HTTP_URL}/pods?labelSelector=app.kubernetes.io%2Fpart-of%3Dkeda-operator`,
   )
   const kedaPods = labeledPods.length > 0
     ? labeledPods.filter(isKedaOperatorPod)
-    : (await fetchPods('/api/mcp/pods')).filter(isKedaOperatorPod)
+    : (await fetchPods(`${LOCAL_AGENT_HTTP_URL}/pods`)).filter(isKedaOperatorPod)
 
   if (kedaPods.length === 0) {
     return {
@@ -218,16 +220,28 @@ export interface UseKedaStatusResult {
   consecutiveFailures: number
   showSkeleton: boolean
   showEmptyState: boolean
+  // Issue 8836: exposed so the card can render a "Last updated X ago" indicator
+  // using the cache-layer refresh timestamp instead of the server-side
+  // lastCheckTime (which does not advance across cache rehydrates).
+  lastRefresh: number | null
+  isDemoFallback: boolean
 }
 
 export function useKedaStatus(): UseKedaStatusResult {
+  // Issue 8836: subscribe to demo mode toggles so the card swaps to demo data
+  // immediately (and shows the Demo badge / yellow outline) when the user
+  // flips demo mode on, instead of only switching when the cache layer falls
+  // back after a fetch failure.
+  const { isDemoMode } = useDemoMode()
+
   const {
-    data,
+    data: liveData,
     isLoading,
     isRefreshing,
     isFailed,
     consecutiveFailures,
     isDemoFallback,
+    lastRefresh,
   } = useCache<KedaStatus>({
     key: CACHE_KEY,
     category: 'default',
@@ -237,12 +251,14 @@ export function useKedaStatus(): UseKedaStatusResult {
     fetcher: fetchKedaStatus,
   })
 
-  const effectiveIsDemoData = isDemoFallback && !isLoading
+  const data = isDemoMode ? KEDA_DEMO_DATA : liveData
+  const effectiveIsDemoData = isDemoMode || (isDemoFallback && !isLoading)
 
   const hasAnyData = (data.operatorPods?.total ?? 0) > 0 || (data.scaledObjects || []).length > 0
 
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !isDemoMode && !hasAnyData,
+    isRefreshing,
     hasAnyData,
     isFailed,
     consecutiveFailures,
@@ -251,11 +267,13 @@ export function useKedaStatus(): UseKedaStatusResult {
 
   return {
     data,
-    loading: isLoading,
+    loading: isLoading && !isDemoMode,
     isRefreshing,
-    error: isFailed && !hasAnyData,
+    error: isFailed && !hasAnyData && !isDemoMode,
     consecutiveFailures,
     showSkeleton,
     showEmptyState,
+    lastRefresh,
+    isDemoFallback: effectiveIsDemoData,
   }
 }

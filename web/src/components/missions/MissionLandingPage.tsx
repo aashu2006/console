@@ -191,7 +191,7 @@ function DashboardMockup() {
   return (
     <div className="absolute inset-0 overflow-hidden opacity-30 blur-[2px]">
       {/* Sidebar */}
-      <div className="absolute left-0 top-0 bottom-0 w-[52px] bg-[#0f1218] border-r border-white/5">
+      <div className="absolute left-0 top-0 bottom-0 w-[52px] bg-card border-r border-white/5">
         {/* Logo area */}
         <div className="h-12 flex items-center justify-center border-b border-white/5">
           <div className="w-6 h-6 rounded bg-purple-500/30" />
@@ -217,11 +217,11 @@ function DashboardMockup() {
         {/* Card grid */}
         <div className="grid grid-cols-3 gap-3">
           {/* Large card */}
-          <div className="col-span-2 h-48 rounded-xl bg-[#111318] border border-white/5 p-4">
+          <div className="col-span-2 h-48 rounded-xl bg-card border border-white/5 p-4">
             <div className="w-24 h-3 rounded bg-white/8 mb-3" />
             <div className="grid grid-cols-4 gap-2 h-32">
               {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="rounded-lg bg-white/[0.02] border border-white/5 p-2">
+                <div key={i} className="rounded-lg bg-white/2 border border-white/5 p-2">
                   <div className="w-full h-2 rounded bg-white/5 mb-2" />
                   <div className="w-3/4 h-6 rounded bg-purple-500/10" />
                 </div>
@@ -229,7 +229,7 @@ function DashboardMockup() {
             </div>
           </div>
           {/* Tall card */}
-          <div className="row-span-2 rounded-xl bg-[#111318] border border-white/5 p-4">
+          <div className="row-span-2 rounded-xl bg-card border border-white/5 p-4">
             <div className="w-20 h-3 rounded bg-white/8 mb-3" />
             {Array.from({ length: 6 }).map((_, i) => (
               <div key={i} className="flex items-center gap-2 mb-2">
@@ -239,11 +239,11 @@ function DashboardMockup() {
             ))}
           </div>
           {/* Bottom row cards */}
-          <div className="h-40 rounded-xl bg-[#111318] border border-white/5 p-4">
+          <div className="h-40 rounded-xl bg-card border border-white/5 p-4">
             <div className="w-16 h-3 rounded bg-white/8 mb-3" />
-            <div className="h-24 rounded bg-gradient-to-t from-blue-500/5 to-transparent" />
+            <div className="h-24 rounded bg-linear-to-t from-blue-500/5 to-transparent" />
           </div>
-          <div className="h-40 rounded-xl bg-[#111318] border border-white/5 p-4">
+          <div className="h-40 rounded-xl bg-card border border-white/5 p-4">
             <div className="w-20 h-3 rounded bg-white/8 mb-3" />
             <div className="flex gap-1 h-24 items-end">
               {Array.from({ length: 12 }).map((_, i) => (
@@ -259,7 +259,7 @@ function DashboardMockup() {
       </div>
 
       {/* Dim overlay to darken the mockup */}
-      <div className="absolute inset-0 bg-[#0a0a0a]/40" />
+      <div className="absolute inset-0 bg-background/40" />
     </div>
   )
 }
@@ -339,12 +339,12 @@ export function MissionLandingPage() {
     : EMPTY_TAB_HEIGHT_PX
 
   return (
-    <div className="min-h-screen bg-[#0a0a0a] relative overflow-hidden">
+    <div className="min-h-screen bg-background relative overflow-hidden">
       {/* Blurred dashboard mockup background — visual curiosity driver */}
       <DashboardMockup />
 
       {/* Header bar */}
-      <div className="relative z-10 flex items-center justify-between px-6 py-4 border-b border-white/5 bg-[#0a0a0a]/60 backdrop-blur-sm">
+      <div className="relative z-10 flex items-center justify-between px-6 py-4 border-b border-white/5 bg-background/60 backdrop-blur-xs">
         <div className="flex items-center gap-3">
           <svg className="w-7 h-7" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="1.5">
             <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
@@ -387,7 +387,7 @@ export function MissionLandingPage() {
         ) : mission ? (
           <div className="w-full max-w-2xl">
             {/* Mission card */}
-            <div className="bg-[#111318]/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl shadow-black/50 overflow-hidden">
+            <div className="bg-card/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl shadow-black/50 overflow-hidden">
               {/* Card header */}
               <div className="p-6 pb-4">
                 <div className="flex items-center gap-2 mb-3">
@@ -445,7 +445,7 @@ export function MissionLandingPage() {
                           activeTab === tab.id
                             ? 'border-purple-500 text-purple-400 bg-purple-500/5'
                             : hasContent
-                              ? 'border-transparent text-white/50 hover:text-white/70 hover:bg-white/[0.02]'
+                              ? 'border-transparent text-white/50 hover:text-white/70 hover:bg-white/2'
                               : 'border-transparent text-white/20 cursor-default'
                         }`}
                         disabled={!hasContent}
@@ -469,7 +469,7 @@ export function MissionLandingPage() {
                   <div className="space-y-2.5">
                     {visibleSteps.map((step, i) => (
                       <div key={i} className="flex items-start gap-3 group">
-                        <div className="flex-shrink-0 w-5 h-5 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center mt-0.5">
+                        <div className="shrink-0 w-5 h-5 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center mt-0.5">
                           <span className="text-2xs font-bold text-purple-400">{i + 1}</span>
                         </div>
                         <div className="flex-1 min-w-0">
@@ -522,7 +522,7 @@ function SectionBadge({ present, label }: { present: boolean; label: string }) {
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 text-2xs rounded-full border ${
       present
         ? 'text-green-400/70 bg-green-500/8 border-green-500/20'
-        : 'text-white/15 bg-white/[0.02] border-white/5'
+        : 'text-white/15 bg-white/2 border-white/5'
     }`}>
       <span className={`w-1.5 h-1.5 rounded-full ${present ? 'bg-green-500/60' : 'bg-white/10'}`} />
       {label}

@@ -1,20 +1,25 @@
+import { startTransition } from 'react'
 import { api, isBackendUnavailable } from '../../lib/api'
 import { reportAgentDataError, reportAgentDataSuccess, isAgentUnavailable } from '../useLocalAgent'
 import { isDemoMode, isNetlifyDeployment, isDemoToken, subscribeDemoMode } from '../../lib/demoMode'
 import { kubectlProxy } from '../../lib/kubectlProxy'
 import { registerCacheReset, triggerAllRefetches } from '../../lib/modeTransition'
 import { resetFailuresForCluster, resetAllCacheFailures } from '../../lib/cache'
+import { hostnameEndsWith, hostnameContainsLabel } from '../../lib/utils/urlHostname'
+import { appendWsAuthToken } from '../../lib/utils/wsAuth'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
 import {
   LOCAL_AGENT_HTTP_URL,
   MCP_HOOK_TIMEOUT_MS,
   METRICS_SERVER_TIMEOUT_MS,
-  STORAGE_KEY_TOKEN,
+  DEFAULT_REFRESH_INTERVAL_MS,
 } from '../../lib/constants'
-import { MCP_PROBE_TIMEOUT_MS, FOCUS_DELAY_MS } from '../../lib/constants/network'
+import { STORAGE_KEY_TOKEN } from '../../lib/constants/storage'
+import { MCP_PROBE_TIMEOUT_MS, FOCUS_DELAY_MS, KUBECTL_MAX_TIMEOUT_MS } from '../../lib/constants/network'
 import type { ClusterInfo, ClusterHealth } from './types'
 
-// Refresh interval for automatic polling (2 minutes) - manual refresh bypasses this
-export const REFRESH_INTERVAL_MS = 120000
+// Re-export canonical constant under the name used by MCP hooks
+export const REFRESH_INTERVAL_MS = DEFAULT_REFRESH_INTERVAL_MS
 
 // Polling intervals for cluster and GPU data freshness
 export const CLUSTER_POLL_INTERVAL_MS = 60000  // 60 seconds
@@ -39,16 +44,56 @@ export const MIN_REFRESH_INDICATOR_MS = 500
 // Re-export for backward compatibility
 export const LOCAL_AGENT_URL = LOCAL_AGENT_HTTP_URL
 
+const AGENT_TOKEN_STORAGE_KEY = 'kc-agent-token'
+const AGENT_TOKEN_FETCH_TIMEOUT_MS = 5000
+
+let agentTokenPromise: Promise<string> | null = null
+
+/**
+ * Lazily fetch the kc-agent token from the backend. The token is cached
+ * in localStorage so subsequent calls (and page reloads) don't re-fetch.
+ */
+function getAgentToken(): Promise<string> {
+  const cached = localStorage.getItem(AGENT_TOKEN_STORAGE_KEY)
+  if (cached) return Promise.resolve(cached)
+
+  if (!agentTokenPromise) {
+    agentTokenPromise = fetch('/api/agent/token', {
+      credentials: 'include',
+      signal: AbortSignal.timeout(AGENT_TOKEN_FETCH_TIMEOUT_MS),
+    })
+      .then(r => r.ok ? r.json() : { token: '' })
+      .then((data: { token?: string }) => {
+        const token = data.token || ''
+        if (token) localStorage.setItem(AGENT_TOKEN_STORAGE_KEY, token)
+        agentTokenPromise = null
+        return token
+      })
+      .catch(() => {
+        agentTokenPromise = null
+        return ''
+      })
+  }
+  return agentTokenPromise
+}
+
 /**
  * Drop-in replacement for `fetch()` that auto-injects the KC_AGENT_TOKEN
  * Authorization header when calling the kc-agent HTTP API. Without this,
  * requests to kc-agent are rejected when KC_AGENT_TOKEN is configured.
  */
-export function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const token = localStorage.getItem(STORAGE_KEY_TOKEN)
+export async function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const token = await getAgentToken()
   const headers = new Headers(init?.headers)
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`)
+  }
+  // #10000 — CSRF defence-in-depth: state-changing requests must carry a
+  // custom header that browsers never attach to cross-origin form POSTs.
+  // The kc-agent requireCSRF middleware rejects POST/PUT/DELETE/PATCH
+  // without this header.
+  if (!headers.has('X-Requested-With')) {
+    headers.set('X-Requested-With', 'XMLHttpRequest')
   }
   // Use caller-provided signal, or fall back to a default timeout
   const signal = init?.signal ?? AbortSignal.timeout(MCP_HOOK_TIMEOUT_MS)
@@ -58,15 +103,57 @@ export function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promis
 // ============================================================================
 // Shared Cluster State - ensures all useClusters() consumers see the same data
 // ============================================================================
+//
+// NOTE (#7865): the cache is internally split into two slices so that heavy
+// cluster-data updates can be wrapped in React.startTransition() (interruptible,
+// yielding to SPA navigation) while small UI-indicator updates stay urgent
+// (so the refresh spinner on the logo reliably paints on → off). See the
+// `dataSubscribers` / `uiSubscribers` split below.
+//
+// The public `ClusterCache` shape is kept as a single merged object so all
+// existing consumers (`useClusters()`, `clusterCache.clusters.find(...)`, etc.)
+// continue to work unchanged.
 export interface ClusterCache {
+  // --- Data slice (heavy; notified inside startTransition) ---
   clusters: ClusterInfo[]
   lastUpdated: Date | null
+  consecutiveFailures: number
+  isFailed: boolean
+  // --- UI slice (tiny; notified urgently, outside startTransition) ---
   isLoading: boolean
   isRefreshing: boolean
   error: string | null
-  consecutiveFailures: number
-  isFailed: boolean
   lastRefresh: Date | null
+}
+
+/** Fields that belong to the heavy data slice. Source of truth for the split. */
+const DATA_FIELDS: ReadonlyArray<keyof ClusterCache> = [
+  'clusters',
+  'lastUpdated',
+  'consecutiveFailures',
+  'isFailed',
+]
+
+/** Fields that belong to the tiny UI-indicator slice. */
+const UI_FIELDS: ReadonlyArray<keyof ClusterCache> = [
+  'isLoading',
+  'isRefreshing',
+  'error',
+  'lastRefresh',
+]
+
+function updatesTouchData(updates: Partial<ClusterCache>): boolean {
+  for (const field of DATA_FIELDS) {
+    if (field in updates) return true
+  }
+  return false
+}
+
+function updatesTouchUI(updates: Partial<ClusterCache>): boolean {
+  for (const field of UI_FIELDS) {
+    if (field in updates) return true
+  }
+  return false
 }
 
 // Cache cluster distribution in localStorage to prevent logo flickering on page load
@@ -143,8 +230,7 @@ function loadClusterCacheFromStorage(): ClusterInfo[] {
     if (stored) {
       const parsed = JSON.parse(stored)
       if (Array.isArray(parsed) && parsed.length > 0) {
-        // Filter out long context-path duplicates from cached data
-        return parsed.filter((c: ClusterInfo) => !c.name.includes('/'))
+        return parsed
       }
     }
   } catch {
@@ -155,9 +241,11 @@ function loadClusterCacheFromStorage(): ClusterInfo[] {
 
 function saveClusterCacheToStorage(clusters: ClusterInfo[]) {
   try {
-    // Only save clusters with meaningful data
-    // Filter out long context-path duplicates before saving
-    const toSave = clusters.filter(c => c.name && !c.name.includes("/")).map(c => ({
+    // Only save clusters with meaningful data.
+    // Filter out clusters whose name contains a slash — these are auto-generated
+    // OpenShift context names (e.g. "default/api-*.openshiftapps.com:6443/kube:admin")
+    // that should not pollute the persistent cache.
+    const toSave = clusters.filter(c => c.name && !c.name.includes('/')).map(c => ({
       name: c.name,
       context: c.context,
       server: c.server,
@@ -248,13 +336,61 @@ export let clusterCache: ClusterCache = {
   lastRefresh: storedClusters.length > 0 ? new Date() : null,
 }
 
-// Subscribers that get notified when cluster data changes
+// Subscribers that get notified when cluster state changes.
+// Split into two sets (#7865):
+//  - dataSubscribers: notified inside React.startTransition(), so navigation
+//    can pre-empt the heavy re-render that a new cluster list triggers.
+//  - uiSubscribers: notified urgently (outside startTransition) so the
+//    refresh-spinner / loading flags always commit and paint immediately.
 type ClusterSubscriber = (cache: ClusterCache) => void
-export const clusterSubscribers = new Set<ClusterSubscriber>()
+export const dataSubscribers = new Set<ClusterSubscriber>()
+export const uiSubscribers = new Set<ClusterSubscriber>()
 
-// Notify all subscribers of state change
+/**
+ * Back-compat alias for the pre-split single subscriber set. Subscribers
+ * added here receive BOTH data and UI updates (same as the old behavior),
+ * but the notification path still honors the split (startTransition for
+ * data, urgent for UI). New code should prefer `dataSubscribers` or
+ * `uiSubscribers` directly, or the `subscribeClusterCache*` helpers below.
+ */
+export const clusterSubscribers: Set<ClusterSubscriber> = new Set<ClusterSubscriber>()
+
+/** Notify only data subscribers, wrapped in startTransition (interruptible). */
+export function notifyClusterDataSubscribers() {
+  const snapshot = clusterCache
+  startTransition(() => {
+    dataSubscribers.forEach(subscriber => subscriber(snapshot))
+  })
+}
+
+/** Notify only UI subscribers, urgently (outside startTransition). */
+export function notifyClusterUISubscribers() {
+  const snapshot = clusterCache
+  uiSubscribers.forEach(subscriber => subscriber(snapshot))
+}
+
+/**
+ * Back-compat: notify every legacy subscriber exactly once. Legacy
+ * subscribers (added to `clusterSubscribers`) receive both data and UI
+ * updates on a single call, so we fire them here — NOT inside
+ * `notifyClusterDataSubscribers` / `notifyClusterUISubscribers`, which
+ * would double-notify them whenever both slices change. Data-subscriber
+ * notification still goes through `startTransition` via the split APIs.
+ *
+ * Used by code paths that mutate the cache directly (not via
+ * updateClusterCache) — see `updateSingleClusterInCache`,
+ * `refreshSingleCluster`, HMR reset, and mode-transition / demo-toggle
+ * handlers.
+ */
 export function notifyClusterSubscribers() {
-  clusterSubscribers.forEach(subscriber => subscriber(clusterCache))
+  const snapshot = clusterCache
+  // Urgent leg — UI subscribers + legacy (merged) subscribers.
+  uiSubscribers.forEach(subscriber => subscriber(snapshot))
+  clusterSubscribers.forEach(subscriber => subscriber(snapshot))
+  // Interruptible leg — only the heavy-data subscribers.
+  startTransition(() => {
+    dataSubscribers.forEach(subscriber => subscriber(snapshot))
+  })
 }
 
 /**
@@ -353,14 +489,20 @@ if (typeof window !== 'undefined') {
   })
 }
 
-// Debounced notification for batching rapid updates (prevents flashing during health checks)
+// Debounced notification for batching rapid updates (prevents flashing during health checks).
+// This path is used by `updateSingleClusterInCache`, which mutates the heavy
+// `clusters` array, so we dispatch to DATA subscribers inside startTransition.
+// Legacy merged subscribers also receive the update (urgent) so the
+// pre-split contract is preserved.
 let notifyTimeout: ReturnType<typeof setTimeout> | null = null
 export function notifyClusterSubscribersDebounced() {
   if (notifyTimeout) {
     clearTimeout(notifyTimeout)
   }
   notifyTimeout = setTimeout(() => {
-    notifyClusterSubscribers()
+    const snapshot = clusterCache
+    clusterSubscribers.forEach(subscriber => subscriber(snapshot))
+    notifyClusterDataSubscribers()
     notifyTimeout = null
   }, CLUSTER_NOTIFY_DEBOUNCE_MS)
 }
@@ -378,7 +520,29 @@ export function updateClusterCache(updates: Partial<ClusterCache>) {
     updateDistributionCache(updates.clusters)
   }
   clusterCache = { ...clusterCache, ...updates }
-  notifyClusterSubscribers()
+
+  // Route notifications based on which slice the updates touch (#7865).
+  // UI fires first (urgent) so spinner on/off commits immediately, then
+  // data fires inside startTransition so navigation can pre-empt the
+  // heavy re-render caused by a new cluster list.
+  const touchesUI = updatesTouchUI(updates)
+  const touchesData = updatesTouchData(updates)
+  if (touchesUI) {
+    notifyClusterUISubscribers()
+  }
+  if (touchesData) {
+    notifyClusterDataSubscribers()
+  }
+  // Legacy merged subscribers are fired exactly once per updateClusterCache
+  // call so the pre-split contract (one notify per update) is preserved.
+  if (touchesUI || touchesData) {
+    const snapshot = clusterCache
+    clusterSubscribers.forEach(subscriber => subscriber(snapshot))
+  } else {
+    // If the updates somehow touch neither slice, fall back to notifying
+    // every subscriber so nothing gets silently dropped.
+    notifyClusterSubscribers()
+  }
 
   // When clusters become available for the first time, reset all cache
   // failures and trigger immediate refetch. This fixes the race condition
@@ -499,12 +663,13 @@ export function deduplicateClustersByServer(clusters: ClusterInfo[]): ClusterInf
 
     // Helper to detect OpenShift-generated long context names
     // These typically look like: "default/api-something.openshiftapps.com:6443/kube:admin"
+    // Use regex anchored to hostname boundaries to avoid substring-bypass (CodeQL #9119).
+    const OPENSHIFT_CONTEXT_RE = /(?:^|\/)(?:[^/]*\.)?openshiftapps\.com(?:[:/]|$)|(?:^|\/)(?:[^/]*\.)?openshift\.com(?:[:/]|$)/
     const isAutoGeneratedName = (name: string): boolean => {
       return name.includes('/api-') ||
              name.includes(':6443/') ||
              name.includes(':443/') ||
-             name.includes('.openshiftapps.com') ||
-             name.includes('.openshift.com') ||
+             OPENSHIFT_CONTEXT_RE.test(name) ||
              (name.includes('/') && name.includes(':') && name.length > AUTO_GENERATED_NAME_LENGTH_THRESHOLD)
     }
 
@@ -693,6 +858,14 @@ export function connectSharedWebSocket() {
     return
   }
 
+  // Playwright nightly runs the built bundle against `vite preview` (port 4173)
+  // with no backend — so /ws has no listener. Firefox's retry behavior on the
+  // failed connection cascades into NS_BINDING_ABORTED on subsequent page.goto
+  // calls. All Playwright/Selenium-class drivers set navigator.webdriver=true.
+  if (typeof navigator !== 'undefined' && navigator.webdriver) {
+    return
+  }
+
   // Set connecting flag FIRST to prevent race conditions (JS is single-threaded but
   // multiple React hook instances can call this in quick succession during initial render)
   if (sharedWebSocket.connecting || sharedWebSocket.ws?.readyState === WebSocket.OPEN) {
@@ -728,7 +901,7 @@ export function connectSharedWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.host}/ws`
 
-    const ws = new WebSocket(wsUrl)
+    const ws = new WebSocket(appendWsAuthToken(wsUrl))
 
     ws.onopen = () => {
       // Guard against race condition where onclose fires before onopen
@@ -738,7 +911,7 @@ export function connectSharedWebSocket() {
         return
       }
       // Send authentication message - backend requires this within 5 seconds
-      const token = localStorage.getItem(STORAGE_KEY_TOKEN)
+      const token = localStorage.getItem(AGENT_TOKEN_STORAGE_KEY)
       if (token) {
         ws.send(JSON.stringify({ type: 'auth', token }))
       } else {
@@ -831,7 +1004,39 @@ if (import.meta.hot) {
       lastRefresh: null,
     }
     clusterSubscribers.clear()
+    dataSubscribers.clear()
+    uiSubscribers.clear()
   })
+}
+
+/** Storage key used by useKagentBackend to persist the preferred backend. */
+const BACKEND_PREF_KEY = 'kc_agent_backend_preference'
+
+/** Read the preferred agent backend from localStorage (non-React). */
+function getPreferredBackend(): string {
+  try {
+    return localStorage.getItem(BACKEND_PREF_KEY) || 'kc-agent'
+  } catch {
+    return 'kc-agent'
+  }
+}
+
+/**
+ * Fetch cluster list from the backend API (/api/mcp/clusters).
+ * This endpoint works independently of kc-agent — it uses the MCP bridge or
+ * direct k8s client, making it the right choice when kagenti/kagent is active. (#9535)
+ */
+async function fetchClusterListFromBackendAPI(): Promise<ClusterInfo[] | null> {
+  try {
+    const { data } = await api.get<{ clusters: ClusterInfo[] }>('/api/mcp/clusters')
+    if (data?.clusters) {
+      reportAgentDataSuccess()
+      return data.clusters
+    }
+  } catch {
+    // Backend API unavailable
+  }
+  return null
 }
 
 // Fetch basic cluster list from local agent (fast, no health check)
@@ -841,6 +1046,14 @@ async function fetchClusterListFromAgent(): Promise<ClusterInfo[] | null> {
   // On localhost, always attempt to reach the agent — it may be running even if
   // AgentManager has not detected it yet.
   if (isNetlifyDeployment) return null
+
+  // When kagenti or kagent is the preferred backend, fetch clusters from the
+  // backend API (/api/mcp/clusters) which works independently of kc-agent.
+  // kc-agent's /clusters endpoint is only available when kc-agent is running. (#9535)
+  const preferred = getPreferredBackend()
+  if (preferred === 'kagenti' || preferred === 'kagent') {
+    return fetchClusterListFromBackendAPI()
+  }
 
   try {
     const controller = new AbortController()
@@ -887,7 +1100,7 @@ const MAX_HEALTH_CHECK_FAILURES = 3
 // Per-cluster failure tracking to prevent transient errors from showing "-"
 // Track first failure timestamp - only mark unreachable after 5 minutes of consecutive failures
 const clusterHealthFailureStart = new Map<string, number>() // timestamp of first failure
-const OFFLINE_THRESHOLD_MS = 5 * 60 * 1000 // 5 minutes before marking as offline
+const OFFLINE_THRESHOLD_MS = 5 * MS_PER_MINUTE // 5 minutes before marking as offline
 
 // Helper to check if cluster has been failing long enough to mark offline
 export function shouldMarkOffline(clusterName: string): boolean {
@@ -942,13 +1155,13 @@ export async function fetchSingleClusterHealth(clusterName: string, kubectlConte
   }
 
   // Fall back to backend API
-  const token = localStorage.getItem(STORAGE_KEY_TOKEN)
+  const agentToken = localStorage.getItem(AGENT_TOKEN_STORAGE_KEY)
   try {
     const response = await fetch(
-      `/api/mcp/clusters/${encodeURIComponent(clusterName)}/health`,
+      `${LOCAL_AGENT_HTTP_URL}/clusters/${encodeURIComponent(clusterName)}/health`,
       {
         signal: AbortSignal.timeout(MCP_HOOK_TIMEOUT_MS),
-        headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+        headers: agentToken ? { 'Authorization': `Bearer ${agentToken}` } : {},
       }
     )
     if (response.ok) {
@@ -986,42 +1199,45 @@ function detectDistributionFromNamespaces(namespaces: string[]): string | undefi
 
 // Helper to detect distribution from server URL (fallback when cluster is unreachable)
 // This allows identifying cluster type even without namespace access
+// Uses parsed hostname checks (not substring matching) to prevent bypass via
+// crafted URLs like evil.com/path?q=eks.amazonaws.com (CodeQL #9119).
 function detectDistributionFromServer(server?: string): string | undefined {
   if (!server) return undefined
-  const lower = server.toLowerCase()
 
-  // OpenShift patterns
-  if (lower.includes('.openshiftapps.com') ||
-      lower.includes('.openshift.com') ||
+  // OpenShift patterns — check parsed hostname, not raw string
+  if (hostnameEndsWith(server, 'openshiftapps.com') ||
+      hostnameEndsWith(server, 'openshift.com') ||
       // IBM FMAAS OpenShift clusters (api.fmaas-*.fmaas.res.ibm.com:6443)
-      (lower.includes('.fmaas.') && lower.includes(':6443')) ||
-      // Generic OpenShift API pattern (api.*.example.com:6443)
-      (lower.match(/^https?:\/\/api\.[^/]+:6443/) && !lower.includes('.eks.') && !lower.includes('.azmk8s.'))) {
+      hostnameContainsLabel(server, 'fmaas') ||
+      // Generic OpenShift API pattern (api.*.example.com:6443) — exclude EKS/AKS
+      (server.match(/^https?:\/\/api\.[^/]+:6443/) &&
+       !hostnameEndsWith(server, 'eks.amazonaws.com') &&
+       !hostnameEndsWith(server, 'azmk8s.io'))) {
     return 'openshift'
   }
 
   // EKS pattern
-  if (lower.includes('.eks.amazonaws.com')) {
+  if (hostnameEndsWith(server, 'eks.amazonaws.com')) {
     return 'eks'
   }
 
   // GKE pattern
-  if (lower.includes('.gke.io') || lower.includes('.container.googleapis.com')) {
+  if (hostnameEndsWith(server, 'gke.io') || hostnameEndsWith(server, 'container.googleapis.com')) {
     return 'gke'
   }
 
   // AKS pattern
-  if (lower.includes('.azmk8s.io') || lower.includes('.hcp.')) {
+  if (hostnameEndsWith(server, 'azmk8s.io') || hostnameContainsLabel(server, 'hcp')) {
     return 'aks'
   }
 
   // OCI OKE pattern
-  if (lower.includes('.oraclecloud.com') || lower.includes('.oci.')) {
+  if (hostnameEndsWith(server, 'oraclecloud.com') || hostnameContainsLabel(server, 'oci')) {
     return 'oci'
   }
 
   // DigitalOcean pattern
-  if (lower.includes('.digitalocean.com') || lower.includes('.k8s.ondigitalocean.')) {
+  if (hostnameEndsWith(server, 'digitalocean.com') || hostnameEndsWith(server, 'k8s.ondigitalocean.com')) {
     return 'digitalocean'
   }
 
@@ -1041,7 +1257,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
     try {
       const response = await kubectlProxy.exec(
         ['get', 'namespaces', '-o', 'jsonpath={.items[*].metadata.name}'],
-        { context: kubectlContext || clusterName, timeout: 45000 }
+        { context: kubectlContext || clusterName, timeout: KUBECTL_MAX_TIMEOUT_MS }
       )
       if (response.exitCode === 0 && response.output) {
         const namespaces = response.output.split(/\s+/).filter(Boolean)
@@ -1060,8 +1276,8 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
     return {}
   }
 
-  const token = localStorage.getItem(STORAGE_KEY_TOKEN)
-  const headers: Record<string, string> = token ? { 'Authorization': `Bearer ${token}` } : {}
+  const agentToken = localStorage.getItem(AGENT_TOKEN_STORAGE_KEY)
+  const headers: Record<string, string> = agentToken ? { 'Authorization': `Bearer ${agentToken}` } : {}
 
   // Helper to extract namespaces from API response
   const extractNamespaces = (items: Array<{ namespace?: string }>): string[] => {
@@ -1073,7 +1289,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
   // Try pods endpoint first
   try {
     const response = await fetch(
-      `/api/mcp/pods?cluster=${encodeURIComponent(clusterName)}&limit=500`,
+      `${LOCAL_AGENT_HTTP_URL}/pods?cluster=${encodeURIComponent(clusterName)}&limit=500`,
       { signal: AbortSignal.timeout(METRICS_SERVER_TIMEOUT_MS), headers }
     )
     if (response.ok) {
@@ -1095,7 +1311,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
   // Fallback: try events endpoint
   try {
     const response = await fetch(
-      `/api/mcp/events?cluster=${encodeURIComponent(clusterName)}&limit=200`,
+      `${LOCAL_AGENT_HTTP_URL}/events?cluster=${encodeURIComponent(clusterName)}&limit=200`,
       { signal: AbortSignal.timeout(METRICS_SERVER_TIMEOUT_MS), headers }
     )
     if (response.ok) {
@@ -1117,7 +1333,7 @@ async function detectClusterDistribution(clusterName: string, kubectlContext?: s
   // Fallback: try deployments endpoint
   try {
     const response = await fetch(
-      `/api/mcp/deployments?cluster=${encodeURIComponent(clusterName)}`,
+      `${LOCAL_AGENT_HTTP_URL}/deployments?cluster=${encodeURIComponent(clusterName)}`,
       { signal: AbortSignal.timeout(METRICS_SERVER_TIMEOUT_MS), headers }
     )
     if (response.ok) {
@@ -1423,13 +1639,16 @@ export async function fullFetchClusters() {
         }
         return newCluster
       })
-      // Deduplicate clusters by server URL - prefers short names when available
-      // but keeps long names (e.g., '/api-pokprod001...' or 'default/api-...') if no short alias exists
-      const dedupedClusters = deduplicateClustersByServer(mergedClusters)
+      // Store the full (raw) cluster list in the cache. Deduplication is
+      // handled lazily by the useClusters() hook's `deduplicatedClusters`
+      // computed property. Premature dedup here was the root cause of
+      // #10316: when many kubeconfig contexts shared server URLs, the
+      // cache only held the dedup winners — hiding legitimate clusters
+      // (including the active kubectl context) from the dashboard.
 
       // Show clusters immediately with preserved health data
       await finishWithMinDuration({
-        clusters: dedupedClusters,
+        clusters: mergedClusters,
         error: null,
         lastUpdated: new Date(),
         isLoading: false,
@@ -1440,9 +1659,10 @@ export async function fullFetchClusters() {
       })
       // Reset flag before returning - allows subsequent refresh calls
       fetchInProgress = false
-      // Check health progressively (non-blocking) - use deduplicated list to avoid
-      // running health checks on long context-path duplicates
-      checkHealthProgressively(dedupedClusters)
+      // Check health on deduplicated clusters to avoid redundant probes
+      // against the same physical server from multiple contexts
+      const healthCheckClusters = deduplicateClustersByServer(mergedClusters)
+      checkHealthProgressively(healthCheckClusters)
       return
     }
 
@@ -1464,7 +1684,7 @@ export async function fullFetchClusters() {
       return
     }
 
-    // Fall back to backend API
+    // Fall back to backend API (/api/mcp/clusters works regardless of agent backend)
     const { data } = await api.get<{ clusters: ClusterInfo[] }>('/api/mcp/clusters')
     // Merge new cluster list with existing cached data (preserve distribution, health, etc.)
     const existingClusters = clusterCache.clusters
@@ -1502,8 +1722,10 @@ export async function fullFetchClusters() {
       lastRefresh: new Date(),
     })
     fetchInProgress = false
-    // Check health progressively (non-blocking) - will update each cluster's data including cpuCores
-    checkHealthProgressively(data.clusters || [])
+    // Check health on deduplicated clusters to avoid redundant probes
+    // against the same physical server from multiple contexts
+    const healthCheckClusters = deduplicateClustersByServer(data.clusters || [])
+    checkHealthProgressively(healthCheckClusters)
   } catch {
     // Always fall back gracefully to demo clusters - never show blocking errors
     // This ensures the UI always has data to display
@@ -1619,10 +1841,24 @@ export const clusterCacheRef = {
   },
 }
 
-// Subscribe to cluster cache changes (for modules that need reactive updates)
+// Subscribe to cluster cache changes (for modules that need reactive updates).
+// Back-compat API: receives BOTH data and UI updates. Prefer the split
+// variants below for new code.
 export function subscribeClusterCache(callback: (cache: ClusterCache) => void): () => void {
   clusterSubscribers.add(callback)
   return () => clusterSubscribers.delete(callback)
+}
+
+/** Subscribe to heavy cluster-data updates only (notifications are interruptible). */
+export function subscribeClusterData(callback: (cache: ClusterCache) => void): () => void {
+  dataSubscribers.add(callback)
+  return () => dataSubscribers.delete(callback)
+}
+
+/** Subscribe to tiny UI-indicator updates only (notifications are urgent). */
+export function subscribeClusterUI(callback: (cache: ClusterCache) => void): () => void {
+  uiSubscribers.add(callback)
+  return () => uiSubscribers.delete(callback)
 }
 
 // Setter functions for module-level state (ES modules can't assign to imported bindings)

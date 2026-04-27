@@ -5,14 +5,22 @@
  *  - #6383 empty-projects filter in extractJSON
  */
 
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect } from 'vitest'
 import {
   isSafeProjectName,
   buildInstallPromptForProject,
   extractJSON,
   mergeProjects,
   PROJECT_NAME_MAX_LENGTH,
+  resetOversizedWarnings,
 } from '../useMissionControl'
+
+// #6788 — Clear module-level singleton between tests to prevent pollution.
+// `oversizedWarnSet` is module-scoped; without this, a test that triggers an
+// oversize warning suppresses the warning in all subsequent tests.
+afterEach(() => {
+  resetOversizedWarnings()
+})
 import type { PayloadProject } from '../types'
 
 const makeProject = (overrides: Partial<PayloadProject>): PayloadProject => ({
@@ -137,6 +145,42 @@ describe('extractJSON — balanced block extraction (#6382)', () => {
   // vitest default timeout (5s) already catches a true infinite loop,
   // so we replace the time gate with structural assertions on the parse
   // result.
+  // #6727 — Malformed fenced block (open fence + large body + no close)
+  // must not trigger catastrophic backtracking in the fence regex. The
+  // old pattern used an unbounded `([\s\S]*?)`, which on this input could
+  // run for seconds. The bounded `{0,MAX_FENCE_BODY}` makes the engine
+  // bail early; we keep a generous wall-clock budget so the assertion
+  // fires only on a genuine regression, not CI jitter.
+  it('does not hang on malformed fenced code blocks (ReDoS guard)', () => {
+    // Generous wall-clock budget for the regex bail-out. If this ever
+    // regresses to the old unbounded pattern, the actual runtime on the
+    // same input was observed at several hundred ms; 2000 ms gives CI
+    // plenty of headroom while still catching a true infinite loop.
+    const REDOS_BUDGET_MS = 2000
+    const payload = '```json\n' + 'a'.repeat(10_000)
+    const start = Date.now()
+    const parsed = extractJSON<unknown>(payload)
+    const elapsed = Date.now() - start
+    // Unparseable — we only care that it returns rather than hanging.
+    expect(parsed).toBeNull()
+    expect(elapsed).toBeLessThan(REDOS_BUDGET_MS)
+  })
+
+  // #6728 — BOM or leading whitespace on the fenced body must not break
+  // JSON.parse. Previously, a BOM-prefixed body fell through to
+  // `candidates` being empty and extractJSON returned null.
+  it('parses a fenced JSON block with a leading BOM', () => {
+    const text = '```json\n\uFEFF{"projects": [{"name": "falco"}]}\n```'
+    const parsed = extractJSON<{ projects: Array<{ name: string }> }>(text, 'projects')
+    expect(parsed?.projects?.[0]?.name).toBe('falco')
+  })
+
+  it('parses a fenced JSON block with surrounding whitespace', () => {
+    const text = '```json\n   \n   {"projects": [{"name": "cert-manager"}]}   \n```'
+    const parsed = extractJSON<{ projects: Array<{ name: string }> }>(text, 'projects')
+    expect(parsed?.projects?.[0]?.name).toBe('cert-manager')
+  })
+
   it('handles heavy nested backslash escaping without losing characters', () => {
     // Construct a JSON string whose `reason` field contains escaped
     // backslashes followed by escaped quotes. In the raw JSON text this
@@ -172,7 +216,7 @@ describe('mergeProjects — user-added preservation (#6465)', () => {
     const merged = mergeProjects(existing, incoming)
     const names = merged.map((p) => p.name).sort()
 
-    // All 3 user-added survive (falco + opa), plus helm (echoed) and
+    // Both user-added projects survive (falco + opa), plus helm (echoed) and
     // argo (new AI suggestion) = 4 total.
     expect(names).toEqual(['argo', 'falco', 'helm', 'opa'])
   })
@@ -207,5 +251,68 @@ describe('mergeProjects — user-added preservation (#6465)', () => {
     const merged = mergeProjects(existing, incoming)
     const names = merged.map((p) => p.name).sort()
     expect(names).toEqual(['cilium', 'falco', 'kyverno', 'opa'])
+  })
+
+  // PR #6574 item C — #6507(A) gated the "keep existing entry verbatim"
+  // branch on `prev.userAdded || prev.category === 'Custom'`, so AI-only
+  // entries (neither flag set) must now ACCEPT incoming AI refinements of
+  // the same name instead of echoing the stale copy. Previously there was
+  // no test for this leg — the fix could silently regress to the old
+  // always-preserve behavior without any red vitest.
+  it('accepts incoming AI refinement of an AI-only project (replaces existing entry)', () => {
+    // Existing state: a single AI-suggested project — not userAdded, not
+    // category:'Custom'. The AI re-asks with an updated version of the
+    // same project (new priority, new category, new notes). The refined
+    // entry must REPLACE the original, not be dropped in favor of it.
+    const existing: PayloadProject[] = [
+      makeProject({
+        name: 'istio',
+        category: 'Service Mesh',
+        priority: 'optional',
+      }),
+    ]
+    const incoming: PayloadProject[] = [
+      makeProject({
+        name: 'istio',
+        category: 'Networking',
+        priority: 'required',
+      }),
+    ]
+
+    const merged = mergeProjects(existing, incoming)
+    expect(merged).toHaveLength(1)
+    // Refinement wins: new category + new priority.
+    expect(merged[0].category).toBe('Networking')
+    expect(merged[0].priority).toBe('required')
+    // And it must NOT have been marked userAdded by the merge itself.
+    expect(merged[0].userAdded).not.toBe(true)
+  })
+
+  it('keeps user-added projects pinned even when AI refines a same-named entry', () => {
+    // Contrast with the test above: same shape, but `userAdded: true`
+    // on the existing entry means the refinement is IGNORED and the
+    // user's version is preserved verbatim.
+    const existing: PayloadProject[] = [
+      makeProject({
+        name: 'istio',
+        category: 'Service Mesh',
+        priority: 'optional',
+        userAdded: true,
+      }),
+    ]
+    const incoming: PayloadProject[] = [
+      makeProject({
+        name: 'istio',
+        category: 'Networking',
+        priority: 'required',
+      }),
+    ]
+
+    const merged = mergeProjects(existing, incoming)
+    expect(merged).toHaveLength(1)
+    // User version wins.
+    expect(merged[0].category).toBe('Service Mesh')
+    expect(merged[0].priority).toBe('optional')
+    expect(merged[0].userAdded).toBe(true)
   })
 })

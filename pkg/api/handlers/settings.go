@@ -4,6 +4,7 @@ import (
 	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/settings"
@@ -34,7 +35,7 @@ func (h *SettingsHandler) requireAdmin(c *fiber.Ctx) error {
 		return nil
 	}
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
 		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
 	}
@@ -84,6 +85,8 @@ func (h *SettingsHandler) SaveSettings(c *fiber.Ctx) error {
 		})
 	}
 
+	audit.Log(c, audit.ActionSaveSettings, "settings", "all")
+
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Settings saved",
@@ -107,6 +110,8 @@ func (h *SettingsHandler) ExportSettings(c *fiber.Ctx) error {
 			"error": "Failed to export settings",
 		})
 	}
+
+	audit.Log(c, audit.ActionExportSettings, "settings", "backup")
 
 	c.Set("Content-Type", "application/json")
 	c.Set("Content-Disposition", "attachment; filename=kc-settings-backup.json")
@@ -137,6 +142,8 @@ func (h *SettingsHandler) ImportSettings(c *fiber.Ctx) error {
 			"message": "invalid settings data",
 		})
 	}
+
+	audit.Log(c, audit.ActionImportSettings, "settings", "backup")
 
 	return c.JSON(fiber.Map{
 		"success": true,

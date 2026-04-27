@@ -4,11 +4,27 @@ import { clusterCacheRef } from './mcp/shared'
 import { kubectlProxy } from '../lib/kubectlProxy'
 import type { DeployStartedPayload, DeployResultPayload, DeployedDep } from '../lib/cardEvents'
 import { LOCAL_AGENT_HTTP_URL, STORAGE_KEY_TOKEN, STORAGE_KEY_MISSIONS_ACTIVE, STORAGE_KEY_MISSIONS_HISTORY } from '../lib/constants'
-import { FETCH_DEFAULT_TIMEOUT_MS, DEPLOY_ABORT_TIMEOUT_MS } from '../lib/constants/network'
+import { FETCH_DEFAULT_TIMEOUT_MS, DEPLOY_ABORT_TIMEOUT_MS, KUBECTL_DEFAULT_TIMEOUT_MS } from '../lib/constants/network'
+import { MS_PER_MINUTE } from '../lib/constants/time'
 
 /** HTTP status codes that indicate authentication/authorization failure */
 const HTTP_UNAUTHORIZED = 401
 const HTTP_FORBIDDEN = 403
+
+/**
+ * #6729 — Safe numeric parse for replica counts coming off a JSON payload.
+ * Raw `Number(x)` returns NaN for strings that don't parse, for objects,
+ * and for `null`, which then silently propagates through comparisons
+ * (`readyReplicas >= replicas` is `false` when either side is NaN) and
+ * leaves deploy missions stuck in "applying". Non-finite and negative
+ * inputs collapse to the fallback (default 0) — a negative replica count
+ * is not a physical state K8s can report.
+ */
+function safeReplicaCount(raw: unknown, fallback = 0): number {
+  const parsed = typeof raw === 'number' ? raw : Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback
+  return parsed
+}
 
 /** Check whether a mission status is terminal (no longer needs active polling) */
 function isTerminalStatus(s: DeployMissionStatus): boolean {
@@ -33,7 +49,7 @@ async function fetchDeployEventsViaProxy(
   const response = await kubectlProxy.exec(
     ['get', 'events', '-n', namespace,
      '--sort-by=.lastTimestamp', '-o', 'json'],
-    { context, timeout: 10000 },
+    { context, timeout: KUBECTL_DEFAULT_TIMEOUT_MS },
   )
   if (response.exitCode !== 0) return []
   interface KubeEvent {
@@ -126,7 +142,7 @@ const MISSIONS_STORAGE_KEY = 'kubestellar-missions'
 const POLL_INTERVAL_MS = 5000
 const MAX_MISSIONS = 50
 /** Cache TTL: 5 minutes — stop polling completed missions after this duration */
-const CACHE_TTL_MS = 5 * 60 * 1000
+const CACHE_TTL_MS = 5 * MS_PER_MINUTE
 /** After this many consecutive HTTP error responses (4xx/5xx) a cluster is marked failed (#6412) */
 const MAX_STATUS_FAILURES = 6
 /**
@@ -151,6 +167,42 @@ const MIN_ACTIVE_MS = 10_000
  * the very error message the user needs.
  */
 const LOG_RECOVERY_EXTRA_POLLS = 3
+/**
+ * #6640 — Max number of concurrent cluster-status HTTP requests across ALL
+ * active missions. Before this cap, a user with N missions × M target
+ * clusters would fire N*M fetches every POLL_INTERVAL_MS, which can DoS
+ * their own backend (especially when agent+REST fallbacks double up). We
+ * keep a generous ceiling — most users will never hit it — but it bounds
+ * the worst case.
+ */
+const DEPLOY_POLL_MAX_CONCURRENCY = 6
+
+/**
+ * Run async tasks with bounded concurrency. Returns results in the same
+ * order as `tasks`. Used by the deploy poller to cap in-flight HTTP
+ * requests across all missions × clusters. Kept inline to avoid adding a
+ * p-limit dependency for one caller.
+ */
+async function runWithConcurrency<T>(
+  tasks: ReadonlyArray<() => Promise<T>>,
+  limit: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length)
+  let nextIndex = 0
+  const workerCount = Math.max(1, Math.min(limit, tasks.length))
+  const workers: Promise<void>[] = []
+  for (let w = 0; w < workerCount; w++) {
+    workers.push((async () => {
+      while (true) {
+        const i = nextIndex++
+        if (i >= tasks.length) return
+        results[i] = await tasks[i]()
+      }
+    })())
+  }
+  await Promise.all(workers)
+  return results
+}
 
 function loadMissions(): DeployMission[] {
   try {
@@ -252,12 +304,53 @@ export function useDeployMissions() {
 
   // Poll deploy status for missions using ref to avoid re-render loop
   useEffect(() => {
+    // #7307 — Guard against concurrent poll() calls. The grace-period repoll
+    // timeout can fire while a regular setInterval poll is already running,
+    // causing two concurrent bursts that exceed DEPLOY_POLL_MAX_CONCURRENCY.
+    let pollInProgress = false
+
     const poll = async () => {
+      if (pollInProgress) return
+      pollInProgress = true
+      try {
+        await pollInner()
+      } finally {
+        pollInProgress = false
+      }
+    }
+    const pollInner = async () => {
       const current = missionsRef.current
       if (current.length === 0) return
+      // #7142 — If every mission is already terminal, skip the poll and
+      // Stop the interval when all missions are terminal AND none need
+      // log recovery. Previously this exited before the per-mission recovery
+      // logic could run, breaking log recovery for completed missions (#7343).
+      const allTerminal = current.every(m => isTerminalStatus(m.status))
+      const anyNeedsRecovery = allTerminal && current.some(m => {
+        if (!m.completedAt || (Date.now() - m.completedAt) <= CACHE_TTL_MS) return false
+        const hasAnyLogs = m.clusterStatuses.some(cs => cs.logs && cs.logs.length > 0)
+        const recoveryPolls = m.logRecoveryPolls ?? 0
+        // Still needs recovery if: has logs but under budget, OR has no logs at all
+        return !hasAnyLogs || recoveryPolls < LOG_RECOVERY_EXTRA_POLLS
+      })
+      if (allTerminal && !anyNeedsRecovery) {
+        if (pollRef.current) {
+          clearInterval(pollRef.current)
+          pollRef.current = undefined
+        }
+        return
+      }
 
-      const updated = await Promise.all(
-        current.map(async (mission) => {
+      // #6640 — Serialize missions and cap per-mission cluster concurrency
+      // via `runWithConcurrency`. Previously this was
+      // `Promise.all(current.map(... Promise.all(clusters.map(...))))`, which
+      // fires N_missions × N_clusters fetches simultaneously every poll
+      // cycle and can DoS the user's own backend under load. Missions are
+      // processed sequentially; clusters within a mission are capped at
+      // DEPLOY_POLL_MAX_CONCURRENCY in-flight at a time.
+      const updated: DeployMission[] = []
+      for (const mission of current) {
+        updated.push(await (async () => {
           const isCompleted = isTerminalStatus(mission.status)
           // #6415 — Track whether this poll cycle is "within the log-recovery
           // grace window". When true, we allow the normal poll body to run
@@ -284,8 +377,10 @@ export function useDeployMissions() {
 
           const pollCount = (mission.pollCount ?? 0) + 1
 
-          const statuses = await Promise.all(
-            mission.targetClusters.map(async (cluster): Promise<DeployClusterStatus> => {
+          // #6640 — Bounded concurrency over clusters. Each cluster task is
+          // wrapped in a thunk so runWithConcurrency can schedule them.
+          const clusterTasks: Array<() => Promise<DeployClusterStatus>> =
+            mission.targetClusters.map((cluster) => async (): Promise<DeployClusterStatus> => {
               // Track consecutive failures from previous poll cycle
               const prevStatus = mission.clusterStatuses.find(cs => cs.cluster === cluster)
               const prevFailures = prevStatus?.consecutiveFailures ?? 0
@@ -339,36 +434,56 @@ export function useDeployMissions() {
                     const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/deployments?${params}`, {
                       signal: ctrl.signal,
                       headers: { Accept: 'application/json' } })
-                    if (res.ok) {
-                      const data = await res.json()
-                      const deployments = (data.deployments || []) as Array<Record<string, unknown>>
-                      const match = deployments.find(
-                        (d) => String(d.name) === mission.workload
-                      )
-                      if (match) {
-                        const replicas = Number(match.replicas ?? 0)
-                        const readyReplicas = Number(match.readyReplicas ?? 0)
-                        let status: DeployClusterStatus['status'] = 'applying'
-                        // Zero-replica workloads are valid (e.g. scale-to-zero) — treat
-                        // readyReplicas >= replicas as success even when both are zero.
-                        if (readyReplicas >= replicas) {
-                          status = 'running'
-                        } else if (String(match.status) === 'failed') {
-                          status = 'failed'
-                        }
-                        // Fetch K8s events via kubectlProxy
-                        let logs: string[] | undefined
-                        try {
-                          logs = await fetchDeployEventsViaProxy(
-                            clusterInfo.context || cluster, mission.namespace, mission.workload,
-                          )
-                          if (logs.length === 0) logs = undefined
-                        } catch { /* non-critical */ }
-                        return { cluster, status, replicas, readyReplicas, logs }
-                      }
-                      // Workload not found on this cluster yet — still pending (or failed after threshold)
+                    // #6816 — If the agent returns a non-OK response (4xx/5xx
+                    // or a proxy HTML error page), count it as a failure
+                    // instead of silently falling through to the REST path.
+                    // Without this guard, res.json() on an HTML body throws
+                    // SyntaxError and the agent failure is invisible to the
+                    // consecutive-failure counter.
+                    if (!res.ok) {
                       return pendingOrFailed()
                     }
+                    // #7141 — Guard against non-JSON responses (e.g. HTML error
+                    // pages from reverse proxies returning 200). Without this,
+                    // res.json() throws SyntaxError and the failure is invisible.
+                    let data: Record<string, unknown>
+                    try {
+                      data = await res.json()
+                    } catch {
+                      return pendingOrFailed()
+                    }
+                    const deployments = (data.deployments || []) as Array<Record<string, unknown>>
+                    const match = deployments.find(
+                      (d) => String(d.name) === mission.workload
+                    )
+                    if (match) {
+                      // #6729 — Safe numeric cast. `Number('foo')` returns
+                      // NaN, which then flows into comparisons like
+                      // `readyReplicas >= replicas` and silently evaluates
+                      // to `false`, leaving missions stuck in "applying".
+                      // Fall back to 0 for non-finite values.
+                      const replicas = safeReplicaCount(match.replicas)
+                      const readyReplicas = safeReplicaCount(match.readyReplicas)
+                      let status: DeployClusterStatus['status'] = 'applying'
+                      // Zero-replica workloads are valid (e.g. scale-to-zero) — treat
+                      // readyReplicas >= replicas as success even when both are zero.
+                      if (readyReplicas >= replicas) {
+                        status = 'running'
+                      } else if (String(match.status) === 'failed') {
+                        status = 'failed'
+                      }
+                      // Fetch K8s events via kubectlProxy
+                      let logs: string[] | undefined
+                      try {
+                        logs = await fetchDeployEventsViaProxy(
+                          clusterInfo.context || cluster, mission.namespace, mission.workload,
+                        )
+                        if (logs.length === 0) logs = undefined
+                      } catch { /* non-critical */ }
+                      return { cluster, status, replicas, readyReplicas, logs }
+                    }
+                    // Workload not found on this cluster yet — still pending (or failed after threshold)
+                    return pendingOrFailed()
                   } finally {
                     // Always clear the abort timer to prevent leak on fetch failure (#5498)
                     clearTimeout(tid)
@@ -433,7 +548,27 @@ export function useDeployMissions() {
                       logs: [logLine],
                     }
                   }
-                  return pendingOrFailed()
+                  // #6666 — Previously a sustained non-auth error (HTTP 500,
+                  // 502, 503, 504, etc.) would silently downgrade the mission
+                  // to `failed` after MAX_STATUS_FAILURES poll cycles with no
+                  // indication of why. Surface the HTTP status AND a short
+                  // response body excerpt in the cluster logs so operators
+                  // can see that the backend itself is returning errors and
+                  // distinguish "backend down" from "workload missing".
+                  let errBody = ''
+                  try {
+                    if (typeof (res as Response).clone === 'function') {
+                      errBody = (await (res as Response).clone().text()).slice(0, 200)
+                    } else if (typeof (res as Response).text === 'function') {
+                      errBody = (await (res as Response).text()).slice(0, 200)
+                    }
+                  } catch { /* body already consumed or unreadable */ }
+                  const pf = pendingOrFailed()
+                  const logLine = `Backend error HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}${errBody ? `: ${errBody}` : ''} (#6666)`
+                  return {
+                    ...pf,
+                    logs: pf.logs ? [...pf.logs, logLine] : [logLine],
+                  }
                 }
                 const data = await res.json()
                 // #5958 — If the workload no longer exists on the target cluster,
@@ -446,15 +581,20 @@ export function useDeployMissions() {
                   }
                 }
                 let status: DeployClusterStatus['status'] = 'applying'
-                const restReplicas = Number(data.replicas ?? 0)
-                const restReady = Number(data.readyReplicas ?? 0)
+                // #6729 — Safe numeric casts. See safeReplicaCount for the
+                // rationale. The REST path is the more common one in
+                // production and was the original symptom on #6729.
+                const restReplicas = safeReplicaCount(data.replicas)
+                const restReady = safeReplicaCount(data.readyReplicas)
                 // #5955 — Require updatedReplicas >= replicas so a partial rollout
                 // is not marked "running" just because availableReplicas reached desired.
                 // When the backend doesn't include updatedReplicas (older servers
                 // or tests), fall back to restReplicas so existing callers keep
                 // working. `undefined` means "don't enforce the check".
                 const restUpdatedRaw = data.updatedReplicas
-                const restUpdated = restUpdatedRaw === undefined ? restReplicas : Number(restUpdatedRaw)
+                const restUpdated = restUpdatedRaw === undefined
+                  ? restReplicas
+                  : safeReplicaCount(restUpdatedRaw)
                 // Zero-replica workloads are valid — treat readyReplicas >= replicas
                 // as success even when both are zero.
                 if (data.status === 'Running' && restReady >= restReplicas && restUpdated >= restReplicas) {
@@ -501,7 +641,7 @@ export function useDeployMissions() {
                 return networkPending()
               }
             })
-          )
+          const statuses = await runWithConcurrency(clusterTasks, DEPLOY_POLL_MAX_CONCURRENCY)
 
           // Determine overall mission status
           const allRunning = statuses.every(s => s.status === 'running')
@@ -564,8 +704,8 @@ export function useDeployMissions() {
             logRecoveryPolls: inRecoveryWindow
               ? (mission.logRecoveryPolls ?? 0) + 1
               : mission.logRecoveryPolls }
-        })
-      )
+        })())
+      }
 
       // Sort: active missions first (newest first), completed missions below (newest first).
       // #6411 — Add a deterministic tiebreaker on mission id. Without it,
@@ -581,14 +721,69 @@ export function useDeployMissions() {
         return (bKey - aKey) || a.id.localeCompare(b.id)
       })
 
-      setMissions([...active, ...completed])
-    }
+      const allMissions = [...active, ...completed]
+      setMissions(allMissions)
 
-    // Poll on interval (first poll after 1s delay, then every POLL_INTERVAL_MS)
-    const initialTimeout = setTimeout(() => {
-      poll()
+      // #6840 — If every mission is in a terminal state, stop polling to
+      // avoid wasting network and compute on completed deployments.
+      if (allMissions.length > 0 && allMissions.every(m => isTerminalStatus(m.status))) {
+        if (pollRef.current) {
+          clearInterval(pollRef.current)
+          pollRef.current = undefined
+        }
+      }
+    } // end pollInner
+
+    // Delay before the first poll fires after mount. Kept small so the UI
+    // updates quickly, but non-zero so the subscribe effect above has a
+    // chance to populate `missionsRef` before the first fetch.
+    const INITIAL_POLL_DELAY_MS = 1000
+    // Poll on interval (first poll after INITIAL_POLL_DELAY_MS, then every
+    // POLL_INTERVAL_MS) — but only while the tab is visible (#6641).
+    // #7159 — Always clear any existing interval before starting a new one.
+    // The old code checked `if (pollRef.current) return` which prevented
+    // double-start, but the visibility-change handler could call startPolling
+    // after stopPolling in rapid succession, and if a race between the
+    // clearInterval and setInterval occurred, the old handle would be
+    // abandoned (leaked), compounding polling frequency exponentially.
+    const startPolling = () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+      }
       pollRef.current = setInterval(poll, POLL_INTERVAL_MS)
-    }, 1000)
+    }
+    const stopPolling = () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = undefined
+      }
+    }
+    const initialTimeout = setTimeout(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        // Tab started hidden — wait for visibilitychange to start polling.
+        return
+      }
+      poll()
+      startPolling()
+    }, INITIAL_POLL_DELAY_MS)
+
+    // #6641 — Page Visibility integration. When the tab is hidden, tear
+    // down the interval so background timers don't queue up (some browsers
+    // throttle but still accumulate ticks, and resuming the tab then
+    // dumps a burst of deferred poll() calls on the backend). On resume,
+    // fire one immediate poll to catch up, then restart the interval.
+    const onVisibilityChange = () => {
+      if (typeof document === 'undefined') return
+      if (document.visibilityState === 'hidden') {
+        stopPolling()
+      } else {
+        poll()
+        startPolling()
+      }
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    }
 
     // issue 6427 — Snapshot the grace-repoll map reference inside the
     // effect body so the cleanup closure uses a captured handle rather
@@ -596,6 +791,9 @@ export function useDeployMissions() {
     const graceRepolls = graceRepollsRef.current
     return () => {
       clearTimeout(initialTimeout)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange)
+      }
       if (pollRef.current) clearInterval(pollRef.current)
       // Cancel any outstanding grace-window re-polls so they don't fire
       // on an unmounted hook and call setMissions on a dead tree.

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { CheckCircle, WifiOff, Cpu, Loader2, ExternalLink, AlertTriangle, KeyRound } from 'lucide-react'
+import { CheckCircle, WifiOff, Cpu, Loader2, ExternalLink, AlertTriangle, KeyRound, Server } from 'lucide-react'
 import { RefreshIndicator } from '../ui/RefreshIndicator'
 import { useClusters, ClusterInfo } from '../../hooks/useMCP'
 import { useCachedGPUNodes } from '../../hooks/useCachedData'
@@ -15,6 +15,7 @@ import { StatusBadge } from '../ui/StatusBadge'
 import { useCardLoadingState } from './CardDataContext'
 import { useTranslation } from 'react-i18next'
 import { useDemoMode } from '../../hooks/useDemoMode'
+import { useFederationAwareness, getProviderLabel as getFederationProviderLabel, getStateLabel, getStateColorClasses, type FederatedCluster } from '../../hooks/useFederation'
 
 // Console URL generation for cloud providers
 function getConsoleUrl(provider: CloudProvider, clusterName: string, apiServerUrl?: string): string | null {
@@ -91,6 +92,7 @@ export function ClusterHealth() {
   const { isMobile } = useMobile()
   const { isDemoMode } = useDemoMode()
   const [selectedCluster, setSelectedCluster] = useState<string | null>(null)
+  const federation = useFederationAwareness()
 
   // Use shared card data hook for filtering, sorting, and pagination
   const {
@@ -184,7 +186,7 @@ export function ClusterHealth() {
     return (
       <div className="h-full flex flex-col min-h-card">
         {/* Header skeleton */}
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <div className="flex items-center gap-2">
             <Skeleton variant="circular" width={16} height={16} />
             <Skeleton variant="text" width={80} height={16} />
@@ -216,7 +218,7 @@ export function ClusterHealth() {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           <StatusBadge color="purple" title={t('clusterHealth.totalClustersTitle', { count: rawClusters.length })}>
             {rawClusters.length} {t('clusterHealth.clustersLabel')}
@@ -264,7 +266,7 @@ export function ClusterHealth() {
       />
 
       {/* Stats */}
-      <div className="grid grid-cols-4 gap-2 mb-4">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-4">
         <div className="p-3 rounded-lg bg-green-500/10 border border-green-500/20 min-w-0 overflow-hidden" title={t('clusterHealth.healthyTooltip', { count: healthyClusters })}>
           <div className="flex items-center gap-1.5 mb-1 min-w-0">
             <CheckCircle className="w-4 h-4 text-green-400 shrink-0" />
@@ -293,6 +295,26 @@ export function ClusterHealth() {
           </div>
           <span className="text-2xl font-bold text-foreground">{networkOfflineClusters}</span>
         </div>
+        {(federation.hubs || []).filter(h => h.detected).map(hub => {
+          const hubClusters = (federation.clusters || []).filter(
+            fc => fc.provider === hub.provider && fc.hubContext === hub.hubContext
+          )
+          const joinedCount = hubClusters.filter(fc => fc.state === 'joined' || fc.state === 'provisioned').length
+          return (
+            <div
+              key={`${hub.provider}-${hub.hubContext}`}
+              className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/20 min-w-0 overflow-hidden"
+              title={`${getFederationProviderLabel(hub.provider)} hub: ${hub.hubContext} — ${joinedCount}/${hubClusters.length} clusters active`}
+            >
+              <div className="flex items-center gap-1.5 mb-1 min-w-0">
+                <Server className="w-4 h-4 text-blue-400 shrink-0" />
+                <span className="text-xs text-blue-400 truncate">{getFederationProviderLabel(hub.provider)}</span>
+              </div>
+              <span className="text-2xl font-bold text-foreground">{hubClusters.length}</span>
+              <span className="text-xs text-muted-foreground ml-1">{t('clusterHealth.clustersLabel').toLowerCase()}</span>
+            </div>
+          )
+        })}
       </div>
 
       {/* Cluster list */}
@@ -321,7 +343,7 @@ export function ClusterHealth() {
             <div
               key={cluster.name}
               data-tour={idx === 0 ? 'drilldown' : undefined}
-              className={`group ${isMobile ? 'flex flex-col gap-1.5' : 'flex items-center justify-between'} p-2 rounded-lg border border-border/30 bg-secondary/30 transition-all cursor-pointer hover:bg-secondary/50 hover:border-border/50 min-w-0 overflow-hidden`}
+              className={`group ${isMobile ? 'flex flex-col gap-1.5' : 'flex flex-wrap items-center justify-between gap-y-2'} p-2 rounded-lg border border-border/30 bg-secondary/30 transition-all cursor-pointer hover:bg-secondary/50 hover:border-border/50 min-w-0 overflow-hidden`}
               onClick={() => setSelectedCluster(cluster.name)}
               title={t('clusterHealth.clickViewDetails', { name: cluster.name })}
             >
@@ -342,6 +364,21 @@ export function ClusterHealth() {
                   <CloudProviderIcon provider={provider} size={14} />
                 </span>
                 <span className="text-sm text-foreground truncate">{cluster.name}</span>
+                {(() => {
+                  const pills = (federation.clusters || []).filter(
+                    (fc: FederatedCluster) => fc.name === cluster.name || (cluster.server && fc.apiServerURL === cluster.server)
+                  )
+                  if (pills.length === 0) return null
+                  return pills.map((fc: FederatedCluster) => (
+                    <span
+                      key={`${fc.provider}-${fc.hubContext}`}
+                      className={`inline-flex items-center gap-0.5 text-2xs px-1.5 py-0.5 rounded border shrink-0 ${getStateColorClasses(fc.state)}`}
+                      title={`${getFederationProviderLabel(fc.provider)} [${fc.hubContext}]: ${getStateLabel(fc.state)}`}
+                    >
+                      {getFederationProviderLabel(fc.provider)}:{getStateLabel(fc.state)}
+                    </span>
+                  ))
+                })()}
                 {/* Warn when cluster is internally reachable but API server is externally unreachable (#4202) */}
                 {!clusterUnreachable && !clusterLoading && cluster.externallyReachable === false && (
                   <span
@@ -349,7 +386,7 @@ export function ClusterHealth() {
                     title="API server externally unreachable — cluster healthy internally but external access may be blocked"
                   >
                     <WifiOff className="w-3 h-3" />
-                    <span className="hidden sm:inline">ext. unreachable</span>
+                    <span className="hidden @sm:inline">ext. unreachable</span>
                   </span>
                 )}
                 {consoleUrl && (

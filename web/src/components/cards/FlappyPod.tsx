@@ -234,7 +234,7 @@ export function FlappyPod(_props: CardComponentProps) {
   return (
     <div ref={gameContainerRef} className="h-full flex flex-col p-2 select-none">
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-3 text-xs">
           <div className="text-center">
             <div className="text-muted-foreground">Score</div>
@@ -250,6 +250,7 @@ export function FlappyPod(_props: CardComponentProps) {
           onClick={startGame}
           className="p-1.5 rounded hover:bg-secondary"
           title="New Game"
+          aria-label="New Game"
         >
           <RotateCcw className="w-4 h-4" />
         </button>

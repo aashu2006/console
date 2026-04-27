@@ -1,6 +1,9 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useClusters } from '../../hooks/useMCP'
+// Shared two-click delete-confirm window (also used by ResolutionHistoryPanel)
+// — keep a single source of truth for delete-confirm timing (#7935).
+import { DELETE_CONFIRM_TIMEOUT_MS } from '../../lib/constants/network'
 
 interface MaintenanceWindow {
   id: string
@@ -35,7 +38,7 @@ function saveWindows(windows: MaintenanceWindow[]) {
 }
 
 export function MaintenanceWindows() {
-  const { t } = useTranslation()
+  const { t } = useTranslation(['common', 'cards'])
   const { clusters } = useClusters()
   const [windows, setWindows] = useState<MaintenanceWindow[]>(loadWindows)
   const [showForm, setShowForm] = useState(false)
@@ -94,10 +97,44 @@ export function MaintenanceWindows() {
     setFormData({ cluster: '', description: '', startTime: '', endTime: '', type: 'maintenance' })
   }
 
+  // Two-click delete: first click shows "Confirm?", second click deletes.
+  // Prevents accidental loss of scheduled maintenance windows (#7932).
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const deleteTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null)
+  useEffect(() => () => clearTimeout(deleteTimerRef.current), [])
+
+  // Outside-click cancels the pending-confirm state, matching the PR #7934
+  // test-plan promise that clicking away resets the confirm pill (#7935).
+  useEffect(() => {
+    if (!pendingDeleteId) return
+    const onPointerDown = (e: PointerEvent) => {
+      const btn = confirmButtonRef.current
+      if (btn && e.target instanceof Node && btn.contains(e.target)) return
+      clearTimeout(deleteTimerRef.current)
+      setPendingDeleteId(null)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [pendingDeleteId])
+
   const handleDelete = (id: string) => {
-    const updated = windows.filter(w => w.id !== id)
-    setWindows(updated)
-    saveWindows(updated)
+    if (pendingDeleteId === id) {
+      // Second click — confirmed
+      clearTimeout(deleteTimerRef.current)
+      setPendingDeleteId(null)
+      const updated = windows.filter(w => w.id !== id)
+      setWindows(updated)
+      saveWindows(updated)
+    } else {
+      // First click — enter confirm state with auto-reset
+      setPendingDeleteId(id)
+      clearTimeout(deleteTimerRef.current)
+      deleteTimerRef.current = setTimeout(
+        () => setPendingDeleteId(prev => prev === id ? null : prev),
+        DELETE_CONFIRM_TIMEOUT_MS
+      )
+    }
   }
 
   const typeColors: Record<string, string> = {
@@ -113,7 +150,7 @@ export function MaintenanceWindows() {
 
   return (
     <div className="space-y-2 p-1">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <span className="text-xs text-muted-foreground">{displayWindows.filter(w => w.status !== 'completed').length} upcoming</span>
         <button
           onClick={() => { setShowForm(!showForm); setTimeError('') }}
@@ -129,7 +166,7 @@ export function MaintenanceWindows() {
             <select
               value={formData.cluster}
               onChange={e => setFormData(f => ({ ...f, cluster: e.target.value }))}
-              className="w-full px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-none focus:ring-1 focus:ring-primary"
+              className="w-full px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               <option value="">{t('common.selectCluster')}</option>
               {clusterNames.map(name => (
@@ -142,7 +179,7 @@ export function MaintenanceWindows() {
               placeholder="Cluster name"
               value={formData.cluster}
               onChange={e => setFormData(f => ({ ...f, cluster: e.target.value }))}
-              className="w-full px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-none focus:ring-1 focus:ring-primary"
+              className="w-full px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
           )}
           <input
@@ -150,30 +187,30 @@ export function MaintenanceWindows() {
             placeholder="Description"
             value={formData.description}
             onChange={e => setFormData(f => ({ ...f, description: e.target.value }))}
-            className="w-full px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-full px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
           />
           <div className="flex gap-2">
             <input
               type="datetime-local"
               value={formData.startTime}
               onChange={e => setFormData(f => ({ ...f, startTime: e.target.value }))}
-              className="flex-1 px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-none focus:ring-1 focus:ring-primary"
+              className="flex-1 px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
             <input
               type="datetime-local"
               value={formData.endTime}
               onChange={e => setFormData(f => ({ ...f, endTime: e.target.value }))}
-              className="flex-1 px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-none focus:ring-1 focus:ring-primary"
+              className="flex-1 px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
           </div>
           {timeError && (
             <p className="text-xs text-red-400">{timeError}</p>
           )}
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <select
               value={formData.type}
               onChange={e => setFormData(f => ({ ...f, type: e.target.value as MaintenanceWindow['type'] }))}
-              className="px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-none focus:ring-1 focus:ring-primary"
+              className="px-2 py-1 text-xs rounded bg-background border border-border/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               <option value="maintenance">{t('common.maintenance')}</option>
               <option value="upgrade">{t('common.upgrade')}</option>
@@ -194,7 +231,7 @@ export function MaintenanceWindows() {
           </div>
         ) : (
           displayWindows.map(w => (
-            <div key={w.id} className="flex items-center justify-between px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors group">
+            <div key={w.id} className="flex flex-wrap items-center justify-between gap-y-2 px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors group">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
                   <span className={`text-xs px-1.5 py-0.5 rounded ${statusColors[w.status]}`}>{w.status}</span>
@@ -207,10 +244,25 @@ export function MaintenanceWindows() {
                 </div>
               </div>
               <button
+                ref={pendingDeleteId === w.id ? confirmButtonRef : undefined}
                 onClick={() => handleDelete(w.id)}
-                className="opacity-0 group-hover:opacity-100 text-xs text-red-400 hover:text-red-300 px-1 transition-opacity"
+                title={pendingDeleteId === w.id
+                  ? t('cards:maintenanceWindows.clickAgainToConfirm')
+                  : t('cards:maintenanceWindows.deleteTitle')}
+                aria-label={pendingDeleteId === w.id
+                  ? t('cards:maintenanceWindows.confirmDeleteAria')
+                  : t('cards:maintenanceWindows.deleteAria')}
+                // Keyboard users need the button visible when focused — the
+                // opacity-0 default hides it (and its focus ring) entirely
+                // without a pointer hover (#7935). group-focus-within and
+                // focus-visible reveal it for keyboard/assistive tech.
+                className={
+                  pendingDeleteId === w.id
+                    ? 'opacity-100 text-xs font-medium text-red-500 hover:text-red-400 px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/40 transition-opacity'
+                    : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-red-400 text-xs text-red-400 hover:text-red-300 px-1 rounded transition-opacity'
+                }
               >
-                ✕
+                {pendingDeleteId === w.id ? t('cards:maintenanceWindows.confirmLabel') : '✕'}
               </button>
             </div>
           ))

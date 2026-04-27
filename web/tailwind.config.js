@@ -1,3 +1,5 @@
+import containerQueries from '@tailwindcss/container-queries'
+
 /** @type {import('tailwindcss').Config} */
 export default {
   content: [
@@ -6,8 +8,34 @@ export default {
     "./.storybook/**/*.{ts,tsx}",
   ],
   darkMode: 'class',
+  // Safelist dynamic severity color classes built at runtime via template strings
+  // (e.g. bg-${color}-500/10, border-${color}-500/50, text-${color}-400)
+  safelist: [
+    { pattern: /^bg-(red|orange|blue|green|yellow|purple)-500\/\d+$/ },
+    { pattern: /^border-(red|orange|blue|green|yellow|purple)-500\/\d+$/ },
+    { pattern: /^text-(red|orange|blue|green|yellow|purple)-400$/ },
+    { pattern: /^bg-(red|orange|blue|green|yellow|purple)-500\/\d+$/, variants: ['hover'] },
+    { pattern: /^border-(red|orange|blue|green|yellow|purple)-500\/\d+$/, variants: ['hover'] },
+    { pattern: /^text-(red|orange|blue|green|yellow|purple)-400$/, variants: ['hover'] },
+  ],
   theme: {
     extend: {
+      /**
+       * Container query breakpoint tokens for card-width-responsive layouts.
+       * Cards use @container queries instead of viewport breakpoints so they
+       * respond to their own width (which shrinks when panels expand).
+       *
+       * @xs  (<300px)  — stack vertically, hide non-essential controls
+       * @sm  (300px+)  — two-row wrapped layout
+       * @md  (450px+)  — relaxed wrapping
+       * @lg  (600px+)  — single-row layout (full width)
+       */
+      containers: {
+        xs: '300px',
+        sm: '300px',
+        md: '450px',
+        lg: '600px',
+      },
       fontSize: {
         '2xs': ['10px', { lineHeight: '14px' }],
       },
@@ -47,6 +75,14 @@ export default {
          * Usage: text-status-success, bg-status-error, border-status-warning
          * Note: opacity modifiers (e.g., /20) are not supported with var() values.
          */
+        /** LinkedIn brand blue (#0A66C2) — used for LinkedIn share buttons */
+        linkedin: {
+          DEFAULT: '#0A66C2',
+          dark: '#004182',
+        },
+        /** Near-black backgrounds for terminal/console UIs */
+        terminal: '#0d0d0d',
+        'near-black': '#0a0a0a',
         status: {
           success: "var(--color-success)",
           warning: "var(--color-warning)",
@@ -55,15 +91,24 @@ export default {
           neutral: "var(--color-neutral)",
           pending: "var(--color-pending)",
         },
+        linkedin: {
+          DEFAULT: '#0A66C2',
+          dark: '#004182',
+        },
+        terminal: '#0d0d0d',
+        'glass-overlay': 'rgba(10,15,25,0.98)',
       },
       /**
        * Z-Index Scale — semantic layers for global stacking.
        * Use these instead of arbitrary z-[N] values on fixed/sticky elements.
        *
        * z-dropdown (100) — Popovers, dropdowns, tooltips, floating panels
+       * z-sidebar  (150) — Docked sidebars (desktop mission sidebar, left nav)
        * z-sticky   (200) — Sticky headers, floating action buttons
+       * z-floating (250) — Portaled floating menus that must sit above sticky headers
+       *                    but below non-modal overlays (e.g. agent selector dropdown)
        * z-overlay  (300) — Non-modal backdrops (mobile sidebar, notification dimmer)
-       * z-modal    (400) — All modals and dialogs
+       * z-modal    (400) — All modals and dialogs (mobile mission sheet, MissionBrowser)
        * z-toast    (500) — Toast notifications (always on top of modals)
        * z-critical (600) — Confirmation dialogs stacked on top of modals
        *
@@ -71,7 +116,9 @@ export default {
        */
       zIndex: {
         dropdown: '100',
+        sidebar: '150',
         sticky: '200',
+        floating: '250',
         overlay: '300',
         modal: '400',
         toast: '500',
@@ -132,5 +179,5 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [containerQueries],
 }

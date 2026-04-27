@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
-import { Database, ExternalLink, AlertCircle } from 'lucide-react'
+import { Database, AlertCircle } from 'lucide-react'
 import { BaseModal, useModalState } from '../../lib/modals'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
-import { useClusters, usePVCs, PVC } from '../../hooks/useMCP'
+import { useClusters } from '../../hooks/useMCP'
+import type { PVC } from '../../hooks/useMCP'
+import { useCachedPVCs } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { StatBlockValue } from '../ui/StatsOverview'
@@ -19,10 +20,9 @@ interface PVCListModalProps {
   pvcs: PVC[]
   title: string
   statusFilter?: 'Bound' | 'Pending' | 'all'
-  onSelectPVC: (cluster: string, namespace: string, name: string) => void
 }
 
-function PVCListModal({ isOpen, onClose, pvcs, title, statusFilter = 'all', onSelectPVC }: PVCListModalProps) {
+function PVCListModal({ isOpen, onClose, pvcs, title, statusFilter = 'all' }: PVCListModalProps) {
   const { t } = useTranslation()
   const [searchQuery, setSearchQuery] = useState('')
 
@@ -67,7 +67,7 @@ function PVCListModal({ isOpen, onClose, pvcs, title, statusFilter = 'all', onSe
           placeholder={t('common.searchPVCs')}
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
       </div>
 
@@ -81,8 +81,8 @@ function PVCListModal({ isOpen, onClose, pvcs, title, statusFilter = 'all', onSe
             {filteredPVCs.map((pvc, idx) => (
               <div
                 key={`${pvc.cluster}-${pvc.namespace}-${pvc.name}-${idx}`}
-                onClick={() => pvc.cluster && onSelectPVC(pvc.cluster, pvc.namespace, pvc.name)}
-                className="glass p-3 rounded-lg cursor-pointer hover:bg-secondary/50 transition-colors"
+                className="glass p-3 rounded-lg transition-colors"
+                title="PVC drilldown not available"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
@@ -103,7 +103,6 @@ function PVCListModal({ isOpen, onClose, pvcs, title, statusFilter = 'all', onSe
                   </div>
                   <div className="flex items-center gap-2">
                     {pvc.cluster && <ClusterBadge cluster={pvc.cluster} size="sm" />}
-                    <ExternalLink className="w-4 h-4 text-muted-foreground" />
                   </div>
                 </div>
               </div>
@@ -125,10 +124,9 @@ export function Storage() {
   const {
     selectedClusters: globalSelectedClusters,
     isAllClustersSelected } = useGlobalFilters()
-  const { pvcs, error: pvcsError } = usePVCs()
+  const { pvcs, error: pvcsError } = useCachedPVCs()
   const error = clustersError || pvcsError
-  const { drillToPVC, drillToResources } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
+  const { drillToResources } = useDrillDownActions()
 
   // PVC List Modal state
   const { isOpen: showPVCModal, open: openPVCModal, close: closePVCModal } = useModalState()
@@ -157,9 +155,11 @@ export function Storage() {
     boundPVCs: filteredPVCs.filter(p => p.status === 'Bound').length,
     pendingPVCs: filteredPVCs.filter(p => p.status === 'Pending').length }
 
-  // Check if we have actual data (not just loading state)
+  // Check if we have actual data (not just loading state) — storage data is valid
+  // regardless of nodeCount (#6808). Use filteredPVCs (not global pvcs) so that
+  // clusters with no PVCs in the current selection show empty state (#7478)
   const hasActualData = filteredClusters.some(c =>
-    c.reachable !== false && c.storageGB !== undefined && c.nodeCount !== undefined && c.nodeCount > 0
+    c.reachable !== false && (c.storageGB !== undefined || filteredPVCs.length > 0)
   )
 
   // Cache the last known good stats to show during refresh
@@ -227,6 +227,17 @@ export function Storage() {
           onClick: () => { setPVCModalFilter('Pending'); openPVCModal() },
           isClickable: hasDataToShow && (stats?.pendingPVCs || 0) > 0
         }
+      case 'pvs': {
+        // Count unique PVs from PVC data — each bound PVC references a PV.
+        // This is an approximation: real PV counts require a separate API call,
+        // but bound PVCs are the best proxy available from cached data.
+        const boundPVCount = filteredPVCs.filter(p => p.status === 'Bound').length
+        return {
+          value: formatStatValue(boundPVCount, hasDataToShow),
+          sublabel: 'persistent volumes (bound)',
+          isClickable: false,
+        }
+      }
       case 'storage_classes': {
         // Count unique storage classes from PVCs (shows storage classes in use)
         const uniqueStorageClasses = new Set(filteredPVCs.map(p => p.storageClass).filter(Boolean))
@@ -237,7 +248,7 @@ export function Storage() {
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   return (
     <>
@@ -257,12 +268,12 @@ export function Storage() {
         hasData={hasDataToShow}
         emptyState={{
           title: 'Storage Dashboard',
-          description: 'Add cards to monitor PersistentVolumes, StorageClasses, and storage utilization across your clusters.' }}
+          description: 'Add cards to monitor PVCs, StorageClasses, and storage utilization across your clusters.' }}
       >
         {/* Error Display */}
         {error && (
           <div className="mb-4 p-4 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+            <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
             <div className="flex-1">
               <p className="text-sm font-medium text-red-400">Error loading storage data</p>
               <p className="text-xs text-muted-foreground mt-1">{error}</p>
@@ -278,10 +289,6 @@ export function Storage() {
         pvcs={filteredPVCs}
         title={pvcModalFilter === 'all' ? 'All PVCs' : pvcModalFilter === 'Bound' ? 'Bound PVCs' : 'Pending PVCs'}
         statusFilter={pvcModalFilter}
-        onSelectPVC={(cluster, namespace, name) => {
-          closePVCModal()
-          drillToPVC(cluster, namespace, name)
-        }}
       />
     </>
   )

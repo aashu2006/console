@@ -1,6 +1,6 @@
 import { AlertCircle } from 'lucide-react'
 import { useServices } from '../../hooks/useMCP'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
+import { useIngresses } from '../../hooks/mcp/networking'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { useIsModeSwitching } from '../../lib/unified/demo'
@@ -16,17 +16,22 @@ const DEFAULT_NETWORK_CARDS = getDefaultCards('network')
 
 export function Network() {
   const { services, isLoading: servicesLoading, isRefreshing: servicesRefreshing, lastUpdated, refetch, error } = useServices()
+  const { ingresses } = useIngresses()
 
   const {
     selectedClusters: globalSelectedClusters,
     isAllClustersSelected } = useGlobalFilters()
   const { drillToService } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
   const isModeSwitching = useIsModeSwitching()
 
   // Filter services based on global cluster selection
   const filteredServices = services.filter(s =>
     isAllClustersSelected || (s.cluster && globalSelectedClusters.includes(s.cluster))
+  )
+
+  // Filter ingresses based on global cluster selection (#7518)
+  const filteredIngresses = (ingresses || []).filter(i =>
+    isAllClustersSelected || (i.cluster && globalSelectedClusters.includes(i.cluster))
   )
 
   // Calculate service stats
@@ -73,15 +78,20 @@ export function Network() {
       case 'clusterip':
         return { value: clusterIPServices, sublabel: 'internal only', onClick: drillToClusterIP, isClickable: clusterIPServices > 0 }
       case 'ingresses':
-        return { value: '-', sublabel: 'ingresses', isClickable: false }
-      case 'endpoints':
-        return { value: filteredServices.length, sublabel: 'endpoints', isClickable: false }
+        return { value: filteredIngresses.length, sublabel: 'ingresses', isClickable: false }
+      case 'endpoints': {
+        // Sum actual ready endpoints across services (#7126) — not just service count
+        const totalEndpoints = filteredServices.reduce(
+          (sum, s) => sum + (s.endpoints ?? 0), 0
+        )
+        return { value: totalEndpoints, sublabel: 'endpoints', isClickable: false }
+      }
       default:
         return { value: '-', sublabel: '' }
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   // Show skeleton during mode switching for smooth transitions
   const showSkeletons = (services.length === 0 && servicesLoading) || isModeSwitching
@@ -108,7 +118,7 @@ export function Network() {
       {/* Error Display */}
       {error && (
         <div className="mb-4 p-4 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-sm font-medium text-red-400">Error loading network data</p>
             <p className="text-xs text-muted-foreground mt-1">{error}</p>

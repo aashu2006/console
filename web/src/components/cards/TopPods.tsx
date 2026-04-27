@@ -174,7 +174,7 @@ function TopPodsInternal({ config }: TopPodsProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <RefreshIndicator
             isRefreshing={isRefreshing}
@@ -242,7 +242,7 @@ function TopPodsInternal({ config }: TopPodsProps) {
               })}
               title={`Click to view details for ${pod.name}`}
             >
-              <div className="flex items-center justify-between mb-1">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                 <div className="flex items-center gap-2 min-w-0 flex-1">
                   <span className="text-xs text-muted-foreground w-5">{displayIndex}.</span>
                   <span className="text-sm font-medium text-foreground truncate" title={pod.name}>
@@ -250,7 +250,7 @@ function TopPodsInternal({ config }: TopPodsProps) {
                   </span>
                 </div>
                 {/* Metric badge based on sort */}
-                <div className="flex items-center gap-1 flex-shrink-0">
+                <div className="flex items-center gap-1 shrink-0">
                   {sortBy === 'restarts' && (
                     <>
                       {pod.restarts > 0 ? (
@@ -392,11 +392,11 @@ function TopPodsInternal({ config }: TopPodsProps) {
               ) : null}
 
               {/* Details row */}
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
                 <div className="flex items-center gap-3">
-                  <span className="flex-shrink-0">{pod.status}</span>
-                  <span className="flex-shrink-0">{pod.ready}</span>
-                  <span className="flex-shrink-0">{pod.age}</span>
+                  <span className="shrink-0">{pod.status}</span>
+                  <span className="shrink-0">{pod.ready}</span>
+                  <span className="shrink-0">{pod.age}</span>
                 </div>
                 <div className="flex items-center gap-1">
                   {(pod.restarts >= 1 || (pod.status !== 'Running' && pod.status !== 'Succeeded' && pod.status !== 'Completed')) && (

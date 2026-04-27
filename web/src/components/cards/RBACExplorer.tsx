@@ -29,6 +29,9 @@ const SKELETON_ROW_COUNT = 4
 /** Height (px) for each skeleton row placeholder */
 const SKELETON_ROW_HEIGHT_PX = 60
 
+/** Scroll position (px) used when resetting to the top of the scroll container (Issue 9268) */
+const SCROLL_TOP_POSITION_PX = 0
+
 // RBACFinding type is imported from useRBACFindings
 
 type RiskLevel = RBACFinding['risk']
@@ -61,11 +64,12 @@ export function RBACExplorer() {
   const { findings, isLoading, isRefreshing, consecutiveFailures, error, isDemoData, refetch } = useRBACFindings()
 
   // ---- Loading / error state reporting ------------------------------------
+  const hasData = (findings || []).length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasData,
     isRefreshing,
     consecutiveFailures,
-    hasAnyData: (findings || []).length > 0,
+    hasAnyData: hasData,
     isDemoData,
     isFailed: !!error,
     errorMessage: error || undefined })
@@ -119,6 +123,8 @@ export function RBACExplorer() {
     setCurrentPage(1)
   }, [riskFilter, search])
 
+  // Scroll container ref is declared below; scroll-to-top on page change is handled there (Issue 9268)
+
   const safeCurrentPage = Math.min(currentPage, totalPages)
 
   const paginatedItems = (() => {
@@ -135,6 +141,15 @@ export function RBACExplorer() {
     estimateSize: () => FINDING_ROW_HEIGHT_PX,
     overscan: VIRTUALIZER_OVERSCAN_COUNT })
 
+  // Scroll the list back to the top whenever the visible page changes so new
+  // items aren't off-screen after clicking Next (Issue 9268).
+  useEffect(() => {
+    const node = scrollContainerRef.current
+    if (node) {
+      node.scrollTop = SCROLL_TOP_POSITION_PX
+    }
+  }, [safeCurrentPage])
+
   // ---- Loading state (skeleton) -------------------------------------------
   if (showSkeleton) {
     return (
@@ -148,30 +163,31 @@ export function RBACExplorer() {
     )
   }
 
-  // ---- Error state with retry ---------------------------------------------
+  // ---- Error state with retry (Issue 9264, Issue 9269) --------------------
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-sm gap-2 p-4 min-h-card">
         <AlertTriangle className="w-6 h-6 text-destructive opacity-70" />
-        <p className="text-destructive">Failed to load RBAC data</p>
+        <p className="text-destructive">{t('common:rbac.failedToLoad')}</p>
         <p className="text-xs text-muted-foreground/70 text-center max-w-xs">{error}</p>
         <button
           onClick={refetch}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs text-blue-400 hover:text-blue-300 hover:bg-blue-500/10 transition-colors"
+          data-testid="rbac-retry"
         >
           <RefreshCw className="w-3 h-3" />
-          Retry
+          {t('common:rbac.retry')}
         </button>
       </div>
     )
   }
 
-  // ---- Empty state --------------------------------------------------------
+  // ---- Empty state (Issue 9269) -------------------------------------------
   if (showEmptyState) {
     return (
       <div className="h-full flex flex-col items-center justify-center min-h-card text-muted-foreground">
-        <p className="text-sm">No RBAC findings</p>
-        <p className="text-xs mt-1">Connect a cluster to analyze RBAC bindings</p>
+        <p className="text-sm">{t('common:rbac.noFindings')}</p>
+        <p className="text-xs mt-1">{t('common:rbac.connectClusterHint')}</p>
       </div>
     )
   }
@@ -216,7 +232,7 @@ export function RBACExplorer() {
       >
         {paginatedItems.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center py-4">
-            <p className="text-sm text-muted-foreground">No findings match your filters</p>
+            <p className="text-sm text-muted-foreground">{t('common:rbac.noMatchingFindings')}</p>
           </div>
         ) : (
           <div
@@ -242,7 +258,7 @@ export function RBACExplorer() {
                     transform: `translateY(${virtualRow.start}px)` }}
                 >
                   <div className={`px-2 py-1.5 mb-1 rounded-lg ${style.bg} border border-transparent hover:border-current/20 transition-colors`}>
-                    <div className="flex items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2">
                       <div className="flex items-center gap-2 min-w-0">
                         <span className={`text-xs px-1.5 py-0.5 rounded ${style.bg} ${style.text} font-medium shrink-0`}>
                           {finding.risk.toUpperCase()}
@@ -252,7 +268,22 @@ export function RBACExplorer() {
                       </div>
                       <StatusBadge color="purple" className="shrink-0">{finding.cluster}</StatusBadge>
                     </div>
-                    <div className="text-xs text-muted-foreground mt-0.5">{finding.description}</div>
+                    <div className="text-xs text-muted-foreground mt-0.5">
+                      {/* Issue 9269: prefer translated description key; fall back to English when legacy.
+                          Issue 9277: react-i18next's typed `t()` infers keys recursively from
+                          CustomTypeOptions.resources, but the recursion depth of its ParseKeys type
+                          drops deep leaves like `rbac.findingDescription.<N>` from the generated
+                          union. A runtime template-literal key that targets one of those dropped
+                          leaves therefore fails TS2345. Cast `t` to a plain signature for this
+                          call-site only. The keys DO exist in common.json and the value is always
+                          a string, so the cast is sound. */}
+                      {finding.descriptionKey
+                        ? (t as (key: string, params?: Record<string, unknown>) => string)(
+                            `rbac.findingDescription.${finding.descriptionKey}`,
+                            finding.descriptionParams ?? {},
+                          )
+                        : finding.description}
+                    </div>
                     <div className="text-xs text-muted-foreground/60 mt-0.5 truncate">{finding.binding}</div>
                   </div>
                 </div>

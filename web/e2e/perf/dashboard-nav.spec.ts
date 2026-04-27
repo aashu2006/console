@@ -122,20 +122,41 @@ async function measureNavigation(
 
   const link = page.locator(linkSelector).first()
 
+  // Timeouts for link discovery: fast path avoids triggering an expensive reload
+  // when the route simply isn't in the primary nav (a config choice, not a crash).
+  const LINK_ATTACH_TIMEOUT_MS = 3_000
+  const LINK_VISIBLE_TIMEOUT_MS = 2_000
+  const SIDEBAR_PRESENCE_TIMEOUT_MS = 500
+  const RELOAD_SIDEBAR_TIMEOUT_MS = 10_000
+
   // Check if link exists and is visible (scroll into view for long sidebars)
   try {
-    await link.waitFor({ state: 'attached', timeout: 3_000 })
+    await link.waitFor({ state: 'attached', timeout: LINK_ATTACH_TIMEOUT_MS })
     await link.scrollIntoViewIfNeeded()
-    await link.waitFor({ state: 'visible', timeout: 2_000 })
+    await link.waitFor({ state: 'visible', timeout: LINK_VISIBLE_TIMEOUT_MS })
   } catch {
-    // If sidebar link not found, the page may have crashed from a previous nav.
-    // Try recovering by reloading and waiting for the sidebar.
+    // Distinguish "sidebar missing (page crashed)" from "link not in primaryNav
+    // for this dashboard config". Only reload in the crash case — when the sidebar
+    // itself is missing. If the sidebar is present but the link isn't, the route
+    // simply isn't configured in primaryNav, so skip fast without a 10s reload.
+    const sidebar = page.locator('[data-testid="sidebar"]').first()
+    const sidebarPresent = await sidebar
+      .waitFor({ state: 'attached', timeout: SIDEBAR_PRESENCE_TIMEOUT_MS })
+      .then(() => true)
+      .catch(() => false)
+
+    if (sidebarPresent) {
+      console.log(`  SKIP ${target.name}: not in primary nav (${linkSelector})`)
+      return null
+    }
+
+    // Sidebar is gone — attempt recovery with a reload.
     try {
       await page.reload({ waitUntil: 'domcontentloaded' })
-      await page.waitForSelector('[data-testid="sidebar"]', { timeout: 10_000 })
-      await link.waitFor({ state: 'attached', timeout: 3_000 })
+      await page.waitForSelector('[data-testid="sidebar"]', { timeout: RELOAD_SIDEBAR_TIMEOUT_MS })
+      await link.waitFor({ state: 'attached', timeout: LINK_ATTACH_TIMEOUT_MS })
       await link.scrollIntoViewIfNeeded()
-      await link.waitFor({ state: 'visible', timeout: 2_000 })
+      await link.waitFor({ state: 'visible', timeout: LINK_VISIBLE_TIMEOUT_MS })
     } catch {
       console.log(`  SKIP ${target.name}: sidebar link not found after recovery (${linkSelector})`)
       return null
@@ -900,18 +921,59 @@ test.afterAll(async () => {
   fs.writeFileSync(path.join(outDir, 'nav-summary.md'), lines.join('\n'))
   console.log(lines.join('\n'))
 
-  // ── Navigation threshold assertions ───────────────────────────────────
-  const warmMetrics = navReport.metrics.filter(
-    (m) => m.scenario === 'warm-nav' && m.cardsFound > 0 && m.totalMs > 0
-  )
-  if (warmMetrics.length > 0) {
-    const avgWarmTotal = Math.round(
-      warmMetrics.reduce((s, m) => s + m.totalMs, 0) / warmMetrics.length
-    )
-    console.log(`[Nav] warm-nav avg total: ${avgWarmTotal}ms (threshold: 3000ms)`)
-    expect(
-      avgWarmTotal,
-      `warm-nav avg total ${avgWarmTotal}ms exceeds 3000ms threshold`
-    ).toBeLessThan(3000)
+  // ── Issue 9232: per-scenario navigation threshold assertions ──────────
+  //
+  // Before this block, every scenario except `warm-nav` measured timings
+  // and wrote them to `nav-report.json` / `nav-summary.md` without ever
+  // asserting against a budget. A dashboard navigation that regressed from
+  // 500ms to 4s (the exact example in Issue 9232) would pass.
+  //
+  // The per-scenario budgets below are sized from observed ranges in the
+  // generated `nav-summary.md`:
+  //   - cold-nav:     first visit, must fetch chunks + render
+  //   - warm-nav:     chunks cached, already <2s in practice
+  //   - from-main:    pre-warmed; measures just the transition cost
+  //   - from-clusters: pre-warmed; measures just the transition cost
+  //   - rapid-nav:    user clicks faster than the app; only the final
+  //                   nav is measured end-to-end, so budget matches warm-nav
+  //   - back-nav:     router `goBack()` + cached cards — should be fastest
+  //
+  // Each budget intentionally leaves ~30-50% headroom over the observed
+  // mean so legitimate growth (new cards, websocket events) doesn't flap
+  // CI, while the kind of regression Issue 9232 calls out ("TTFI going
+  // from 500ms to 3000ms") gets caught.
+  const COLD_NAV_AVG_MS_BUDGET = 5_000
+  const WARM_NAV_AVG_MS_BUDGET = 3_000
+  const FROM_MAIN_AVG_MS_BUDGET = 4_000
+  const FROM_CLUSTERS_AVG_MS_BUDGET = 4_000
+  const RAPID_NAV_AVG_MS_BUDGET = 3_000
+  const BACK_NAV_AVG_MS_BUDGET = 3_000
+
+  const SCENARIO_BUDGETS: Record<Scenario, number> = {
+    'cold-nav': COLD_NAV_AVG_MS_BUDGET,
+    'warm-nav': WARM_NAV_AVG_MS_BUDGET,
+    'from-main': FROM_MAIN_AVG_MS_BUDGET,
+    'from-clusters': FROM_CLUSTERS_AVG_MS_BUDGET,
+    'rapid-nav': RAPID_NAV_AVG_MS_BUDGET,
+    'back-nav': BACK_NAV_AVG_MS_BUDGET,
   }
+
+  const scenarioFailures: string[] = []
+  for (const scenario of Object.keys(SCENARIO_BUDGETS) as Scenario[]) {
+    const metrics = navReport.metrics.filter(
+      (m) => m.scenario === scenario && m.cardsFound > 0 && m.totalMs > 0
+    )
+    if (metrics.length === 0) continue
+    const avg = Math.round(metrics.reduce((s, m) => s + m.totalMs, 0) / metrics.length)
+    const budget = SCENARIO_BUDGETS[scenario]
+    console.log(`[Nav] ${scenario} avg total: ${avg}ms (budget: ${budget}ms, n=${metrics.length})`)
+    if (avg >= budget) {
+      scenarioFailures.push(`${scenario} avg total ${avg}ms >= ${budget}ms budget (n=${metrics.length})`)
+    }
+  }
+
+  expect(
+    scenarioFailures.length,
+    `Navigation-scenario avg budgets breached:\n${scenarioFailures.join('\n')}`
+  ).toBe(0)
 })

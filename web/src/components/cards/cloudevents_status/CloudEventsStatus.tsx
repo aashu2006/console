@@ -5,6 +5,8 @@ import { CardSearchInput, MetricTile } from '../../../lib/cards/CardComponents'
 import { Skeleton, SkeletonList, SkeletonStats } from '../../ui/Skeleton'
 import { useCloudEventsStatus } from './useCloudEventsStatus'
 import type { CloudEventResourceState } from './demoData'
+import { createCardSyncFormatter } from '../../../lib/formatters'
+import { getHealthBadgeClasses } from '../../../lib/cards/statusColors'
 
 const STATUS_STYLE: Record<CloudEventResourceState, { badge: string; icon: React.ReactNode }> = {
   ready: {
@@ -22,26 +24,10 @@ const STATUS_LABEL_KEY: Record<CloudEventResourceState, 'cloudevents.status_read
   degraded: 'cloudevents.status_degraded',
   error: 'cloudevents.status_error' }
 
-function useFormatRelativeTime() {
-  const { t } = useTranslation('cards')
-  return (isoString: string): string => {
-    const diff = Date.now() - new Date(isoString).getTime()
-    if (isNaN(diff) || diff < 0) return t('cloudevents.syncedJustNow')
-
-    const minute = 60_000
-    const hour = 60 * minute
-    const day = 24 * hour
-
-    if (diff < minute) return t('cloudevents.syncedJustNow')
-    if (diff < hour) return t('cloudevents.syncedMinutesAgo', { count: Math.floor(diff / minute) })
-    if (diff < day) return t('cloudevents.syncedHoursAgo', { count: Math.floor(diff / hour) })
-    return t('cloudevents.syncedDaysAgo', { count: Math.floor(diff / day) })
-  }
-}
 
 export function CloudEventsStatus() {
   const { t } = useTranslation('cards')
-  const formatRelativeTime = useFormatRelativeTime()
+  const formatRelativeTime = createCardSyncFormatter(t, 'cloudevents')
   const { data, isRefreshing, error, showSkeleton, showEmptyState } = useCloudEventsStatus()
   const [search, setSearch] = useState('')
 
@@ -63,7 +49,7 @@ export function CloudEventsStatus() {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card gap-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-y-2">
           <Skeleton variant="rounded" width={140} height={28} />
           <Skeleton variant="rounded" width={90} height={20} />
         </div>
@@ -95,11 +81,9 @@ export function CloudEventsStatus() {
 
   return (
     <div className="h-full flex flex-col min-h-card content-loaded gap-4 overflow-hidden">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div
-          className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${
-            isHealthy ? 'bg-green-500/15 text-green-400' : 'bg-yellow-500/15 text-yellow-400'
-          }`}
+          className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${getHealthBadgeClasses(isHealthy)}`}
         >
           {isHealthy ? <CheckCircle className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
           {isHealthy ? t('cloudevents.healthy') : t('cloudevents.degraded')}
@@ -111,7 +95,7 @@ export function CloudEventsStatus() {
         </div>
       </div>
 
-      <div className="grid grid-cols-4 gap-2">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2">
         <MetricTile
           label={t('cloudevents.brokers')}
           value={data.brokers.total}
@@ -156,7 +140,7 @@ export function CloudEventsStatus() {
               const style = STATUS_STYLE[resource.state]
               return (
                 <div key={`${resource.cluster}/${resource.namespace}/${resource.kind}/${resource.name}`} className="rounded-md bg-secondary/30 px-3 py-2.5 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2">
                     <div className="min-w-0 flex items-center gap-1.5">
                       {style.icon}
                       <span className="text-xs font-medium truncate">{resource.name}</span>
@@ -165,7 +149,7 @@ export function CloudEventsStatus() {
                       {t(STATUS_LABEL_KEY[resource.state])}
                     </span>
                   </div>
-                  <div className="text-xs text-muted-foreground flex items-center justify-between gap-2">
+                  <div className="text-xs text-muted-foreground flex flex-wrap items-center justify-between gap-y-2 gap-2">
                     <span className="truncate">{resource.kind} · {resource.namespace} · {resource.cluster}</span>
                     <span className="shrink-0">{t('cloudevents.sink')}: {resource.sink || t('security.notApplicable')}</span>
                   </div>

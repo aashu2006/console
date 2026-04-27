@@ -25,6 +25,13 @@ import { useDemoMode } from '../../hooks/useDemoMode'
 import { useTranslation } from 'react-i18next'
 import { useMissions } from '../../hooks/useMissions'
 import { useApiKeyCheck, ApiKeyPromptModal } from './console-missions/shared'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
+
+// Named time-offset constants for demo fixture data (CLAUDE.md: No Magic Numbers)
+const TWO_MINUTES_MS = 2 * MS_PER_MINUTE
+const THREE_MINUTES_MS = 3 * MS_PER_MINUTE
+const FOUR_MINUTES_MS = 4 * MS_PER_MINUTE
+const FIVE_MINUTES_MS = 5 * MS_PER_MINUTE
 
 interface MissionsProps {
   config?: Record<string, unknown>
@@ -43,8 +50,8 @@ const DEMO_MISSIONS: DeployMission[] = [
       { cluster: 'openshift-prod', status: 'running', replicas: 3, readyReplicas: 3 },
       { cluster: 'do-nyc1-prod', status: 'running', replicas: 3, readyReplicas: 3 },
     ],
-    startedAt: Date.now() - 300000,
-    completedAt: Date.now() - 240000 },
+    startedAt: Date.now() - FIVE_MINUTES_MS,
+    completedAt: Date.now() - FOUR_MINUTES_MS },
   {
     id: 'demo-2',
     workload: 'api-gateway',
@@ -57,8 +64,8 @@ const DEMO_MISSIONS: DeployMission[] = [
       { cluster: 'aks-dev-westeu', status: 'running', replicas: 2, readyReplicas: 2 },
       { cluster: 'rancher-mgmt', status: 'running', replicas: 2, readyReplicas: 2 },
     ],
-    startedAt: Date.now() - 180000,
-    completedAt: Date.now() - 120000 },
+    startedAt: Date.now() - THREE_MINUTES_MS,
+    completedAt: Date.now() - TWO_MINUTES_MS },
 ]
 
 const STATUS_CONFIG: Record<DeployMissionStatus, {
@@ -96,16 +103,24 @@ const STATUS_CONFIG: Record<DeployMissionStatus, {
     bg: 'bg-orange-500/20',
     label: 'Partial' } }
 
+// ClusterStatusRow renders a row's text (`color`), a progress bar
+// (`barColor`), and a status label. The `bg` field used to be declared here
+// but was never read by ClusterStatusRow — dropped so the config matches
+// the renderer. `pending`'s barColor is also never visually shown (the bar
+// is forced to 0% width for the pending state at the call site), so its
+// value is cosmetic; semantic-token choice there still matters for the
+// text color which IS rendered. Tinted accent colors
+// (yellow/green/red at /20 + /500) already read on both light and dark
+// themes, so no dark: variants needed.
 const CLUSTER_STATUS_CONFIG: Record<DeployClusterStatus['status'], {
   color: string
-  bg: string
   barColor: string
   label: string
 }> = {
-  pending: { color: 'text-muted-foreground', bg: 'bg-gray-500/20', barColor: 'bg-gray-500', label: 'Pending' },
-  applying: { color: 'text-yellow-400', bg: 'bg-yellow-500/20', barColor: 'bg-yellow-500', label: 'Applying' },
-  running: { color: 'text-green-400', bg: 'bg-green-500/20', barColor: 'bg-green-500', label: 'Running' },
-  failed: { color: 'text-red-400', bg: 'bg-red-500/20', barColor: 'bg-red-500', label: 'Failed' } }
+  pending: { color: 'text-muted-foreground', barColor: 'bg-muted-foreground', label: 'Pending' },
+  applying: { color: 'text-yellow-400', barColor: 'bg-yellow-500', label: 'Applying' },
+  running: { color: 'text-green-400', barColor: 'bg-green-500', label: 'Running' },
+  failed: { color: 'text-red-400', barColor: 'bg-red-500', label: 'Failed' } }
 
 // Status priority for sorting (active first)
 const STATUS_ORDER: Record<string, number> = {
@@ -130,7 +145,7 @@ const CLUSTER_FILTER_STORAGE_KEY = 'kubestellar-card-filter:deployment-missions-
 export function Missions(_props: MissionsProps) {
   const { t } = useTranslation(['common', 'cards'])
   const { missions: liveMissions, activeMissions: liveActive, completedMissions: liveCompleted } = useDeployMissions()
-  const { deduplicatedClusters, isLoading, isRefreshing } = useClusters()
+  const { deduplicatedClusters, isLoading, isRefreshing, isFailed, consecutiveFailures } = useClusters()
   const { isDemoMode: demoMode } = useDemoMode()
   const missions = demoMode ? DEMO_MISSIONS : liveMissions
   const activeMissions = demoMode ? [] : liveActive
@@ -169,7 +184,9 @@ export function Missions(_props: MissionsProps) {
     isLoading: isLoading && !hasData,
     isRefreshing,
     hasAnyData: hasData,
-    isDemoData: demoMode })
+    isDemoData: demoMode,
+    isFailed,
+    consecutiveFailures })
 
   // Manual cluster filter — filters by target clusters (not source).
   // Can't use useCardData's built-in cluster filter because the global
@@ -350,7 +367,7 @@ Please:
   return (
     <div className="h-full flex flex-col">
       {/* Controls row: cluster filter + sort + limit */}
-      <div className="flex items-center justify-between mb-2 shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 shrink-0">
         <div className="flex items-center gap-2">
           {activeMissions.length > 0 ? (
             <StatusBadge color="blue" size="xs">
@@ -391,7 +408,7 @@ Please:
               </button>
             ) : undefined
           }
-          className="!mb-0"
+          className="mb-0!"
         />
       </div>
 

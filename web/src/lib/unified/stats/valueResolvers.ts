@@ -9,6 +9,9 @@ import type {
   StatValueSource,
   StatValueFormat,
 } from '../types'
+import { formatBytes, formatCurrency } from '../../formatters'
+import { SECONDS_PER_MINUTE, SECONDS_PER_HOUR, SECONDS_PER_DAY } from '../../constants/time'
+export { formatBytes, formatCurrency }
 
 /**
  * Resolved stat value with metadata
@@ -153,23 +156,24 @@ export function resolveComputedExpression(data: unknown, expression: string): un
       }
 
       case 'min': {
-        if (currentItems.length === 0) return 0
-        return Math.min(
-          ...currentItems.map((item) => {
-            const val = resolveFieldPath(item, arg)
-            return typeof val === 'number' ? val : Infinity
-          })
-        )
+        // #6713 — Pre-filter to finite numbers so non-numeric values don't
+        // leak Infinity into the result. If NO items are numeric after the
+        // filter, return null so the UI can render a placeholder instead
+        // of "Infinity".
+        const nums = currentItems
+          .map((item) => resolveFieldPath(item, arg))
+          .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+        if (nums.length === 0) return null
+        return Math.min(...nums)
       }
 
       case 'max': {
-        if (currentItems.length === 0) return 0
-        return Math.max(
-          ...currentItems.map((item) => {
-            const val = resolveFieldPath(item, arg)
-            return typeof val === 'number' ? val : -Infinity
-          })
-        )
+        // #6713 — See 'min' above; same pre-filter logic for Math.max.
+        const nums = currentItems
+          .map((item) => resolveFieldPath(item, arg))
+          .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+        if (nums.length === 0) return null
+        return Math.max(...nums)
       }
 
       case 'latest': {
@@ -258,23 +262,24 @@ export function resolveAggregate(
     }
 
     case 'min': {
-      if (items.length === 0) return 0
-      return Math.min(
-        ...items.map((item) => {
-          const val = resolveFieldPath(item, field)
-          return typeof val === 'number' ? val : Infinity
-        })
-      )
+      // #6713 — Pre-filter to finite numbers so non-numeric values don't
+      // leak Infinity into the result. Returns 0 when no numeric items
+      // are present (resolveAggregate's return type is `number`, not
+      // nullable — see path-based resolver for the null variant).
+      const nums = items
+        .map((item) => resolveFieldPath(item, field))
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+      if (nums.length === 0) return 0
+      return Math.min(...nums)
     }
 
     case 'max': {
-      if (items.length === 0) return 0
-      return Math.max(
-        ...items.map((item) => {
-          const val = resolveFieldPath(item, field)
-          return typeof val === 'number' ? val : -Infinity
-        })
-      )
+      // #6713 — See 'min' above; same pre-filter logic for Math.max.
+      const nums = items
+        .map((item) => resolveFieldPath(item, field))
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+      if (nums.length === 0) return 0
+      return Math.max(...nums)
     }
 
     default:
@@ -337,48 +342,17 @@ export function formatNumber(value: number): string | number {
 }
 
 /**
- * Format bytes to human-readable
- */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-  const exp = Math.floor(Math.log(bytes) / Math.log(1024))
-  const size = bytes / Math.pow(1024, exp)
-
-  return `${size.toFixed(1)} ${units[exp]}`
-}
-
-/**
- * Format currency
- */
-export function formatCurrency(value: number): string {
-  if (value >= 1_000_000) {
-    return `$${(value / 1_000_000).toFixed(1)}M`
-  }
-  if (value >= 1_000) {
-    return `$${(value / 1_000).toFixed(1)}K`
-  }
-  return `$${value.toFixed(2)}`
-}
-
-// Time boundary constants (in seconds) for duration formatting
-const SECS_PER_MINUTE = 60
-const SECS_PER_HOUR = 3_600
-const SECS_PER_DAY = 86_400
-
-/**
  * Format duration in seconds to human-readable
  */
 export function formatDuration(seconds: number): string {
-  if (seconds < SECS_PER_MINUTE) {
+  if (seconds < SECONDS_PER_MINUTE) {
     return `${Math.round(seconds)}s`
   }
-  if (seconds < SECS_PER_HOUR) {
-    return `${Math.round(seconds / SECS_PER_MINUTE)}m`
+  if (seconds < SECONDS_PER_HOUR) {
+    return `${Math.round(seconds / SECONDS_PER_MINUTE)}m`
   }
-  if (seconds < SECS_PER_DAY) {
-    return `${(seconds / SECS_PER_HOUR).toFixed(1)}h`
+  if (seconds < SECONDS_PER_DAY) {
+    return `${(seconds / SECONDS_PER_HOUR).toFixed(1)}h`
   }
-  return `${(seconds / SECS_PER_DAY).toFixed(1)}d`
+  return `${(seconds / SECONDS_PER_DAY).toFixed(1)}d`
 }

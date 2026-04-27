@@ -13,6 +13,8 @@ import type { DynamicCardDefinition, DynamicCardDefinition_T1 } from '../../lib/
 import type { CardComponentProps, CardComponent } from './cardRegistry'
 import { useTranslation } from 'react-i18next'
 
+const MAX_AUTO_GRID_COLS = 3
+
 /**
  * DynamicCard: Meta-component that renders dynamic card definitions.
  *
@@ -29,9 +31,34 @@ export function DynamicCard({ config }: CardComponentProps) {
   const dynamicCardId = (typeof safeConfig.dynamicCardId === 'string' ? safeConfig.dynamicCardId : '') || ''
   const definition = getDynamicCard(dynamicCardId)
 
-  // Report demo state: dynamic cards depend on the agent for live API data
+  // Report demo state: dynamic cards depend on the agent for live API data.
+  //
+  // #9058 — Always include `hasData: true` in this report. Previously this
+  // call reported `{ isDemoData, isFailed, consecutiveFailures }` without
+  // `hasData`, leaving `hasData` as `undefined` (falsy). Because
+  // `useReportCardDataState` uses `useLayoutEffect` and parent layout
+  // effects fire AFTER children's, the meta-component's report runs LAST
+  // and overwrote the `hasData: true` that `Tier1CardRuntime` /
+  // `Tier2CardRuntime` had reported. CardWrapper then saw
+  // `!childDataState.hasData` for a rendered card and painted its generic
+  // "No data available" empty-state overlay (with a Retry button) on top
+  // of a perfectly valid custom card with valid inline/static data.
+  //
+  // Reporting `hasData: true` here is correct for BOTH branches:
+  //  - Error shell states below (missing id / missing definition /
+  //    invalid tier definition): the shell IS the rendered content, so
+  //    we tell CardWrapper not to paint its generic empty state over it.
+  //  - Tier runtime branch: the card's content (data rows, internal
+  //    empty-state message, or internal skeleton) IS the rendered
+  //    content, and the runtime handles its own internal loading/empty/
+  //    error UI.
   const { shouldUseDemoData } = useCardDemoState({ requires: 'agent' })
-  useReportCardDataState({ isDemoData: shouldUseDemoData, isFailed: false, consecutiveFailures: 0 })
+  useReportCardDataState({
+    isDemoData: shouldUseDemoData,
+    isFailed: false,
+    consecutiveFailures: 0,
+    hasData: true,
+  })
 
   if (!dynamicCardId) {
     return (
@@ -224,7 +251,7 @@ export function Tier1CardRuntime({ cardDefinition }: Tier1Props) {
       {showStats && cardDefinition.stats && cardDefinition.stats.length > 0 && (
         <div className={cn(
           'grid gap-2 mb-3',
-          cardDefinition.stats.length <= 3 ? `grid-cols-${cardDefinition.stats.length}` : 'grid-cols-4',
+          cardDefinition.stats.length <= MAX_AUTO_GRID_COLS ? `grid-cols-${cardDefinition.stats.length}` : 'grid-cols-4',
         )}>
           {cardDefinition.stats.map((stat, idx) => {
             // Resolve stat value from data
@@ -256,7 +283,7 @@ export function Tier1CardRuntime({ cardDefinition }: Tier1Props) {
             value={filters.search}
             onChange={(e) => filters.setSearch(e.target.value)}
             placeholder={t('common:common.search')}
-            className="w-full text-xs px-2.5 py-1.5 rounded-md bg-secondary/50 border border-border text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+            className="w-full text-xs px-2.5 py-1.5 rounded-md bg-secondary/50 border border-border text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
           />
         </div>
       )}
@@ -293,7 +320,8 @@ export function Tier1CardRuntime({ cardDefinition }: Tier1Props) {
                   {(cardDefinition.columns || []).map(col => {
                     const val = String((item as Record<string, unknown>)[col.field] ?? '-')
                     if (col.format === 'badge') {
-                      const badgeColor = col.badgeColors?.[val] || 'bg-gray-500/20 text-muted-foreground'
+                      // Semantic badge color — adapts to both light and dark themes.
+                      const badgeColor = col.badgeColors?.[val] || 'bg-muted text-muted-foreground'
                       return (
                         <span
                           key={col.field}
@@ -409,7 +437,7 @@ export function Tier2CardRuntime({ definition, config }: Tier2Props) {
       } catch (err) {
         if (cancelled) return
         const message = err instanceof Error ? err.message : String(err)
-        console.error(`[DynamicCard] Unexpected compile error:`, err)
+        // Message is already surfaced to the user via setError below (#8816)
         setError(`Unexpected error: ${message}`)
         setCompiling(false)
       }
@@ -437,7 +465,7 @@ export function Tier2CardRuntime({ definition, config }: Tier2Props) {
       <div className="h-full flex flex-col items-center justify-center p-4 text-center">
         <AlertTriangle className="w-6 h-6 text-red-400 mb-2" />
         <p className="text-sm text-red-400 font-medium">{t('dynamicCard.compilationError')}</p>
-        <p className="text-xs text-muted-foreground mt-1 max-w-sm font-mono break-words">
+        <p className="text-xs text-muted-foreground mt-1 max-w-sm font-mono wrap-break-word">
           {error}
         </p>
       </div>

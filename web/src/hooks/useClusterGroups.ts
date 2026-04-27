@@ -30,6 +30,8 @@ export interface ClusterGroup {
   query?: ClusterGroupQuery
   lastEvaluated?: string
   builtIn?: boolean
+  source?: 'local' | 'federation'
+  provider?: string
 }
 
 export interface AIQueryResult {
@@ -69,7 +71,7 @@ function saveGroups(groups: ClusterGroup[]) {
 
 function authHeaders(): Record<string, string> {
   const token = localStorage.getItem(STORAGE_KEY_TOKEN)
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
   if (token) headers['Authorization'] = `Bearer ${token}`
   return headers
 }

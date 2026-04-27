@@ -1,10 +1,28 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Globe, Check, X } from 'lucide-react'
+import { Globe, Check, X, Moon } from 'lucide-react'
 import { isBrowserNotifVerified, setBrowserNotifVerified } from '../../../lib/notificationStatus'
+import { useDoNotDisturb } from '../../../hooks/useDoNotDisturb'
 
 /** Browser notification verification flow state */
 type BrowserNotifState = 'idle' | 'asked' | 'verified' | 'failed'
+
+/**
+ * Pick browser-specific instruction key. The OS-level notification center
+ * labels the browser differently depending on which one is installed, so
+ * showing "Google Chrome → Allow Notifications" to a Firefox user is wrong
+ * (#8305). Edge must match before Chrome because its UA contains "Chrome".
+ */
+export function detectInstructionKey(ua: string): string {
+  const u = ua.toLowerCase()
+  if (u.includes('edg/') || u.includes('edge/')) return 'settings.notifications.browser.enableInstructionsEdge'
+  if (u.includes('firefox/')) return 'settings.notifications.browser.enableInstructionsFirefox'
+  if (u.includes('safari/') && !u.includes('chrome/') && !u.includes('chromium/') && !u.includes('android')) {
+    return 'settings.notifications.browser.enableInstructionsSafari'
+  }
+  if (u.includes('chrome/') || u.includes('chromium/')) return 'settings.notifications.browser.enableInstructionsChrome'
+  return 'settings.notifications.browser.enableInstructionsGeneric'
+}
 
 /**
  * Browser notification settings sub-section.
@@ -12,6 +30,9 @@ type BrowserNotifState = 'idle' | 'asked' | 'verified' | 'failed'
  */
 export function BrowserNotificationSettings() {
   const { t } = useTranslation()
+  const instructionKey = detectInstructionKey(
+    typeof navigator !== 'undefined' ? navigator.userAgent : '',
+  )
   const [browserNotifState, setBrowserNotifState] = useState<BrowserNotifState>(
     () => (isBrowserNotifVerified() ? 'verified' : 'idle'),
   )
@@ -110,7 +131,7 @@ export function BrowserNotificationSettings() {
 
           {browserNotifState === 'verified' && (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-green-500/10 border border-green-500/20">
-              <Check className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
+              <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
               <p className="text-sm text-green-400">
                 {t('settings.notifications.browser.verified')}
               </p>
@@ -120,9 +141,12 @@ export function BrowserNotificationSettings() {
           {browserNotifState === 'failed' && (
             <div className="space-y-2">
               <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                <X className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                <X className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                 <p className="text-sm text-amber-400">
-                  {t('settings.notifications.browser.enableInstructions')}
+                  {t(instructionKey as never)}
+                </p>
+                <p className="text-xs text-amber-400/80">
+                  {t('settings.notifications.browser.dndHint')}
                 </p>
               </div>
               <button
@@ -138,7 +162,7 @@ export function BrowserNotificationSettings() {
         <div className="space-y-2">
           {browserPermission === 'denied' ? (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/20">
-              <X className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+              <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
               <p className="text-sm text-red-400">
                 {t('settings.notifications.browser.blocked')}
               </p>
@@ -151,6 +175,61 @@ export function BrowserNotificationSettings() {
               {t('settings.notifications.browser.requestPermission')}
             </button>
           )}
+        </div>
+      )}
+
+      {/* Quiet Hours */}
+      <QuietHoursConfig />
+    </div>
+  )
+}
+
+/** Quiet hours configuration — recurring daily window where notifications are suppressed */
+function QuietHoursConfig() {
+  const dnd = useDoNotDisturb()
+  const { t } = useTranslation()
+
+  return (
+    <div className="space-y-3 pt-4 border-t border-border">
+      <div className="flex items-center gap-2">
+        <Moon className="w-4 h-4 text-muted-foreground" />
+        <h4 className="text-sm font-medium text-foreground">
+          {t('settings.notifications.browser.quietHoursTitle')}
+        </h4>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {t('settings.notifications.browser.quietHoursDesc')}
+      </p>
+
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={dnd.quietHoursEnabled}
+          onChange={(e) => dnd.setQuietHours(e.target.checked)}
+          className="rounded border-border accent-primary"
+        />
+        <span className="text-sm text-foreground">
+          {t('settings.notifications.browser.quietHoursDontNotifyBetween')}
+        </span>
+      </label>
+
+      {dnd.quietHoursEnabled && (
+        <div className="flex items-center gap-2 pl-6">
+          <input
+            type="time"
+            value={dnd.quietHoursStart}
+            onChange={(e) => dnd.setQuietHours(true, e.target.value)}
+            className="px-2 py-1 text-sm bg-secondary border border-border rounded text-foreground"
+          />
+          <span className="text-xs text-muted-foreground">
+            {t('settings.notifications.browser.quietHoursAnd')}
+          </span>
+          <input
+            type="time"
+            value={dnd.quietHoursEnd}
+            onChange={(e) => dnd.setQuietHours(true, undefined, e.target.value)}
+            className="px-2 py-1 text-sm bg-secondary border border-border rounded text-foreground"
+          />
         </div>
       )}
     </div>

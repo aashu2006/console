@@ -31,10 +31,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -83,8 +83,13 @@ jobs:
             echo "PASS: Atomic CAS for mutual exclusion present"
           fi
 
-          # 2. Defer cleanup of updating flag
-          if ! grep -q "defer atomic.StoreInt32" "$CHECKER"; then
+          # 2. Defer cleanup of updating flag.
+          # The cleanup was refactored from an inline `defer atomic.StoreInt32`
+          # into a local `cleanup := func() { atomic.StoreInt32(&uc.updating, 0); … }`
+          # closure that's deferred from every start path. Verify both:
+          # (a) cleanup closure exists and clears the updating flag, and
+          # (b) at least one `defer cleanup()` call site exists.
+          if ! grep -q "atomic.StoreInt32(&uc.updating, 0)" "$CHECKER" || ! grep -q "defer cleanup()" "$CHECKER"; then
             echo "FAIL: Missing defer cleanup of updating flag"
             ERRORS=$((ERRORS + 1))
           else

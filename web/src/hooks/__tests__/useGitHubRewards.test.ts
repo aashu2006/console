@@ -19,6 +19,7 @@ vi.mock('../../lib/auth', () => ({ useAuth: () => mockUseAuth() }))
 
 // Constants are simple values -- we mirror them here for localStorage setup.
 const STORAGE_KEY_TOKEN = 'token'
+const STORAGE_KEY_HAS_SESSION = 'kc-has-session'
 /** Per-user cache key format matching the hook's userCacheKey() */
 function userCacheKey(login: string): string {
   return `github-rewards-cache:${login}`
@@ -228,7 +229,8 @@ describe('useGitHubRewards', () => {
     })
 
     const callsAfterMount = vi.mocked(global.fetch).mock.calls.length
-    expect(callsAfterMount).toBe(1)
+    // 2 calls: one for rewards (Netlify), one for contributions (local proxy)
+    expect(callsAfterMount).toBe(2)
 
     // Set up the next fetch response
     vi.mocked(global.fetch).mockResolvedValue({
@@ -247,8 +249,8 @@ describe('useGitHubRewards', () => {
   })
 
   // 7. Missing token -- no fetch
-  it('does not fetch when STORAGE_KEY_TOKEN is absent', async () => {
-    localStorage.removeItem(STORAGE_KEY_TOKEN)
+  it('does not fetch when user is not authenticated', async () => {
+    mockUseAuth.mockReturnValue({ user: null, isAuthenticated: false })
 
     const { useGitHubRewards } = await import('../useGitHubRewards')
     const { result } = renderHook(() => useGitHubRewards())
@@ -278,7 +280,64 @@ describe('useGitHubRewards', () => {
       expect(global.fetch).toHaveBeenCalled()
     })
 
-    const fetchUrl = vi.mocked(global.fetch).mock.calls[0][0] as string
-    expect(fetchUrl).toContain('login=octocat')
+    const rewardsCall = vi.mocked(global.fetch).mock.calls.find(
+      c => (c[0] as string).includes('rewards/github'),
+    )
+    expect(rewardsCall).toBeDefined()
+    expect(rewardsCall![0] as string).toContain('login=octocat')
+  })
+
+  // 9. Authenticated fetch does not send Authorization header (server-side token resolution)
+  it('fetches without Authorization header when authenticated', async () => {
+    const apiResponse = makeSampleResponse({ total_points: 2000 })
+    vi.mocked(global.fetch).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(apiResponse),
+    } as Response)
+
+    const { useGitHubRewards } = await import('../useGitHubRewards')
+    const { result } = renderHook(() => useGitHubRewards())
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalled()
+      expect(result.current.githubRewards).not.toBeNull()
+      expect(result.current.githubRewards!.total_points).toBe(2000)
+    })
+
+    // Verify the rewards fetch (Netlify) sends no Authorization header
+    const rewardsCall = vi.mocked(global.fetch).mock.calls.find(
+      c => (c[0] as string).includes('rewards/github'),
+    )
+    expect(rewardsCall).toBeDefined()
+    const fetchInit = rewardsCall![1] as RequestInit | undefined
+    const headers = fetchInit?.headers as Record<string, string> | undefined
+    expect(headers?.['Authorization']).toBeUndefined()
+  })
+
+  // 10. localStorage.getItem throwing does not crash the hook
+  it('handles localStorage throwing without crashing', async () => {
+    // Simulate restricted browser mode where localStorage throws on read.
+    // Use vi.spyOn so jsdom's internal binding is properly intercepted.
+    const getItemSpy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new DOMException('Access denied')
+    })
+
+    // Hook is authenticated, but localStorage cache will fail to load
+    const apiResponse = makeSampleResponse()
+    vi.mocked(global.fetch).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(apiResponse),
+    } as Response)
+
+    const { useGitHubRewards } = await import('../useGitHubRewards')
+    const { result } = renderHook(() => useGitHubRewards())
+
+    await waitFor(() => {
+      // Should not crash — fetches from API even though localStorage is broken
+      expect(global.fetch).toHaveBeenCalled()
+      expect(result.current.githubRewards).not.toBeNull()
+    })
+
+    getItemSpy.mockRestore()
   })
 })

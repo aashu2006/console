@@ -44,7 +44,9 @@ const DEMO_NAMESPACE_COSTS: NamespaceCost[] = [
 function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
   const { t } = useTranslation('common')
   const { drillToCost } = useDrillDownActions()
-  useReportCardDataState({ hasData: true, isFailed: false, consecutiveFailures: 0, isDemoData: false })
+  // No live OpenCost integration yet — the card always renders DEMO_NAMESPACE_COSTS,
+  // so flag it as demo data to get the yellow outline + Demo badge (#8012).
+  useReportCardDataState({ hasData: true, isFailed: false, consecutiveFailures: 0, isDemoData: true })
 
   const {
     items: filteredCosts,
@@ -93,7 +95,7 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-2 flex-shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 shrink-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-muted-foreground">
             {totalItems} namespaces
@@ -133,7 +135,7 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
               sortDirection,
               onSortDirectionChange: setSortDirection,
             }}
-            className="!mb-0"
+            className="mb-0!"
           />
         </div>
       </div>
@@ -148,7 +150,7 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
 
       {/* Integration notice */}
       <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-blue-500/10 border border-blue-500/20 text-xs">
-        <AlertCircle className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
+        <AlertCircle className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
         <div>
           <p className="text-blue-400 font-medium">OpenCost Integration</p>
           <p className="text-muted-foreground">
@@ -161,28 +163,60 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
       </div>
 
       {/* Total cost */}
-      <div className="p-3 rounded-lg bg-gradient-to-r from-blue-500/20 to-cyan-500/20 border border-blue-500/30 mb-3">
+      <div className="p-3 rounded-lg bg-linear-to-r from-blue-500/20 to-cyan-500/20 border border-blue-500/30 mb-3">
         <p className="text-xs text-blue-400 mb-1">Monthly Cost (Demo)</p>
         <p className="text-xl font-bold text-foreground">${totalCost.toLocaleString()}</p>
       </div>
 
-      {/* Namespace costs */}
+      {/* Namespace costs.
+        * Issue 8883: roving-tabindex list — Enter/Space activate; ArrowUp/Down
+        * traverse siblings; Home/End jump. Container gets role="list" so
+        * AT exposes the list semantics.
+        */}
       <div ref={containerRef} className="flex-1 overflow-y-auto space-y-2" style={containerStyle}>
         <p className="text-xs text-muted-foreground font-medium mb-2">Cost by Namespace</p>
-        {filteredCosts.map(ns => (
+        <div role="list" className="space-y-2">
+        {filteredCosts.map((ns, idx, arr) => {
+          const activate = () => drillToCost('all', {
+            namespace: ns.namespace,
+            cpuCost: ns.cpuCost,
+            memCost: ns.memCost,
+            storageCost: ns.storageCost,
+            totalCost: ns.totalCost,
+            source: 'opencost',
+          })
+          const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+            const list = e.currentTarget.parentElement
+            const items = list ? Array.from(list.querySelectorAll<HTMLDivElement>('[data-keynav-item="opencost-ns"]')) : []
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              activate()
+            } else if (e.key === 'ArrowDown' && idx < arr.length - 1) {
+              e.preventDefault()
+              items[idx + 1]?.focus()
+            } else if (e.key === 'ArrowUp' && idx > 0) {
+              e.preventDefault()
+              items[idx - 1]?.focus()
+            } else if (e.key === 'Home') {
+              e.preventDefault()
+              items[0]?.focus()
+            } else if (e.key === 'End') {
+              e.preventDefault()
+              items[items.length - 1]?.focus()
+            }
+          }
+          return (
           <div
             key={ns.namespace}
-            onClick={() => drillToCost('all', {
-              namespace: ns.namespace,
-              cpuCost: ns.cpuCost,
-              memCost: ns.memCost,
-              storageCost: ns.storageCost,
-              totalCost: ns.totalCost,
-              source: 'opencost',
-            })}
-            className="p-2 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group"
+            data-keynav-item="opencost-ns"
+            role="button"
+            aria-label={t('actions.viewNamespaceCostAria', { namespace: ns.namespace })}
+            tabIndex={0}
+            onClick={activate}
+            onKeyDown={handleKeyDown}
+            className="p-2 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400"
           >
-            <div className="flex items-center justify-between mb-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1.5">
               <div className="flex items-center gap-2">
                 <Box className="w-3.5 h-3.5 text-muted-foreground" />
                 <span className="text-sm font-medium text-foreground group-hover:text-blue-400">{ns.namespace}</span>
@@ -194,7 +228,7 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
             </div>
             <div className="h-1 bg-secondary rounded-full overflow-hidden mb-1.5">
               <div
-                className="h-full bg-gradient-to-r from-blue-500 to-cyan-500 rounded-full"
+                className="h-full bg-linear-to-r from-blue-500 to-cyan-500 rounded-full"
                 style={{ width: `${(ns.totalCost / maxCost) * 100}%` }}
               />
             </div>
@@ -210,7 +244,9 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
               <span>Storage: ${ns.storageCost}</span>
             </div>
           </div>
-        ))}
+          )
+        })}
+        </div>
       </div>
 
       {/* Pagination */}
@@ -224,7 +260,7 @@ function OpenCostOverviewInternal({ config: _config }: OpenCostOverviewProps) {
       />
 
       {/* Footer */}
-      <div className="mt-3 pt-2 border-t border-border/50 flex items-center justify-between text-xs text-muted-foreground">
+      <div className="mt-3 pt-2 border-t border-border/50 flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
         <span>{t('costs.poweredByOpenCost')}</span>
         <a
           href="https://www.opencost.io/docs"

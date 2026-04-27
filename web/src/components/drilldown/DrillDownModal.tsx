@@ -1,7 +1,8 @@
 import { Component, useEffect, Suspense, type ReactNode, type ErrorInfo } from 'react'
+import { createPortal } from 'react-dom'
 import { safeLazy } from '../../lib/safeLazy'
 import { useTranslation } from 'react-i18next'
-import { Box, Server, Layers, Rocket, FileText, Zap, Cpu, Lock, User, Bell, Ship, GitBranch, Settings, Shield, Package, DollarSign, AlertTriangle, RefreshCw } from 'lucide-react'
+import { Box, Server, Layers, Rocket, FileText, Zap, Cpu, Lock, User, Bell, Ship, GitBranch, Settings, Shield, Package, DollarSign, AlertTriangle, RefreshCw, HardDrive } from 'lucide-react'
 import { useDrillDown } from '../../hooks/useDrillDown'
 import { useMobile } from '../../hooks/useMobile'
 // Lazy load large components (>300 lines) for better performance
@@ -23,19 +24,20 @@ const ArgoAppDrillDown = safeLazy(() => import('./views/ArgoAppDrillDown'), 'Arg
 const HelmReleaseDrillDown = safeLazy(() => import('./views/HelmReleaseDrillDown'), 'HelmReleaseDrillDown')
 const ConfigMapDrillDown = safeLazy(() => import('./views/ConfigMapDrillDown'), 'ConfigMapDrillDown')
 const BuildpackDrillDown = safeLazy(() => import('./views/BuildpackDrillDown'), 'BuildpackDrillDown')
+const ServiceDrillDown = safeLazy(() => import('./views/ServiceDrillDown'), 'default')
 const RBACDrillDown = safeLazy(() => import('./views/RBACDrillDown'), 'RBACDrillDown')
 const CostDrillDown = safeLazy(() => import('./views/CostDrillDown'), 'CostDrillDown')
 const ComplianceDrillDown = safeLazy(() => import('./views/ComplianceDrillDown'), 'ComplianceDrillDown')
+const PVCDrillDown = safeLazy(() => import('./views/PVCDrillDown'), 'PVCDrillDown')
 
 const EventsDrillDown = safeLazy(() => import('./views/EventsDrillDown'), 'EventsDrillDown')
 
 const NamespaceDrillDown = safeLazy(() => import('./views/NamespaceDrillDown'), 'NamespaceDrillDown')
 const NodeDrillDown = safeLazy(() => import('./views/NodeDrillDown'), 'NodeDrillDown')
 const GPUNamespaceDrillDown = safeLazy(() => import('./views/GPUNamespaceDrillDown'), 'GPUNamespaceDrillDown')
-// Keep smaller components as direct imports for immediate loading
-import { LogsDrillDown } from './views/LogsDrillDown'
-import { GPUNodeDrillDown } from './views/GPUNodeDrillDown'
-import { YAMLDrillDown } from './views/YAMLDrillDown'
+const LogsDrillDown = safeLazy(() => import('./views/LogsDrillDown'), 'LogsDrillDown')
+const GPUNodeDrillDown = safeLazy(() => import('./views/GPUNodeDrillDown'), 'GPUNodeDrillDown')
+const YAMLDrillDown = safeLazy(() => import('./views/YAMLDrillDown'), 'YAMLDrillDown')
 
 // Loading fallback for lazy-loaded drilldown views
 function DrillDownLoading() {
@@ -127,6 +129,8 @@ const getViewIcon = (type: string) => {
     case 'configmap': return <FileText className="w-4 h-4 text-yellow-400" />
     case 'secret': return <Lock className="w-4 h-4 text-red-400" />
     case 'serviceaccount': return <User className="w-4 h-4 text-purple-400" />
+    case 'service': return <Layers className="w-4 h-4 text-cyan-400" />
+    case 'pvc': return <HardDrive className="w-4 h-4 text-green-400" />
     case 'node': return <Cpu className="w-4 h-4 text-orange-400" />
     case 'gpu-node': return <Cpu className="w-4 h-4 text-purple-400" />
     case 'gpu-namespace': return <Box className="w-4 h-4 text-purple-400" />
@@ -249,6 +253,10 @@ export function DrillDownModal() {
         return <SecretDrillDown data={data} />
       case 'serviceaccount':
         return <ServiceAccountDrillDown data={data} />
+      case 'pvc':
+        return <PVCDrillDown data={data} />
+      case 'service':
+        return <ServiceDrillDown data={data} />
       // Phase 2 views
       case 'alert':
         return <AlertDrillDown data={data} />
@@ -298,12 +306,21 @@ export function DrillDownModal() {
     }
   }
 
-  return (
-    <div 
-      className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-modal p-2 md:p-4"
+  // Render the modal at document.body so it sits after the Layout sidebar
+  // in DOM order. Both the sidebar and drill-down use z-modal; with equal
+  // z-index the later sibling paints on top. Without the portal, the
+  // sidebar (rendered inside Layout, which mounts after DrillDownModal in
+  // the React tree) visually overlaps the drill-down's left edge — e.g.
+  // hiding the back button and the start of the breadcrumb on a narrow
+  // window. The portal guarantees drill-downs always render after the
+  // chrome regardless of where the component is mounted in the tree.
+  return createPortal(
+    <div
+      className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-modal p-2 md:p-4"
       onClick={close}
     >
       <div
+        data-testid="drilldown-modal"
         className="glass w-full md:w-[90vw] max-w-[1200px] h-[95vh] md:h-[80vh] rounded-xl flex flex-col overflow-hidden"
         onClick={e => e.stopPropagation()}
       >
@@ -323,7 +340,7 @@ export function DrillDownModal() {
             </button>
 
             {/* Breadcrumbs */}
-            <nav className="flex items-center gap-1 min-w-0 overflow-x-auto">
+            <nav data-testid="drilldown-tabs" className="flex items-center gap-1 min-w-0 overflow-x-auto">
               {state.stack.map((view, index) => {
                 const isLast = index === state.stack.length - 1
                 const isPod = view.type === 'pod'
@@ -361,8 +378,10 @@ export function DrillDownModal() {
 
           {/* Close button */}
           <button
+            data-testid="drilldown-close"
             onClick={close}
             className="p-2 rounded-lg hover:bg-card/50 text-muted-foreground hover:text-foreground transition-colors"
+            aria-label={t('drilldown.close')}
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -396,6 +415,7 @@ export function DrillDownModal() {
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

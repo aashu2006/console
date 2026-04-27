@@ -28,7 +28,7 @@ export function PagerDutyNotificationSettings({
 
   const handleTestPagerDuty = async () => {
     if (!config.pagerdutyRoutingKey) {
-      setTestResult({ type: 'pagerduty', success: false, message: 'PagerDuty routing key is required' })
+      setTestResult({ type: 'pagerduty', success: false, message: t('settings.notifications.pagerduty.routingKeyRequired') })
       return
     }
 
@@ -37,12 +37,12 @@ export function PagerDutyNotificationSettings({
       await testNotification('pagerduty', {
         pagerdutyRoutingKey: config.pagerdutyRoutingKey,
       })
-      setTestResult({ type: 'pagerduty', success: true, message: 'Test notification sent and resolved successfully' })
+      setTestResult({ type: 'pagerduty', success: true, message: t('settings.notifications.pagerduty.testSuccess') })
     } catch (error) {
       setTestResult({
         type: 'pagerduty',
         success: false,
-        message: error instanceof Error ? error.message : 'Failed to send test notification',
+        message: error instanceof Error ? error.message : t('settings.notifications.pagerduty.testFailed'),
       })
     }
   }
@@ -63,7 +63,7 @@ export function PagerDutyNotificationSettings({
           value={config.pagerdutyRoutingKey || ''}
           onChange={e => updateConfig({ pagerdutyRoutingKey: e.target.value })}
           placeholder="e.g. a1b2c3d4e5f6..."
-          className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500"
+          className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500"
         />
         <p className="text-xs text-muted-foreground mt-1">
           {t('settings.notifications.pagerduty.routingKeyHint', 'Find this under Services > Integrations > Events API v2 in PagerDuty')}
@@ -75,7 +75,7 @@ export function PagerDutyNotificationSettings({
         disabled={isLoading}
         className="px-4 py-2 text-sm rounded-lg bg-purple-500 text-white hover:bg-purple-600 transition-colors disabled:opacity-50"
       >
-        {isLoading ? 'Testing...' : t('settings.notifications.pagerduty.testNotification', 'Test PagerDuty')}
+        {isLoading ? t('settings.notifications.pagerduty.testing') : t('settings.notifications.pagerduty.testNotification', 'Test PagerDuty')}
       </button>
 
       {testResult && testResult.type === 'pagerduty' && (
@@ -85,9 +85,9 @@ export function PagerDutyNotificationSettings({
           }`}
         >
           {testResult.success ? (
-            <Check className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
+            <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
           ) : (
-            <X className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+            <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
           )}
           <p className={`text-sm ${testResult.success ? 'text-green-400' : 'text-red-400'}`}>
             {testResult.message}

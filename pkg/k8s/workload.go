@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -10,10 +11,12 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/kubestellar/console/pkg/api/v1alpha1"
 )
@@ -84,6 +87,10 @@ func (m *MultiClusterClient) ListWorkloads(ctx context.Context, cluster, namespa
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	workloads := make([]v1alpha1.Workload, 0)
+	// Per-cluster error accumulator — real failures (auth/network/RBAC)
+	// MUST be surfaced so the UI can render partial failures rather than
+	// silently hiding entire clusters (#6659). Mirrors the MCS/Argo pattern.
+	clusterErrors := make([]v1alpha1.WorkloadClusterError, 0)
 
 	slog.Info("[ListWorkloads] listing workloads", "clusterCount", len(clusterNames), "clusters", clusterNames)
 	for _, clusterName := range clusterNames {
@@ -94,6 +101,13 @@ func (m *MultiClusterClient) ListWorkloads(ctx context.Context, cluster, namespa
 			clusterWorkloads, err := m.ListWorkloadsForCluster(ctx, c, namespace, workloadType)
 			if err != nil {
 				slog.Error("[ListWorkloads] error listing workloads for cluster", "cluster", c, "error", err)
+				mu.Lock()
+				clusterErrors = append(clusterErrors, v1alpha1.WorkloadClusterError{
+					Cluster:   c,
+					ErrorType: classifyError(err.Error()),
+					Message:   err.Error(),
+				})
+				mu.Unlock()
 				return
 			}
 			slog.Info("[ListWorkloads] found workloads in cluster", "count", len(clusterWorkloads), "cluster", c)
@@ -107,12 +121,19 @@ func (m *MultiClusterClient) ListWorkloads(ctx context.Context, cluster, namespa
 	wg.Wait()
 
 	return &v1alpha1.WorkloadList{
-		Items:      workloads,
-		TotalCount: len(workloads),
+		Items:         workloads,
+		TotalCount:    len(workloads),
+		ClusterErrors: clusterErrors,
 	}, nil
 }
 
-// ListWorkloadsForCluster lists workloads in a specific cluster
+// ListWorkloadsForCluster lists workloads in a specific cluster.
+//
+// Real listing errors (auth, network, RBAC) are propagated to the caller so
+// that the aggregate ListWorkloads response can surface partial failures
+// instead of silently dropping the whole cluster (#6659). NotFound/NoMatch
+// errors (type simply not registered on the cluster) are treated as empty
+// lists for that kind, matching the Argo/MCS "CRD not installed" pattern.
 func (m *MultiClusterClient) ListWorkloadsForCluster(ctx context.Context, contextName, namespace, workloadType string) ([]v1alpha1.Workload, error) {
 	dynamicClient, err := m.GetDynamicClient(contextName)
 	if err != nil {
@@ -121,16 +142,34 @@ func (m *MultiClusterClient) ListWorkloadsForCluster(ctx context.Context, contex
 
 	workloads := make([]v1alpha1.Workload, 0)
 
+	// isKindNotRegistered reports whether an error means "this kind simply
+	// isn't registered on this cluster" (benign skip), as opposed to a real
+	// failure that must be surfaced.
+	isKindNotRegistered := func(err error) bool {
+		if err == nil {
+			return false
+		}
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+		msg := err.Error()
+		return strings.Contains(msg, "no matches for") ||
+			strings.Contains(msg, "the server could not find the requested resource")
+	}
+
 	// List Deployments
 	if workloadType == "" || workloadType == "Deployment" {
 		var deployments interface{}
+		var listErr error
 		if namespace == "" {
-			deployments, err = dynamicClient.Resource(gvrDeployments).List(ctx, metav1.ListOptions{})
+			deployments, listErr = dynamicClient.Resource(gvrDeployments).List(ctx, metav1.ListOptions{})
 		} else {
-			deployments, err = dynamicClient.Resource(gvrDeployments).Namespace(namespace).List(ctx, metav1.ListOptions{})
+			deployments, listErr = dynamicClient.Resource(gvrDeployments).Namespace(namespace).List(ctx, metav1.ListOptions{})
 		}
-		if err != nil {
-			slog.Error("[ListWorkloadsForCluster] error listing deployments", "cluster", contextName, "error", err)
+		if listErr != nil {
+			if !isKindNotRegistered(listErr) {
+				return nil, fmt.Errorf("list deployments on %s: %w", contextName, listErr)
+			}
 		} else {
 			parsed := m.parseDeploymentsAsWorkloads(deployments, contextName)
 			workloads = append(workloads, parsed...)
@@ -140,13 +179,16 @@ func (m *MultiClusterClient) ListWorkloadsForCluster(ctx context.Context, contex
 	// List StatefulSets
 	if workloadType == "" || workloadType == "StatefulSet" {
 		var statefulsets interface{}
+		var listErr error
 		if namespace == "" {
-			statefulsets, err = dynamicClient.Resource(gvrStatefulSets).List(ctx, metav1.ListOptions{})
+			statefulsets, listErr = dynamicClient.Resource(gvrStatefulSets).List(ctx, metav1.ListOptions{})
 		} else {
-			statefulsets, err = dynamicClient.Resource(gvrStatefulSets).Namespace(namespace).List(ctx, metav1.ListOptions{})
+			statefulsets, listErr = dynamicClient.Resource(gvrStatefulSets).Namespace(namespace).List(ctx, metav1.ListOptions{})
 		}
-		if err != nil {
-			slog.Error("[ListWorkloadsForCluster] error listing statefulsets", "cluster", contextName, "error", err)
+		if listErr != nil {
+			if !isKindNotRegistered(listErr) {
+				return nil, fmt.Errorf("list statefulsets on %s: %w", contextName, listErr)
+			}
 		} else {
 			parsed := m.parseStatefulSetsAsWorkloads(statefulsets, contextName)
 			workloads = append(workloads, parsed...)
@@ -156,13 +198,16 @@ func (m *MultiClusterClient) ListWorkloadsForCluster(ctx context.Context, contex
 	// List DaemonSets
 	if workloadType == "" || workloadType == "DaemonSet" {
 		var daemonsets interface{}
+		var listErr error
 		if namespace == "" {
-			daemonsets, err = dynamicClient.Resource(gvrDaemonSets).List(ctx, metav1.ListOptions{})
+			daemonsets, listErr = dynamicClient.Resource(gvrDaemonSets).List(ctx, metav1.ListOptions{})
 		} else {
-			daemonsets, err = dynamicClient.Resource(gvrDaemonSets).Namespace(namespace).List(ctx, metav1.ListOptions{})
+			daemonsets, listErr = dynamicClient.Resource(gvrDaemonSets).Namespace(namespace).List(ctx, metav1.ListOptions{})
 		}
-		if err != nil {
-			slog.Error("[ListWorkloadsForCluster] error listing daemonsets", "cluster", contextName, "error", err)
+		if listErr != nil {
+			if !isKindNotRegistered(listErr) {
+				return nil, fmt.Errorf("list daemonsets on %s: %w", contextName, listErr)
+			}
 		} else {
 			parsed := m.parseDaemonSetsAsWorkloads(daemonsets, contextName)
 			workloads = append(workloads, parsed...)
@@ -479,13 +524,20 @@ func (m *MultiClusterClient) GetWorkload(ctx context.Context, cluster, namespace
 		obj, getErr := dynamicClient.Resource(k.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			if apierrors.IsNotFound(getErr) {
-				// Expected — try the next kind.
+				// Expected — this kind doesn't have an object with that name. Try next.
 				continue
 			}
-			// Unexpected error (auth, network, server). Fall back to the
-			// old list-based path so the caller never regresses to a hard
-			// failure just because one kind happened to be unavailable.
-			return m.getWorkloadByList(ctx, cluster, namespace, name)
+			if apimeta.IsNoMatchError(getErr) {
+				// The cluster doesn't know about this GVR (older k8s, CRD missing,
+				// or discovery cache stale). Fall back to the legacy list-based
+				// path which handles kind-availability gracefully. (#6547)
+				return m.getWorkloadByList(ctx, cluster, namespace, name)
+			}
+			// Real error (auth, network, server). Do NOT silently fall through
+			// to the list path — that path logs-and-swallows list errors and
+			// would turn an auth failure into a false "not found". Return it
+			// so callers can surface the underlying problem. (#6547)
+			return nil, fmt.Errorf("get %s/%s in %s: %w", k.gvr.Resource, name, namespace, getErr)
 		}
 		list := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*obj}}
 		parsed := k.parser(list, cluster)
@@ -639,7 +691,9 @@ func (m *MultiClusterClient) DeployWorkload(ctx context.Context, sourceCluster, 
 	var mu sync.Mutex
 	deployed := make([]string, 0, len(targetClusters))
 	failed := make([]string, 0)
-	var lastErr error
+	// Collect all per-cluster errors so partial failures report every cluster's
+	// error, not just the last one to finish (#10257).
+	errs := make([]error, 0)
 	allDepResults := make([]v1alpha1.DeployedDep, 0)
 
 	for _, target := range targetClusters {
@@ -651,7 +705,7 @@ func (m *MultiClusterClient) DeployWorkload(ctx context.Context, sourceCluster, 
 			if err != nil {
 				mu.Lock()
 				failed = append(failed, targetCluster)
-				lastErr = fmt.Errorf("cluster %s: %w", targetCluster, err)
+				errs = append(errs, fmt.Errorf("cluster %s: %w", targetCluster, err))
 				mu.Unlock()
 				return
 			}
@@ -689,10 +743,12 @@ func (m *MultiClusterClient) DeployWorkload(ctx context.Context, sourceCluster, 
 					failed = append(failed, targetCluster)
 					if apierrors.IsNotFound(getErr) {
 						// Genuine "does not exist" — the Create error is authoritative.
-						lastErr = fmt.Errorf("cluster %s: create failed: %w", targetCluster, err)
+						errs = append(errs, fmt.Errorf("cluster %s: create failed: %w", targetCluster, err))
 					} else {
-						// Non-NotFound Get error (network, auth, server) — surface both.
-						lastErr = fmt.Errorf("cluster %s: create failed: %w; also get failed: %v", targetCluster, err, getErr)
+						// Non-NotFound Get error (network, auth, server) — surface
+						// BOTH errors with %w so callers can errors.Is/As either
+						// one. Go 1.20+ supports multi-error %w. (#6547)
+						errs = append(errs, fmt.Errorf("cluster %s: create failed: %w; also get failed: %w", targetCluster, err, getErr))
 					}
 					mu.Unlock()
 					return
@@ -702,7 +758,7 @@ func (m *MultiClusterClient) DeployWorkload(ctx context.Context, sourceCluster, 
 				if err != nil {
 					mu.Lock()
 					failed = append(failed, targetCluster)
-					lastErr = fmt.Errorf("cluster %s: update failed: %w", targetCluster, err)
+					errs = append(errs, fmt.Errorf("cluster %s: update failed: %w", targetCluster, err))
 					mu.Unlock()
 					return
 				}
@@ -748,9 +804,9 @@ func (m *MultiClusterClient) DeployWorkload(ctx context.Context, sourceCluster, 
 	if len(failed) == 0 {
 		resp.Message = fmt.Sprintf("Deployed %s/%s to %d cluster(s)%s", namespace, name, len(deployed), depSummary)
 	} else if len(deployed) > 0 {
-		resp.Message = fmt.Sprintf("Partially deployed: %d succeeded, %d failed%s", len(deployed), len(failed), depSummary)
+		resp.Message = fmt.Sprintf("Partially deployed: %d succeeded, %d failed%s: %v", len(deployed), len(failed), depSummary, errors.Join(errs...))
 	} else {
-		resp.Message = fmt.Sprintf("Deployment failed on all clusters: %v", lastErr)
+		resp.Message = fmt.Sprintf("Deployment failed on all clusters: %v", errors.Join(errs...))
 	}
 
 	return resp, nil
@@ -1001,7 +1057,9 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 	var mu sync.Mutex
 	deployed := make([]string, 0, len(targetClusters))
 	failed := make([]string, 0)
-	var lastErr error
+	// Collect all per-cluster errors so partial failures report every cluster's
+	// error, not just the last one to finish (#10257).
+	scaleErrs := make([]error, 0)
 
 	for _, cluster := range targetClusters {
 		wg.Add(1)
@@ -1012,7 +1070,7 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 			if err != nil {
 				mu.Lock()
 				failed = append(failed, clusterName)
-				lastErr = fmt.Errorf("cluster %s: %w", clusterName, err)
+				scaleErrs = append(scaleErrs, fmt.Errorf("cluster %s: %w", clusterName, err))
 				mu.Unlock()
 				return
 			}
@@ -1028,7 +1086,7 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 					}
 					mu.Lock()
 					failed = append(failed, clusterName)
-					lastErr = fmt.Errorf("cluster %s: get %s: %w", clusterName, g.kind, getErr)
+					scaleErrs = append(scaleErrs, fmt.Errorf("cluster %s: get %s: %w", clusterName, g.kind, getErr))
 					mu.Unlock()
 					return
 				}
@@ -1038,7 +1096,7 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 				if !ok {
 					mu.Lock()
 					failed = append(failed, clusterName)
-					lastErr = fmt.Errorf("cluster %s: invalid spec in %s %s/%s", clusterName, g.kind, namespace, name)
+					scaleErrs = append(scaleErrs, fmt.Errorf("cluster %s: invalid spec in %s %s/%s", clusterName, g.kind, namespace, name))
 					mu.Unlock()
 					return
 				}
@@ -1048,7 +1106,7 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 				if updateErr != nil {
 					mu.Lock()
 					failed = append(failed, clusterName)
-					lastErr = fmt.Errorf("cluster %s: scale %s: %w", clusterName, g.kind, updateErr)
+					scaleErrs = append(scaleErrs, fmt.Errorf("cluster %s: scale %s: %w", clusterName, g.kind, updateErr))
 					mu.Unlock()
 					return
 				}
@@ -1062,7 +1120,7 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 				deployed = append(deployed, clusterName)
 			} else {
 				failed = append(failed, clusterName)
-				lastErr = fmt.Errorf("cluster %s: workload %s/%s not found as Deployment or StatefulSet", clusterName, namespace, name)
+				scaleErrs = append(scaleErrs, fmt.Errorf("cluster %s: workload %s/%s not found as Deployment or StatefulSet", clusterName, namespace, name))
 			}
 			mu.Unlock()
 		}(cluster)
@@ -1072,8 +1130,10 @@ func (m *MultiClusterClient) ScaleWorkload(ctx context.Context, namespace, name 
 
 	success := len(deployed) > 0
 	msg := fmt.Sprintf("Scaled %s/%s to %d replicas on %d/%d clusters", namespace, name, replicas, len(deployed), len(targetClusters))
-	if lastErr != nil && !success {
-		msg = lastErr.Error()
+	if len(scaleErrs) > 0 && !success {
+		msg = fmt.Sprintf("Scale failed on all clusters: %v", errors.Join(scaleErrs...))
+	} else if len(scaleErrs) > 0 {
+		msg = fmt.Sprintf("%s (errors: %v)", msg, errors.Join(scaleErrs...))
 	}
 
 	return &v1alpha1.DeployResponse{
@@ -1127,14 +1187,22 @@ func (m *MultiClusterClient) DeleteWorkload(ctx context.Context, cluster, namesp
 	return fmt.Errorf("workload %s/%s not found in cluster %s (tried Deployment, StatefulSet, DaemonSet)", namespace, name, cluster)
 }
 
-// GetClusterCapabilities returns the capabilities of all clusters
+// GetClusterCapabilities returns the capabilities of all clusters.
+//
+// Uses DeduplicatedClusters instead of the lazy m.clients snapshot so that
+// newly-added kubeconfig contexts appear immediately on hot reload, matching
+// the fix already landed in argocd.go for #6476. Previously, a cluster added
+// after startup whose kubernetes client had not yet been lazily created was
+// silently missing from /workloads/capabilities responses (#6661).
 func (m *MultiClusterClient) GetClusterCapabilities(ctx context.Context) (*v1alpha1.ClusterCapabilityList, error) {
-	m.mu.RLock()
-	clusters := make([]string, 0, len(m.clients))
-	for name := range m.clients {
-		clusters = append(clusters, name)
+	dedupClusters, err := m.DeduplicatedClusters(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list clusters: %w", err)
 	}
-	m.mu.RUnlock()
+	clusters := make([]string, 0, len(dedupClusters))
+	for _, c := range dedupClusters {
+		clusters = append(clusters, c.Name)
+	}
 
 	capabilities := make([]v1alpha1.ClusterCapability, 0, len(clusters))
 
@@ -1176,9 +1244,10 @@ func (m *MultiClusterClient) GetClusterCapabilities(ctx context.Context) (*v1alp
 		cap.GPUCount = totalGPUs
 
 		// Use capacity from first node as representative for CPU/Memory
-		// (nodes is guaranteed non-empty here — zero-node clusters are skipped above)
-		cap.CPUCapacity = nodes[0].CPUCapacity
-		cap.MemCapacity = nodes[0].MemoryCapacity
+		if len(nodes) > 0 {
+			cap.CPUCapacity = nodes[0].CPUCapacity
+			cap.MemCapacity = nodes[0].MemoryCapacity
+		}
 
 		capabilities = append(capabilities, cap)
 	}
@@ -1189,7 +1258,10 @@ func (m *MultiClusterClient) GetClusterCapabilities(ctx context.Context) (*v1alp
 	}, nil
 }
 
-// LabelClusterNodes labels all nodes in a cluster with the given labels
+// LabelClusterNodes labels all nodes in a cluster with the given labels.
+// Each node update uses retry-on-conflict to handle transient ResourceVersion
+// mismatches. Errors are collected per-node so that one failure does not
+// prevent labeling the remaining nodes (#10256).
 func (m *MultiClusterClient) LabelClusterNodes(ctx context.Context, cluster string, labels map[string]string) error {
 	dynamicClient, err := m.GetDynamicClient(cluster)
 	if err != nil {
@@ -1201,24 +1273,39 @@ func (m *MultiClusterClient) LabelClusterNodes(ctx context.Context, cluster stri
 		return fmt.Errorf("failed to list nodes in %s: %w", cluster, err)
 	}
 
+	var errs []error
 	for _, node := range nodeList.Items {
-		existing := node.GetLabels()
-		if existing == nil {
-			existing = make(map[string]string)
-		}
-		for k, v := range labels {
-			existing[k] = v
-		}
-		node.SetLabels(existing)
-		_, err := dynamicClient.Resource(gvrNodes).Update(ctx, &node, metav1.UpdateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to label node %s in %s: %w", node.GetName(), cluster, err)
+		nodeName := node.GetName()
+		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Re-fetch the node to get the latest ResourceVersion.
+			fresh, getErr := dynamicClient.Resource(gvrNodes).Get(ctx, nodeName, metav1.GetOptions{})
+			if getErr != nil {
+				return fmt.Errorf("failed to get node %s in %s: %w", nodeName, cluster, getErr)
+			}
+			existing := fresh.GetLabels()
+			if existing == nil {
+				existing = make(map[string]string)
+			}
+			for k, v := range labels {
+				existing[k] = v
+			}
+			fresh.SetLabels(existing)
+			_, updateErr := dynamicClient.Resource(gvrNodes).Update(ctx, fresh, metav1.UpdateOptions{})
+			return updateErr
+		})
+		if retryErr != nil {
+			slog.Error("[LabelClusterNodes] failed to label node after retries",
+				"node", nodeName, "cluster", cluster, "error", retryErr)
+			errs = append(errs, fmt.Errorf("node %s: %w", nodeName, retryErr))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// RemoveClusterNodeLabels removes specified labels from all nodes in a cluster
+// RemoveClusterNodeLabels removes specified labels from all nodes in a cluster.
+// Each node update uses retry-on-conflict to handle transient ResourceVersion
+// mismatches. Errors are collected per-node so that one failure does not
+// prevent updating the remaining nodes (#10256).
 func (m *MultiClusterClient) RemoveClusterNodeLabels(ctx context.Context, cluster string, labelKeys []string) error {
 	dynamicClient, err := m.GetDynamicClient(cluster)
 	if err != nil {
@@ -1230,28 +1317,40 @@ func (m *MultiClusterClient) RemoveClusterNodeLabels(ctx context.Context, cluste
 		return fmt.Errorf("failed to list nodes in %s: %w", cluster, err)
 	}
 
+	var errs []error
 	for _, node := range nodeList.Items {
-		existing := node.GetLabels()
-		if existing == nil {
-			continue
-		}
-		changed := false
-		for _, k := range labelKeys {
-			if _, ok := existing[k]; ok {
-				delete(existing, k)
-				changed = true
+		nodeName := node.GetName()
+		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Re-fetch the node to get the latest ResourceVersion.
+			fresh, getErr := dynamicClient.Resource(gvrNodes).Get(ctx, nodeName, metav1.GetOptions{})
+			if getErr != nil {
+				return fmt.Errorf("failed to get node %s in %s: %w", nodeName, cluster, getErr)
 			}
-		}
-		if !changed {
-			continue
-		}
-		node.SetLabels(existing)
-		_, err := dynamicClient.Resource(gvrNodes).Update(ctx, &node, metav1.UpdateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to update node %s in %s: %w", node.GetName(), cluster, err)
+			existing := fresh.GetLabels()
+			if existing == nil {
+				return nil // no labels to remove
+			}
+			changed := false
+			for _, k := range labelKeys {
+				if _, ok := existing[k]; ok {
+					delete(existing, k)
+					changed = true
+				}
+			}
+			if !changed {
+				return nil // nothing to update
+			}
+			fresh.SetLabels(existing)
+			_, updateErr := dynamicClient.Resource(gvrNodes).Update(ctx, fresh, metav1.UpdateOptions{})
+			return updateErr
+		})
+		if retryErr != nil {
+			slog.Error("[RemoveClusterNodeLabels] failed to update node after retries",
+				"node", nodeName, "cluster", cluster, "error", retryErr)
+			errs = append(errs, fmt.Errorf("node %s: %w", nodeName, retryErr))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ListBindingPolicies lists binding policies (placeholder)

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { X, CheckCircle, AlertTriangle, WifiOff, Pencil, Trash2, ChevronRight, ChevronDown, Layers, Server, Network, HardDrive, Box, FolderOpen, Loader2, Cpu, MemoryStick, Database, Wand2, Stethoscope, Wrench, Bot, ExternalLink } from 'lucide-react'
 import { BaseModal } from '../../lib/modals'
 import { useClusterHealth, usePodIssues, useDeploymentIssues, useGPUNodes, useNodes, useNamespaceStats, useDeployments, useClusters } from '../../hooks/useMCP'
@@ -99,11 +99,11 @@ interface ClusterDetailModalProps {
 
 export function ClusterDetailModal({ clusterName, clusterUser, onClose, onRename, onRemove }: ClusterDetailModalProps) {
   const { t } = useTranslation()
-  const { health, isLoading } = useClusterHealth(clusterName)
+  const { health, isLoading, error: healthError } = useClusterHealth(clusterName)
   const { deduplicatedClusters, clusters: rawClusters } = useClusters()
   const { issues: podIssues } = usePodIssues(clusterName)
   const { issues: deploymentIssues } = useDeploymentIssues(clusterName)
-  const { nodes: gpuNodes } = useGPUNodes(clusterName)
+  const { nodes: gpuNodes, isLoading: gpuLoading, isRefreshing: gpuRefreshing } = useGPUNodes(clusterName)
   const { nodes: clusterNodes, isLoading: nodesLoading } = useNodes(clusterName)
   const { stats: namespaceStats, isLoading: nsLoading } = useNamespaceStats(clusterName)
   const { deployments: clusterDeployments } = useDeployments(clusterName)
@@ -178,8 +178,8 @@ export function ClusterDetailModal({ clusterName, clusterUser, onClose, onRename
     ].slice(0, 10).join('\n')
 
     startMission({
-      title: `Diagnose ${clusterName.split('/').pop()}`,
-      description: `Analyzing cluster health and identifying issues`,
+      title: t('cluster.diagnoseMissionTitle', { cluster: clusterName.split('/').pop() }),
+      description: t('cluster.diagnoseMissionDescription'),
       type: 'troubleshoot',
       cluster: clusterName,
       initialPrompt: `Analyze the health of Kubernetes cluster "${clusterName}" and identify any issues that need attention.
@@ -216,8 +216,8 @@ Please analyze this cluster and provide:
     ].join('\n')
 
     startMission({
-      title: `Repair ${clusterName.split('/').pop()}`,
-      description: `Automatically fixing cluster issues`,
+      title: t('cluster.repairMissionTitle', { cluster: clusterName.split('/').pop() }),
+      description: t('cluster.repairMissionDescription'),
       type: 'repair',
       cluster: clusterName,
       initialPrompt: `I need help repairing issues in Kubernetes cluster "${clusterName}".
@@ -259,6 +259,21 @@ After I approve, help me execute the repairs step by step.`,
     })
     return map
   })()
+
+  // Retain last non-empty GPU data so the section doesn't vanish during refetch (#8597).
+  // Only fall back to cached data while a refresh/load is in progress (transient empty).
+  // When a settled (non-loading, non-refreshing) fetch returns empty, respect it as
+  // authoritative — GPUs may have been removed from the cluster (#8601).
+  const isGpuTransient = gpuLoading || gpuRefreshing
+  const lastGpuDataRef = useRef<{ clusterGPUs: typeof clusterGPUs; gpuByType: typeof gpuByType }>({ clusterGPUs: [], gpuByType: {} })
+  if (clusterGPUs.length > 0) {
+    lastGpuDataRef.current = { clusterGPUs, gpuByType }
+  } else if (!isGpuTransient) {
+    // Settled fetch returned empty — clear cached data so UI shows no GPUs
+    lastGpuDataRef.current = { clusterGPUs: [], gpuByType: {} }
+  }
+  const stableClusterGPUs = clusterGPUs.length > 0 ? clusterGPUs : lastGpuDataRef.current.clusterGPUs
+  const stableGpuByType = clusterGPUs.length > 0 ? gpuByType : lastGpuDataRef.current.gpuByType
 
   // Show modal immediately with loading state for data - don't block on isLoading
   return (
@@ -350,6 +365,14 @@ After I approve, help me execute the repairs step by step.`,
           </button>
         </div>
 
+        {/* Error banner when cluster health fetch fails (issue 6772) */}
+        {healthError && (
+          <div className="mb-4 p-3 rounded-lg bg-red-500/20 border border-red-500/50 flex items-center gap-2 text-sm text-red-400">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>{healthError}</span>
+          </div>
+        )}
+
         {/* Status details — surfaces unreachable reason (#5925),
             external reachability (#5926) and freshness (#5927). */}
         {clusterInfo && (
@@ -363,7 +386,7 @@ After I approve, help me execute the repairs step by step.`,
             parent provided a remove handler. */}
         {onRemove && isUnreachable && (clusterInfo?.source === 'kubeconfig' || !clusterInfo?.source) && (
           <div className="mb-6 flex items-start gap-3 p-4 rounded-lg bg-red-500/5 border border-red-500/20">
-            <WifiOff className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
+            <WifiOff className="w-5 h-5 text-red-400 shrink-0 mt-0.5" aria-hidden="true" />
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-medium text-foreground mb-1">
                 {t('clusterDetail.offlineRemoveTitle')}
@@ -385,7 +408,7 @@ After I approve, help me execute the repairs step by step.`,
         )}
 
         {/* AI Actions */}
-        <div className="mb-6 p-4 rounded-lg bg-gradient-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/20">
+        <div className="mb-6 p-4 rounded-lg bg-linear-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/20">
           <div className="flex items-center gap-2 mb-3">
             <Bot className="w-5 h-5 text-purple-400" />
             <span className="text-sm font-medium text-foreground">{t('clusterDetail.aiAssistant')}</span>
@@ -515,12 +538,12 @@ After I approve, help me execute the repairs step by step.`,
             )}
           </button>
           <button
-            onClick={() => !isUnreachable && !isLoading && clusterGPUs.length > 0 && setShowGPUDetail(true)}
-            disabled={isUnreachable || isLoading || clusterGPUs.length === 0}
+            onClick={() => !isUnreachable && !isLoading && stableClusterGPUs.length > 0 && setShowGPUDetail(true)}
+            disabled={isUnreachable || isLoading || stableClusterGPUs.length === 0}
             className={`group p-4 rounded-lg bg-card/50 border text-left transition-all duration-200 ${
-              !isUnreachable && !isLoading && clusterGPUs.length > 0 ? 'border-border hover:border-yellow-500/50 hover:bg-yellow-500/5 hover:shadow-lg hover:shadow-yellow-500/10 cursor-pointer' : 'border-border cursor-default'
+              !isUnreachable && !isLoading && stableClusterGPUs.length > 0 ? 'border-border hover:border-yellow-500/50 hover:bg-yellow-500/5 hover:shadow-lg hover:shadow-yellow-500/10 cursor-pointer' : 'border-border cursor-default'
             }`}
-            title={!isUnreachable && !isLoading && clusterGPUs.length > 0 ? t('clusterDetail.clickToViewGPU') : undefined}
+            title={!isUnreachable && !isLoading && stableClusterGPUs.length > 0 ? t('clusterDetail.clickToViewGPU') : undefined}
           >
             {isLoading ? (
               <>
@@ -530,10 +553,10 @@ After I approve, help me execute the repairs step by step.`,
               </>
             ) : (
               <>
-                <div className="text-2xl font-bold text-foreground">{!isUnreachable ? clusterGPUs.reduce((sum, n) => sum + n.gpuCount, 0) : '-'}</div>
+                <div className="text-2xl font-bold text-foreground">{!isUnreachable ? stableClusterGPUs.reduce((sum, n) => sum + n.gpuCount, 0) : '-'}</div>
                 <div className="text-sm text-muted-foreground">{t('common.gpus')}</div>
-                <div className="text-xs text-yellow-400">{!isUnreachable ? `${clusterGPUs.reduce((sum, n) => sum + n.gpuAllocated, 0)} ${t('clusterDetail.allocated')}` : ''}</div>
-                {!isUnreachable && clusterGPUs.length > 0 && (
+                <div className="text-xs text-yellow-400">{!isUnreachable ? `${stableClusterGPUs.reduce((sum, n) => sum + n.gpuAllocated, 0)} ${t('clusterDetail.allocated')}` : ''}</div>
+                {!isUnreachable && stableClusterGPUs.length > 0 && (
                   <div className="text-2xs text-muted-foreground/50 mt-2 group-hover:text-yellow-400/70 transition-colors">{t('clusterDetail.clickForDetails')}</div>
                 )}
               </>
@@ -720,11 +743,11 @@ After I approve, help me execute the repairs step by step.`,
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 flex-1 min-w-0">
-                      <StatusBadge color="blue" size="xs" icon={<Box className="w-3 h-3" />} className="flex-shrink-0">{t('clusterDetail.pod')}</StatusBadge>
+                      <StatusBadge color="blue" size="xs" icon={<Box className="w-3 h-3" />} className="shrink-0">{t('clusterDetail.pod')}</StatusBadge>
                       <span className="font-medium text-foreground truncate">{issue.name}</span>
-                      <span className="text-xs text-muted-foreground flex-shrink-0">({issue.namespace})</span>
+                      <span className="text-xs text-muted-foreground shrink-0">({issue.namespace})</span>
                     </div>
-                    <div className="flex items-center gap-2 flex-shrink-0 ml-2">
+                    <div className="flex items-center gap-2 shrink-0 ml-2">
                       <StatusBadge color="red" size="xs">{issue.status}</StatusBadge>
                       <ChevronRight className="w-4 h-4 text-muted-foreground" />
                     </div>
@@ -749,11 +772,11 @@ After I approve, help me execute the repairs step by step.`,
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 flex-1 min-w-0">
-                      <StatusBadge color="purple" size="xs" icon={<Layers className="w-3 h-3" />} className="flex-shrink-0">{t('clusterDetail.deploy')}</StatusBadge>
+                      <StatusBadge color="purple" size="xs" icon={<Layers className="w-3 h-3" />} className="shrink-0">{t('clusterDetail.deploy')}</StatusBadge>
                       <span className="font-medium text-foreground truncate">{issue.name}</span>
-                      <span className="text-xs text-muted-foreground flex-shrink-0">({issue.namespace})</span>
+                      <span className="text-xs text-muted-foreground shrink-0">({issue.namespace})</span>
                     </div>
-                    <div className="flex items-center gap-2 flex-shrink-0 ml-2">
+                    <div className="flex items-center gap-2 shrink-0 ml-2">
                       <StatusBadge color="red" size="xs">
                         {issue.readyReplicas}/{issue.replicas} ready
                       </StatusBadge>
@@ -770,14 +793,14 @@ After I approve, help me execute the repairs step by step.`,
         )}
 
         {/* GPU Section */}
-        {clusterGPUs.length > 0 && (
+        {stableClusterGPUs.length > 0 && (
           <div className="mb-6">
             <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
               <HardDrive className="w-4 h-4 text-purple-400" />
               {t('clusterDetail.gpusByType')}
             </h3>
             <div className="space-y-4">
-              {Object.entries(gpuByType).map(([type, info]) => (
+              {Object.entries(stableGpuByType).map(([type, info]) => (
                 <div key={type} className="rounded-lg bg-card/50 border border-border overflow-hidden">
                   <div className="p-3 border-b border-border/50 bg-purple-500/5">
                     <div className="flex items-center justify-between">
@@ -936,7 +959,7 @@ After I approve, help me execute the repairs step by step.`,
       {showGPUDetail && (
         <GPUDetailModal
           clusterName={clusterName}
-          gpuNodes={clusterGPUs.map(n => ({
+          gpuNodes={stableClusterGPUs.map(n => ({
             name: n.name,
             gpuType: n.gpuType || 'Unknown',
             gpuCount: n.gpuCount,

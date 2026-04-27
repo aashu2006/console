@@ -32,6 +32,98 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Auth contract smoke test ──────────────────────────────────────
+  # Verifies /auth/refresh returns the "token" and "onboarded" fields
+  # that AuthCallback.tsx depends on. Catches regressions like commit
+  # 25e464fa which removed the token field and broke login for 24h.
+  auth-contract:
+    if: github.repository == 'kubestellar/console'
+    name: Auth Login Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build backend
+        run: go build -o console-bin ./cmd/console
+
+      - name: Test /auth/refresh contract
+        run: |
+          JWT_SECRET="nightly-smoke-$(openssl rand -hex 16)" \
+          DEV_MODE=true BACKEND_PORT=8081 ./console-bin &
+          PID=$!
+          # Poll /auth/github (dev-mode login) until it returns a 307 with a
+          # kc_auth cookie. In dev mode (no GITHUB_CLIENT_ID), GitHubLogin
+          # delegates to devModeLogin which sets the JWT in an HttpOnly cookie
+          # and redirects to the frontend callback URL (#6590, #4278).
+          #
+          # Previous versions called /auth/dev-login (non-existent route that
+          # fell through to the SPA catch-all 307) and expected a JSON body
+          # with a "token" field. Both assumptions were stale: the route was
+          # never registered, and the token has been cookie-only since #6590.
+          #
+          # Retry budget: MAX_TRIES * (CURL_MAX_TIME + SLEEP_SECONDS) = worst case.
+          # 10 * (2 + 1) = 30s total, matching the original intent.
+          MAX_TRIES=10         # number of poll attempts
+          CURL_MAX_TIME=2      # seconds per curl attempt
+          SLEEP_SECONDS=1      # seconds between attempts
+          MAX_RESP_CHARS=200   # chars of last response to echo in error message
+          COOKIE_JAR=/tmp/auth-cookies.txt
+          TOKEN=""
+          LAST_STATUS=""
+          for i in $(seq 1 "$MAX_TRIES"); do
+            # Use -c (cookie jar) to capture Set-Cookie headers, and avoid
+            # following the redirect so we can inspect the 307 response.
+            LAST_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+              --max-time "$CURL_MAX_TIME" \
+              -c "$COOKIE_JAR" \
+              http://localhost:8081/auth/github 2>/dev/null || echo "000")
+            # Extract the kc_auth cookie value from the Netscape cookie jar.
+            if [ -f "$COOKIE_JAR" ]; then
+              TOKEN=$(grep 'kc_auth' "$COOKIE_JAR" | awk '{print $NF}' || true)
+              if [ -n "$TOKEN" ]; then break; fi
+            fi
+            sleep "$SLEEP_SECONDS"
+          done
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Could not get dev-user token after ${MAX_TRIES} tries (~30s) (last HTTP status: ${LAST_STATUS})"
+            kill $PID 2>/dev/null; exit 1
+          fi
+          echo "Dev-mode login OK — got kc_auth cookie (HTTP ${LAST_STATUS})"
+
+          # Test /auth/refresh contract (#6590):
+          # - Token is sent via Authorization header (primary) AND cookie (fallback)
+          # - Response body must contain "refreshed" and "onboarded" (NOT "token")
+          # - New JWT is delivered exclusively via the HttpOnly kc_auth cookie
+          REFRESH_RESP=$(curl -sS --max-time 5 -X POST \
+            -H "Cookie: kc_auth=$TOKEN" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "X-Requested-With: XMLHttpRequest" \
+            http://localhost:8081/auth/refresh)
+          HAS_REFRESHED=$(echo "$REFRESH_RESP" | jq -r '.refreshed // empty')
+          if [ "$HAS_REFRESHED" != "true" ]; then
+            echo "::error::CONTRACT VIOLATION: /auth/refresh missing 'refreshed' field — response: ${REFRESH_RESP:0:$MAX_RESP_CHARS}"
+            kill $PID 2>/dev/null; exit 1
+          fi
+          HAS_ONBOARDED=$(echo "$REFRESH_RESP" | jq 'has("onboarded")')
+          if [ "$HAS_ONBOARDED" != "true" ]; then
+            echo "::error::CONTRACT VIOLATION: /auth/refresh missing 'onboarded'"
+            kill $PID 2>/dev/null; exit 1
+          fi
+          # Verify token is NOT in the body (#6590 security invariant)
+          BODY_TOKEN=$(echo "$REFRESH_RESP" | jq -r '.token // empty')
+          if [ -n "$BODY_TOKEN" ]; then
+            echo "::error::CONTRACT VIOLATION (#6590): /auth/refresh must NOT return 'token' in body — JWT is HttpOnly cookie-only"
+            kill $PID 2>/dev/null; exit 1
+          fi
+          echo "Auth contract OK"
+          kill $PID 2>/dev/null || true
+
+  # ── Dashboard health checks ──────────────────────────────────────
   health-check:
     if: github.repository == 'kubestellar/console'
     name: Dashboard Health Check
@@ -41,10 +133,10 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -86,7 +178,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nightly-dashboard-results
           path: |
@@ -96,7 +188,7 @@ jobs:
 
       - name: Upload screenshots
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nightly-screenshots
           path: web/test-results/nightly/
@@ -106,7 +198,7 @@ jobs:
 
       - name: Create issue for failures
         if: failure() && inputs.skip_issue_creation != true
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.CONSOLE_AUTO || secrets.GITHUB_TOKEN }}
           script: |

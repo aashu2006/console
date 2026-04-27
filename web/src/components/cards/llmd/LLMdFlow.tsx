@@ -5,12 +5,20 @@
  * glowing gauges, time-series sparklines, and interactive elements.
  *
  * Now supports live data from selected llm-d stack via StackContext.
+ *
+ * Issue 9071 (dark-mode pass): inline `style={{ backgroundColor|color|textShadow }}`
+ * uses in this file are intentionally data-driven — colors come from
+ * `loadColors.glow`, `COLORS.{prefill|decode|kv-transfer}`, and
+ * `metricConfig[metric].color` (per-metric brand color). These are accent
+ * colors, not surface chrome, and are designed to read on both light and
+ * dark backgrounds. They are not candidates for `dark:` variants.
  */
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CircleDot } from 'lucide-react'
 import { generateServerMetrics, type ServerMetrics } from '../../../lib/llmd/mockData'
 import { Acronym } from './shared/PortalTooltip'
+import { getLoadColors, getHorseshoeColor } from './shared/colorUtils'
 import { useOptionalStack } from '../../../contexts/StackContext'
 import { useCardDemoState, useReportCardDataState } from '../CardDataContext'
 import { usePrometheusMetrics } from '../../../hooks/usePrometheusMetrics'
@@ -68,14 +76,6 @@ const COLORS = {
   'kv-transfer': '#06b6d4',
   gateway: '#3b82f6',
   epp: '#f59e0b' }
-
-// Get color based on load percentage
-const getLoadColors = (load: number) => {
-  if (load >= 90) return { start: '#ef4444', end: '#f87171', glow: '#ef4444' }
-  if (load >= 70) return { start: '#f59e0b', end: '#fbbf24', glow: '#f59e0b' }
-  if (load >= 50) return { start: '#eab308', end: '#facc15', glow: '#eab308' }
-  return { start: '#22c55e', end: '#4ade80', glow: '#22c55e' }
-}
 
 // Premium gauge node with glowing arc
 interface PremiumNodeProps {
@@ -349,14 +349,6 @@ function FlowConnection({
       )}
     </g>
   )
-}
-
-// Color based on percentage for horseshoe
-const getHorseshoeColor = (pct: number) => {
-  if (pct >= 90) return '#ef4444'
-  if (pct >= 70) return '#f59e0b'
-  if (pct >= 50) return '#eab308'
-  return '#22c55e'
 }
 
 // Horseshoe node for alternative view
@@ -951,17 +943,17 @@ export function LLMdFlow() {
   const showEmptyState = !selectedStack && !isDemoMode
 
   return (
-    <div className={`relative w-full h-full flex-1 flex flex-col bg-gradient-to-br from-background/50 to-secondary/30 rounded-lg ${isExpanded ? 'min-h-0' : 'min-h-[300px]'}`}>
+    <div className={`relative w-full h-full flex-1 flex flex-col bg-linear-to-br from-background/50 to-secondary/30 rounded-lg ${isExpanded ? 'min-h-0' : 'min-h-[300px]'}`}>
       {/* Empty state overlay */}
       {showEmptyState && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center z-20 bg-background/60 backdrop-blur-sm">
+        <div className="absolute inset-0 flex flex-col items-center justify-center z-20 bg-background/60 backdrop-blur-xs">
           <div className="w-12 h-12 rounded-full border-2 border-border border-t-purple-500 animate-spin mb-4" />
           <span className="text-muted-foreground text-sm">{t('llmd.selectStackVisualize')}</span>
           <span className="text-muted-foreground text-xs mt-1">{t('llmd.useStackSelector')}</span>
         </div>
       )}
       {/* Header */}
-      <div className="absolute top-3 left-3 right-3 flex items-center justify-between z-10">
+      <div className="absolute top-3 left-3 right-3 flex flex-wrap items-center justify-between gap-y-2 z-10">
         <div className="flex items-center gap-4">
           {/* Stack info */}
           {selectedStack && (
@@ -1107,9 +1099,9 @@ export function LLMdFlow() {
             initial={{ opacity: 0, x: -20 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: -20 }}
-            className="absolute top-10 left-3 w-56 bg-background/95 backdrop-blur-sm rounded-xl p-4 border border-border shadow-xl"
+            className="absolute top-10 left-3 w-56 bg-background/95 backdrop-blur-xs rounded-xl p-4 border border-border shadow-xl"
           >
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
               <h4 className="text-white font-semibold text-sm">
                 {selectedMetrics.name}
               </h4>

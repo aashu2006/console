@@ -112,9 +112,9 @@ describe('usePermissions', () => {
     expect(fetch).not.toHaveBeenCalled()
   })
 
-  it('isClusterAdmin returns true for unknown cluster (assume admin when no data)', () => {
+  it('isClusterAdmin returns false for unknown cluster (fail-closed)', () => {
     const { result } = renderHook(() => usePermissions())
-    expect(result.current.isClusterAdmin('unknown')).toBe(true)
+    expect(result.current.isClusterAdmin('unknown')).toBe(false)
   })
 
   it('hasPermission returns false for unknown cluster', () => {
@@ -177,7 +177,8 @@ describe('usePermissions', () => {
     await waitFor(() => expect(fetchSpy).toHaveBeenCalled())
 
     const [url, options] = fetchSpy.mock.calls[0] as [string, RequestInit]
-    expect(url).toContain('/api/permissions/summary')
+    // #7993 Phase 6: routed through kc-agent (LOCAL_AGENT_HTTP_URL)
+    expect(url).toContain('/permissions/summary')
     const headers = options.headers as Record<string, string>
     expect(headers['Authorization']).toBe('Bearer real-jwt-token-abc123')
   })
@@ -191,8 +192,8 @@ describe('usePermissions', () => {
 
     expect(result.current.isClusterAdmin('prod-cluster')).toBe(true)
     expect(result.current.isClusterAdmin('dev-cluster')).toBe(false)
-    // Unknown cluster still returns true (assume admin when no data)
-    expect(result.current.isClusterAdmin('nonexistent')).toBe(true)
+    // Unknown cluster returns false (fail-closed security)
+    expect(result.current.isClusterAdmin('nonexistent')).toBe(false)
   })
 
   it('hasPermission returns correct values for each permission type', async () => {
@@ -398,7 +399,7 @@ describe('useCanI', () => {
     expect(result.current.checking).toBe(false)
   })
 
-  it('sends POST to /api/rbac/can-i with correct body and returns result', async () => {
+  it('sends POST to kc-agent /rbac/can-i with correct body and returns result', async () => {
     vi.mocked(isBackendUnavailable).mockReturnValue(false)
     localStorage.setItem(MOCKED_TOKEN_KEY, 'real-token')
 
@@ -424,7 +425,8 @@ describe('useCanI', () => {
 
     // Verify the request was sent correctly
     const [url, options] = fetchSpy.mock.calls[0] as [string, RequestInit]
-    expect(url).toContain('/api/rbac/can-i')
+    // #7993 Phase 6: routed through kc-agent (LOCAL_AGENT_HTTP_URL)
+    expect(url).toContain('/rbac/can-i')
     expect(options.method).toBe('POST')
     const body = JSON.parse(options.body as string)
     expect(body.cluster).toBe('prod')
@@ -434,13 +436,13 @@ describe('useCanI', () => {
     expect(body.group).toBe('apps')
   })
 
-  it('returns allowed=true on non-OK response (graceful degradation)', async () => {
+  it('returns allowed=false on non-OK response (fail-closed security)', async () => {
     vi.mocked(isBackendUnavailable).mockReturnValue(false)
     localStorage.setItem(MOCKED_TOKEN_KEY, 'real-token')
     vi.spyOn(globalThis, 'fetch').mockImplementation(mockFetchError(403))
 
     const { result } = renderHook(() => useCanI())
-    let response = { allowed: false }
+    let response = { allowed: true }
     await act(async () => {
       response = await result.current.checkPermission({
         cluster: 'test',
@@ -449,18 +451,18 @@ describe('useCanI', () => {
       })
     })
 
-    // Non-OK responses gracefully degrade to allowed=true
-    expect(response.allowed).toBe(true)
+    // SECURITY: Non-OK responses fail-closed (deny permission)
+    expect(response.allowed).toBe(false)
     expect(result.current.checking).toBe(false)
   })
 
-  it('returns allowed=true on network error (graceful degradation)', async () => {
+  it('returns allowed=false on network error (fail-closed security)', async () => {
     vi.mocked(isBackendUnavailable).mockReturnValue(false)
     localStorage.setItem(MOCKED_TOKEN_KEY, 'real-token')
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('fetch failed'))
 
     const { result } = renderHook(() => useCanI())
-    let response = { allowed: false }
+    let response = { allowed: true }
     await act(async () => {
       response = await result.current.checkPermission({
         cluster: 'test',
@@ -469,7 +471,8 @@ describe('useCanI', () => {
       })
     })
 
-    expect(response.allowed).toBe(true)
+    // SECURITY: Network errors fail-closed (deny permission)
+    expect(response.allowed).toBe(false)
     expect(result.current.checking).toBe(false)
   })
 

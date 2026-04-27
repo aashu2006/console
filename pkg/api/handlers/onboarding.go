@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -11,6 +12,21 @@ import (
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/store"
+)
+
+const (
+	// maxOnboardingResponses is the maximum number of responses accepted in a
+	// single SaveResponses call. Prevents a caller from posting unbounded data
+	// that would exhaust connection pools with individual writes (#7005).
+	maxOnboardingResponses = 50
+
+	// maxQuestionKeyLength is the maximum length of a QuestionKey field in an
+	// onboarding response (#7005).
+	maxQuestionKeyLength = 128
+
+	// maxAnswerLength is the maximum length of an Answer field in an onboarding
+	// response (#7005).
+	maxAnswerLength = 1024
 )
 
 // OnboardingHandler handles onboarding operations
@@ -40,13 +56,35 @@ func (h *OnboardingHandler) SaveResponses(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
 	}
 
+	// Cap the number of responses to prevent unbounded writes (#7005).
+	if len(responses) > maxOnboardingResponses {
+		return fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("Too many responses (%d), maximum is %d", len(responses), maxOnboardingResponses))
+	}
+
+	// Validate field lengths before persisting anything (#7005).
+	for i, r := range responses {
+		if r.QuestionKey == "" {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("response[%d]: question_key is required", i))
+		}
+		if len(r.QuestionKey) > maxQuestionKeyLength {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("response[%d]: question_key exceeds %d characters", i, maxQuestionKeyLength))
+		}
+		if len(r.Answer) > maxAnswerLength {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("response[%d]: answer exceeds %d characters", i, maxAnswerLength))
+		}
+	}
+
 	for _, r := range responses {
 		response := &models.OnboardingResponse{
 			UserID:      userID,
 			QuestionKey: r.QuestionKey,
 			Answer:      r.Answer,
 		}
-		if err := h.store.SaveOnboardingResponse(response); err != nil {
+		if err := h.store.SaveOnboardingResponse(c.UserContext(), response); err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "Failed to save response")
 		}
 	}
@@ -59,7 +97,7 @@ func (h *OnboardingHandler) CompleteOnboarding(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
 
 	// Get user's responses
-	responses, err := h.store.GetOnboardingResponses(userID)
+	responses, err := h.store.GetOnboardingResponses(c.UserContext(), userID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get responses")
 	}
@@ -73,7 +111,7 @@ func (h *OnboardingHandler) CompleteOnboarding(c *fiber.Ctx) error {
 		Name:      "My Dashboard",
 		IsDefault: true,
 	}
-	if err := h.store.CreateDashboard(dashboard); err != nil {
+	if err := h.store.CreateDashboard(c.UserContext(), dashboard); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to create dashboard")
 	}
 
@@ -86,13 +124,13 @@ func (h *OnboardingHandler) CompleteOnboarding(c *fiber.Ctx) error {
 			W: 4,
 			H: 3,
 		}
-		if err := h.store.CreateCard(&card); err != nil {
+		if err := h.store.CreateCard(c.UserContext(), &card); err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "Failed to create card")
 		}
 	}
 
 	// Mark user as onboarded
-	if err := h.store.SetUserOnboarded(userID); err != nil {
+	if err := h.store.SetUserOnboarded(c.UserContext(), userID); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to complete onboarding")
 	}
 

@@ -150,6 +150,12 @@ export const REFRESH_RATES = {
   // Cost data - very infrequent
   costs: 600_000,        // 10 minutes
 
+  // AI / ML serving workloads (InferenceServices, model registries, etc.) —
+  // moderate refresh, same cadence as clusters/services. Added for
+  // kserve_status (kubestellar/console-marketplace#38) and reusable by
+  // future AI/ML cards.
+  'ai-ml': 60_000,       // 1 minute
+
   // Default
   default: 120_000,      // 2 minutes
 } as const
@@ -401,7 +407,7 @@ class IndexedDBStorage implements CacheStorage {
         req.onsuccess = () => resolve()
         req.onerror = () => reject(req.error)
       })
-    } catch { /* ignore */ }
+    } catch (e) { console.warn('[Cache] IndexedDB put failed:', e) }
   }
 
   async delete(key: string): Promise<void> {
@@ -414,7 +420,7 @@ class IndexedDBStorage implements CacheStorage {
         req.onsuccess = () => resolve()
         req.onerror = () => resolve()
       })
-    } catch { /* ignore */ }
+    } catch (e) { console.warn('[Cache] IndexedDB delete failed:', e) }
   }
 
   async clear(): Promise<void> {
@@ -427,7 +433,7 @@ class IndexedDBStorage implements CacheStorage {
         req.onsuccess = () => resolve()
         req.onerror = () => resolve()
       })
-    } catch { /* ignore */ }
+    } catch (e) { console.warn('[Cache] IndexedDB clear failed:', e) }
   }
 
   async getStats(): Promise<{ keys: string[]; count: number }> {
@@ -899,10 +905,34 @@ class CacheStore<T> {
 
       const finalData = merge && hasCachedData ? merge(this.state.data, newData) : newData
 
+      // #6671 — Pre-save generation guard. Without this, a mode-transition
+      // that clears storage AFTER the fetch started but BEFORE this save
+      // call would see the stale fetch re-write `finalData` into storage
+      // (both sessionStorage AND the worker IDB), and the next hydration
+      // of this cache key would pick up cross-mode leaked data. The
+      // post-save check below is not enough: the sessionStorage write
+      // inside `saveToStorage` is synchronous, so the damage is done
+      // before the post-save check can see the new resetVersion.
+      if (this.resetVersion !== fetchVersion) {
+        this.fetchingRef = false
+        return
+      }
+
       await this.saveToStorage(finalData)
+      // #6671 — Re-check after saveToStorage resolves. A mode transition
+      // could have fired DURING the await above; in that case the save we
+      // just completed wrote stale data and we must clear it back out so
+      // the next mount doesn't rehydrate it. saveToStorage always writes
+      // both sessionStorage and the worker IDB, so we remove both.
+      if (this.resetVersion !== fetchVersion) {
+        try { sessionStorage.removeItem(SS_PREFIX + this.key) } catch { /* ignore */ }
+        cacheStorage.delete(this.key).catch(() => { /* ignore */ })
+        this.fetchingRef = false
+        return
+      }
       this.saveMeta({ consecutiveFailures: 0, lastSuccessfulRefresh: Date.now() })
 
-      // Final check after storage save
+      // Final check after meta save
       if (this.resetVersion !== fetchVersion) {
         this.fetchingRef = false
         return
@@ -932,7 +962,13 @@ class CacheStore<T> {
       // If a progressive fetcher pushed partial data via onProgress before
       // throwing, the state.data has been updated but never saved to storage.
       // Save it now so it survives page refresh.
-      if (hasData && this.persist) {
+      //
+      // #6672 — Generation guard on the error path. Previously a stale
+      // progressive fetch that failed after a mode transition would still
+      // persist its accumulated partial data here, re-leaking old-mode
+      // rows into storage and causing cross-mode hydration on next mount.
+      // Same class of race as #6671 on the success path.
+      if (hasData && this.persist && this.resetVersion === fetchVersion) {
         this.saveToStorage(this.state.data)
         this.initialDataLoaded = true
       }
@@ -1074,6 +1110,9 @@ export interface UseCacheResult<T> {
   isDemoFallback: boolean
 }
 
+/** Hook return shape without clearAndRefetch — used by useCached* wrapper hooks */
+export type CachedHookResult<T> = Omit<UseCacheResult<T>, 'clearAndRefetch'>
+
 export function useCache<T>({
   key,
   fetcher,
@@ -1197,10 +1236,19 @@ export function useCache<T>({
     // Only fetch immediately on initial mount or page navigation, NOT when
     // the effect re-fires due to consecutiveFailures/backoff interval changes.
     if (!isModeTransition && !initialFetchDoneRef.current && keepAliveActive) {
-      // Initial mount or page navigation remount — fetch immediately.
-      // Only mark done when we actually started a fetch (#5891).
       initialFetchDoneRef.current = true
-      refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
+      // If the shared cache already has fresh data (fetched within the refresh
+      // interval), skip the immediate fetch — the auto-refresh timer will
+      // update it in the background. This prevents dashboard navigation from
+      // blocking on multi-cluster fetches that hit unreachable clusters.
+      // The isRefreshing guard ensures hydrated-from-storage data (which starts
+      // with isRefreshing=true) always triggers a real fetch on first mount.
+      const lastRefresh = state.lastRefresh
+      const dataAge = lastRefresh ? Date.now() - lastRefresh : Infinity
+      const hasFreshData = !state.isLoading && !state.isRefreshing && dataAge < baseInterval
+      if (!hasFreshData) {
+        refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
+      }
     }
     // else: mode transition — triggerAllRefetches() will call refetch after skeleton timer
     // else: backoff re-fire — let the interval handle the next retry

@@ -2,8 +2,9 @@ import { useState } from 'react'
 import { Shield, Loader2 } from 'lucide-react'
 import { Button } from '../ui/Button'
 import { BaseModal, ConfirmDialog } from '../../lib/modals'
-import { api } from '../../lib/api'
 import { useTranslation } from 'react-i18next'
+import { LOCAL_AGENT_HTTP_URL } from '../../lib/constants'
+import { authFetch } from '../../lib/api'
 import type { NamespaceDetails, NamespaceAccessEntry } from './types'
 
 const COMMON_SUBJECTS = {
@@ -67,13 +68,33 @@ export function GrantAccessModal({ namespace, existingAccess, onClose, onGranted
     setError(null)
 
     try {
-      await api.post(`/api/namespaces/${namespace.name}/access`, {
-        cluster: namespace.cluster,
-        subjectKind,
-        subjectName,
-        subjectNamespace: subjectKind === 'ServiceAccount' ? subjectNS : undefined,
-        role,
+      // Granting namespace access creates a RoleBinding on a managed cluster,
+      // so it must run under the user's kubeconfig via kc-agent, not the
+      // backend pod ServiceAccount. See #7993 Phase 1.5 PR A. The backend
+      // POST /api/namespaces/:name/access route still exists and will be
+      // removed as part of Phase 2 once all frontend callers are migrated —
+      // this switches the only caller over. The agent's /rolebindings POST
+      // handler accepts this shape directly and normalizes it into a full
+      // CreateRoleBindingRequest before calling the shared pkg/k8s method.
+      // #8034 Copilot followup: use authFetch() which already injects the
+      // Bearer token and applies the default fetch timeout, instead of a
+      // per-file agentAuthHeaders() helper.
+      const res = await authFetch(`${LOCAL_AGENT_HTTP_URL}/rolebindings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cluster: namespace.cluster,
+          namespace: namespace.name,
+          subjectKind,
+          subjectName,
+          subjectNamespace: subjectKind === 'ServiceAccount' ? subjectNS : undefined,
+          role,
+        }),
       })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: 'Failed to grant access' }))
+        throw new Error(errorData.error || 'Failed to grant access')
+      }
       onGranted()
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to grant access'
@@ -139,7 +160,7 @@ export function GrantAccessModal({ namespace, existingAccess, onClose, onGranted
                 setSubjectKind(e.target.value as 'User' | 'Group' | 'ServiceAccount')
                 setSubjectName('') // Clear selection when type changes
               }}
-              className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             >
               <option value="User">{t('namespaces.subjectUser')}</option>
               <option value="Group">{t('namespaces.subjectGroup')}</option>
@@ -158,7 +179,7 @@ export function GrantAccessModal({ namespace, existingAccess, onClose, onGranted
                 onChange={(e) => setSubjectName(e.target.value)}
                 onFocus={() => setShowDropdown(true)}
                 placeholder={subjectKind === 'User' ? 'Select or type a user...' : subjectKind === 'Group' ? 'Select or type a group...' : 'Select or type a service account...'}
-                className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
               />
               {showDropdown && availableSubjects.length > 0 && (
                 <div className="absolute z-10 top-full left-0 right-0 mt-1 bg-card border border-border rounded-lg shadow-lg max-h-48 overflow-y-auto">
@@ -201,7 +222,7 @@ export function GrantAccessModal({ namespace, existingAccess, onClose, onGranted
                 value={subjectNS}
                 onChange={(e) => setSubjectNS(e.target.value)}
                 placeholder="default"
-                className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
               />
             </div>
           )}
@@ -211,7 +232,7 @@ export function GrantAccessModal({ namespace, existingAccess, onClose, onGranted
             <select
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 rounded-lg bg-secondary border border-border text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             >
               <option value="cluster-admin">{t('namespaces.roleClusterAdmin')}</option>
               <option value="admin">{t('namespaces.roleAdmin')}</option>
@@ -239,7 +260,7 @@ export function GrantAccessModal({ namespace, existingAccess, onClose, onGranted
             variant="primary"
             size="lg"
             onClick={handleGrant}
-            disabled={!subjectName || granting}
+            disabled={!subjectName || granting || (subjectKind === 'ServiceAccount' && !subjectNS.trim())}
             icon={granting ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
           >
             {granting ? 'Granting...' : 'Grant Access'}

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { CheckCircle, AlertTriangle, XCircle, Clock, ChevronRight, Server, Package } from 'lucide-react'
+import { formatTimeAgo } from '../../lib/formatters'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedHelmReleases } from '../../hooks/useCachedData'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
@@ -174,14 +175,7 @@ export function HelmReleaseStatus({ config }: HelmReleaseStatusProps) {
     }
   }
 
-  const formatTime = (timestamp: string) => {
-    const date = new Date(timestamp)
-    const now = new Date()
-    const diff = now.getTime() - date.getTime()
-
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
-    return `${Math.floor(diff / 86400000)}d ago`
-  }
+  const UNKNOWN_TIME_LABEL = 'Unknown'
 
   // Counts from namespace-filtered releases (pre-pagination summary)
   const deployedCount = namespacedReleases.filter(r => r.status === 'deployed').length
@@ -190,7 +184,7 @@ export function HelmReleaseStatus({ config }: HelmReleaseStatusProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={140} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -217,7 +211,7 @@ export function HelmReleaseStatus({ config }: HelmReleaseStatusProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded overflow-hidden">
       {/* Controls - single row */}
-      <div className="flex items-center justify-between gap-2 mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2 mb-4">
         <div className="flex items-center gap-2">
           {localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -331,7 +325,7 @@ export function HelmReleaseStatus({ config }: HelmReleaseStatusProps) {
                   className={`p-3 rounded-lg ${release.status === 'failed' ? 'bg-red-500/10 border border-red-500/20' : idx % 2 === 0 ? 'bg-secondary/20' : 'bg-secondary/40'} hover:bg-secondary/50 transition-colors cursor-pointer group`}
                   title={`${release.name} - ${release.chart}@${release.version} (Revision ${release.revision})`}
                 >
-                  <div className="flex items-center justify-between mb-1">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                     <div className="flex items-center gap-2">
                       <span title={`Status: ${release.status}`}><StatusIcon className={`w-4 h-4 ${STATUS_TEXT_CLASSES[color]}`} /></span>
                       <span className="text-sm text-foreground font-medium group-hover:text-purple-400" title={release.name}>{release.name}</span>
@@ -353,7 +347,7 @@ export function HelmReleaseStatus({ config }: HelmReleaseStatusProps) {
                     {release.cluster && <div className="shrink-0"><ClusterBadge cluster={release.cluster} size="sm" /></div>}
                     <span className="truncate" title={`Chart: ${release.chart}, Version: ${release.version}`}>{release.chart}@{release.version}</span>
                     <span className="shrink-0 whitespace-nowrap" title={`Helm revision: ${release.revision}`}>Rev {release.revision}</span>
-                    <span className="ml-auto shrink-0 whitespace-nowrap" title={`Last updated: ${new Date(release.updated).toLocaleString()}`}>{formatTime(release.updated)}</span>
+                    <span className="ml-auto shrink-0 whitespace-nowrap" title={`Last updated: ${release.updated && !Number.isNaN(new Date(release.updated).getTime()) ? new Date(release.updated).toLocaleString() : UNKNOWN_TIME_LABEL}`}>{formatTimeAgo(release.updated ?? '', { invalidLabel: UNKNOWN_TIME_LABEL })}</span>
                   </div>
                 </div>
               )

@@ -20,6 +20,7 @@ const ACCELERATION = 0.15
 const DECELERATION = 0.08
 const TURN_SPEED = 0.06
 const FRICTION = 0.98
+const COUNTDOWN_INTERVAL_MS = 1000
 const AI_COUNT = 3
 const FORWARD_ANGLE = -Math.PI / 2 // Pointing "up" on screen
 
@@ -150,22 +151,22 @@ export function KubeKart() {
     activeShieldRef.current = 0
   }, [])
 
-  // Get track curve at position
-  const getTrackCurve = (y: number): number => {
+  // Get track curve at position — stable ref for render/update deps
+  const getTrackCurve = useCallback((y: number): number => {
     const period = 400
     const phase = (y + trackScrollRef.current) / period
     return Math.sin(phase) * 0.3
-  }
+  }, [])
 
-  // Check if position is on track
-  const isOnTrack = (x: number): boolean => {
+  // Check if position is on track — stable ref for update deps
+  const isOnTrack = useCallback((x: number): boolean => {
     const trackLeft = (CANVAS_WIDTH - TRACK_WIDTH) / 2
     const trackRight = trackLeft + TRACK_WIDTH
     return x >= trackLeft + 20 && x <= trackRight - 20
-  }
+  }, [])
 
   // Update AI karts - drive straight at moderate speed in fixed lanes
-  const updateAI = (kart: Kart, index: number) => {
+  const updateAI = useCallback((kart: Kart, index: number) => {
     const maxAiSpeed = MAX_SPEED * (0.65 + index * 0.05)
     if (kart.speed < maxAiSpeed) {
       kart.speed += ACCELERATION * 0.6
@@ -186,7 +187,7 @@ export function KubeKart() {
 
     // Face forward
     kart.angle = FORWARD_ANGLE
-  }
+  }, [])
 
   // Game update
   const update = useCallback(() => {
@@ -483,7 +484,7 @@ export function KubeKart() {
     if (gameState !== 'countdown') return
 
     if (countdown > 0) {
-      const timer = setTimeout(() => setCountdown(c => c - 1), 1000)
+      const timer = setTimeout(() => setCountdown(c => c - 1), COUNTDOWN_INTERVAL_MS)
       return () => clearTimeout(timer)
     } else {
       setGameState('playing')
@@ -502,6 +503,8 @@ export function KubeKart() {
   }, [gameState, initTrack, render])
 
   const startGame = () => {
+    cancelAnimationFrame(animationRef.current)
+    keysRef.current.clear()
     initTrack()
     raceTimeRef.current = 0
     setRaceTime(0)
@@ -527,7 +530,7 @@ export function KubeKart() {
     <div ref={gameContainerRef} className="h-full flex flex-col">
       <div className={`flex flex-col items-center gap-3 ${isExpanded ? 'flex-1 min-h-0' : ''}`}>
         {/* Stats bar */}
-        <div className="flex items-center justify-between w-full max-w-[400px] text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 w-full max-w-[400px] text-sm">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-1">
               <Flag className="w-4 h-4 text-green-400" />

@@ -114,7 +114,14 @@ function KeyValueItem({
       }
 
       case 'timestamp': {
-        const date = value instanceof Date ? value : new Date(String(value))
+        // #6711 — Guard against invalid dates so we don't render the string
+        // "Invalid Date". When `value` is null/undefined/unparseable, the
+        // Date constructor produces a NaN-timestamp Date whose toISOString()
+        // throws. Check validity first and render an em-dash placeholder.
+        const date = value instanceof Date ? value : new Date(String(value ?? ''))
+        if (isNaN(date.getTime())) {
+          return <span className="text-muted-foreground">—</span>
+        }
         return (
           <span title={date.toISOString()}>
             {date.toLocaleString()}
@@ -392,7 +399,7 @@ export function AlertSection({
   return (
     <div className={`p-3 rounded-lg border ${styles[type]} ${className}`}>
       <div className="flex items-start gap-2">
-        <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
         <div>
           {title && (
             <p className="font-medium text-sm">{title}</p>

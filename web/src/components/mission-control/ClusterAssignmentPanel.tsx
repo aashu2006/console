@@ -6,10 +6,11 @@
  */
 
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { Loader2, Wand2, Shuffle, LayoutGrid, Table, Plus, X } from 'lucide-react'
+import { Loader2, Wand2, Shuffle, LayoutGrid, Table } from 'lucide-react'
 import { motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import rehypeSanitize from 'rehype-sanitize'
 import { Button } from '../ui/Button'
 import { ClusterReadinessCard } from './ClusterReadinessCard'
 import { AssignmentMatrix } from './AssignmentMatrix'
@@ -19,14 +20,13 @@ import type { Mission } from '../../hooks/useMissions'
 // Import cluster data hook
 import { useClusters } from '../../hooks/mcp/clusters'
 import { useHelmReleases } from '../../hooks/mcp/helm'
-import { clusterDisplayName } from '../../hooks/mcp/shared'
 
 type ViewMode = 'cards' | 'matrix'
 
 interface ClusterAssignmentPanelProps {
   state: MissionControlState
   onAskAI: (projects: PayloadProject[], clustersJson: string) => void
-  onAutoAssign: (clusters: Array<{ name: string; context?: string; distribution?: string; cpuCores?: number; memoryGB?: number; storageGB?: number; cpuUsageCores?: number; cpuRequestsCores?: number; memoryUsageGB?: number; memoryRequestsGB?: number }>) => void
+  onAutoAssign: (clusters: Array<{ name: string; context?: string; distribution?: string; cpuCores?: number; memoryGB?: number; storageGB?: number; cpuUsageCores?: number; cpuRequestsCores?: number; memoryUsageGB?: number; memoryRequestsGB?: number }>) => void | Promise<void>
   onSetAssignment: (clusterName: string, projectName: string, assigned: boolean) => void
   aiStreaming: boolean
   planningMission?: Mission | null
@@ -50,21 +50,31 @@ export function ClusterAssignmentPanel({
   const { deduplicatedClusters: clusters, isLoading: clustersLoading } = useClusters()
   const { releases: helmReleases } = useHelmReleases()
   const [viewMode, setViewMode] = useState<ViewMode>('cards')
-  const [autoAssignDone, setAutoAssignDone] = useState(false)
-  const [excludedClusters, setExcludedClusters] = useState<Set<string>>(new Set())
-  const [showClusterPicker, setShowClusterPicker] = useState(false)
+  const [, setAutoAssignDone] = useState(false)
+  // Cluster set is owned by Define Mission (state.targetClusters); the panel
+  // no longer maintains a local excluded set.
+  const excludedClusters = useMemo(() => new Set<string>(), [])
 
-  // Healthy clusters only — sort by name for stable ordering when toggling projects (#4548)
+  // Healthy clusters only — sort by name for stable ordering when toggling projects (#4548).
+  // ALSO scope to state.targetClusters when the user picked a subset on the
+  // previous step (Define Mission > TARGET CLUSTERS). Without this filter,
+  // the user picks 1 cluster and Chart Your Course shows all 5 — which both
+  // misleads the AI and wastes the user's earlier scoping choice. An empty
+  // targetClusters list means "all clusters" (the default state when the
+  // user hasn't narrowed down).
+  const targetClustersSet = useMemo(
+    () => new Set(state.targetClusters || []),
+    [state.targetClusters]
+  )
   const allHealthyClusters = useMemo(
     () => clusters
       .filter((c) => c.healthy !== false && c.reachable !== false)
+      .filter((c) => targetClustersSet.size === 0 || targetClustersSet.has(c.name))
       .sort((a, b) => a.name.localeCompare(b.name)),
-    [clusters]
+    [clusters, targetClustersSet]
   )
   // Active clusters = healthy minus excluded
   const healthyClusters = allHealthyClusters.filter((c) => !excludedClusters.has(c.name))
-  // Excluded but available
-  const removedClusters = allHealthyClusters.filter((c) => excludedClusters.has(c.name))
 
   const projectNames = state.projects.map((p) => p.name)
 
@@ -116,25 +126,16 @@ export function ClusterAssignmentPanel({
         storageGB: c.storageGB,
         cpuUsageCores: c.cpuUsageCores,
         memoryUsageGB: c.memoryUsageGB,
-        namespaces: c.namespaces?.length ?? 0 })),
+        namespaces: c.namespaces?.length ?? 0
+      })),
       null,
       2
     )
     onAskAI(state.projects, clustersJson)
   }
 
-  // Show cluster picker on first mount so user can select clusters before auto-assign
-  useEffect(() => {
-    if (
-      !autoAssignDone &&
-      !aiStreaming &&
-      allHealthyClusters.length > 0 &&
-      state.assignments.length === 0 &&
-      state.projects.length > 0
-    ) {
-      setShowClusterPicker(true)
-    }
-  }, [allHealthyClusters.length])
+  // Cluster picker no longer lives on this panel — selection is owned by
+  // Define Mission's TARGET CLUSTERS picker. Nothing to auto-open here.
 
   return (
     <div className="max-w-7xl mx-auto p-6 space-y-6">
@@ -154,7 +155,7 @@ export function ClusterAssignmentPanel({
               variant="ghost"
               size="sm"
               onClick={() => setViewMode('cards')}
-              className={`!p-1.5 !rounded-none ${viewMode === 'cards' ? 'bg-primary/10 text-primary' : ''}`}
+              className={`p-1.5! rounded-none! ${viewMode === 'cards' ? 'bg-primary/10 text-primary' : ''}`}
               title="Card view"
               icon={<LayoutGrid className="w-4 h-4" />}
             />
@@ -162,99 +163,22 @@ export function ClusterAssignmentPanel({
               variant="ghost"
               size="sm"
               onClick={() => setViewMode('matrix')}
-              className={`!p-1.5 !rounded-none ${viewMode === 'matrix' ? 'bg-primary/10 text-primary' : ''}`}
+              className={`p-1.5! rounded-none! ${viewMode === 'matrix' ? 'bg-primary/10 text-primary' : ''}`}
               title="Matrix view"
               icon={<Table className="w-4 h-4" />}
             />
           </div>
 
-          {/* Add/remove clusters */}
-          <div className="relative">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setShowClusterPicker(!showClusterPicker)}
-              icon={<Plus className="w-3.5 h-3.5" />}
-            >
-              {healthyClusters.length}/{allHealthyClusters.length} Clusters
-            </Button>
-
-            {showClusterPicker && (
-              <>
-                <div className="fixed inset-0 z-20" role="presentation" aria-hidden="true" onClick={() => setShowClusterPicker(false)} />
-                <div className="absolute right-0 top-full mt-1 w-72 bg-slate-900 border border-border rounded-lg shadow-xl z-30 py-2 max-h-80 overflow-y-auto">
-                  <div className="px-3 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
-                    Active Clusters
-                  </div>
-                  {healthyClusters.map((c) => (
-                    <div
-                      key={c.name}
-                      className="flex items-center justify-between px-3 py-1.5 hover:bg-secondary/50"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                        <span className="text-xs font-medium" title={c.name}>{clusterDisplayName(c.name)}</span>
-                        <span className="text-[10px] text-muted-foreground">{c.distribution || 'k8s'}</span>
-                      </div>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => {
-                          setExcludedClusters((prev) => new Set([...prev, c.name]))
-                          // Clear any existing assignments for the excluded cluster (#5534)
-                          const existing = state.assignments.find((a) => a.clusterName === c.name)
-                          if (existing) {
-                            for (const pName of existing.projectNames) {
-                              onSetAssignment(c.name, pName, false)
-                            }
-                          }
-                        }}
-                        className="!p-0.5 text-muted-foreground hover:text-destructive"
-                        title="Remove from mission"
-                        icon={<X className="w-3 h-3" />}
-                      />
-                    </div>
-                  ))}
-
-                  {removedClusters.length > 0 && (
-                    <>
-                      <div className="border-t border-border my-1" />
-                      <div className="px-3 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
-                        Available Clusters
-                      </div>
-                      {removedClusters.map((c) => (
-                        <div
-                          key={c.name}
-                          className="flex items-center justify-between px-3 py-1.5 hover:bg-secondary/50"
-                        >
-                          <div className="flex items-center gap-2">
-                            <span className="w-2 h-2 rounded-full bg-slate-500" />
-                            <span className="text-xs font-medium text-muted-foreground" title={c.name}>{clusterDisplayName(c.name)}</span>
-                            <span className="text-[10px] text-muted-foreground">{c.distribution || 'k8s'}</span>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setExcludedClusters((prev) => {
-                              const next = new Set(prev)
-                              next.delete(c.name)
-                              return next
-                            })}
-                            className="!text-[10px] !px-2 !py-0.5 bg-primary/10 text-primary hover:bg-primary/20"
-                          >
-                            Add
-                          </Button>
-                        </div>
-                      ))}
-                    </>
-                  )}
-
-                  {allHealthyClusters.length === 0 && (
-                    <div className="px-3 py-2 text-xs text-muted-foreground">No healthy clusters found</div>
-                  )}
-                </div>
-              </>
-            )}
+          {/* Cluster count — passive display. Cluster selection is owned by
+              Define Mission > TARGET CLUSTERS so there's a single source of
+              truth for the mission scope. To change the cluster mix, the user
+              goes back one step. */}
+          <div
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-secondary/50 text-xs text-muted-foreground"
+            title="Cluster selection is set in the Define Mission step"
+          >
+            <span className="font-medium text-foreground">{healthyClusters.length}</span>
+            <span>cluster{healthyClusters.length === 1 ? '' : 's'}</span>
           </div>
 
           <Button
@@ -321,35 +245,37 @@ export function ClusterAssignmentPanel({
                 // Merge helm-generated notes with AI warnings (dedupe by checking if AI already mentions the project)
                 const mergedAssignment = aiAssignment && helmNotes.length > 0
                   ? {
-                      ...aiAssignment,
-                      warnings: [
-                        ...helmNotes.filter(note => {
-                          // Don't add helm note if AI already has a warning about the same project
-                          const aiWarnings = aiAssignment.warnings ?? []
-                          return !aiWarnings.some(w => {
-                            // Compare by checking if both mention the same project name
-                            const noteProject = note.split(' already')[0].toLowerCase()
-                            return w.toLowerCase().includes(noteProject)
-                          })
-                        }),
-                        ...(aiAssignment.warnings ?? []),
-                      ] }
+                    ...aiAssignment,
+                    warnings: [
+                      ...helmNotes.filter(note => {
+                        // Don't add helm note if AI already has a warning about the same project
+                        const aiWarnings = aiAssignment.warnings ?? []
+                        return !aiWarnings.some(w => {
+                          // Compare by checking if both mention the same project name
+                          const noteProject = note.split(' already')[0].toLowerCase()
+                          return w.toLowerCase().includes(noteProject)
+                        })
+                      }),
+                      ...(aiAssignment.warnings ?? []),
+                    ]
+                  }
                   : aiAssignment
                 return (
-                <div key={cluster.name} data-testid={`mission-control-cluster-${cluster.name}`}>
-                <ClusterReadinessCard
-                  cluster={cluster}
-                  assignment={mergedAssignment}
-                  onToggleProject={(name, assigned) =>
-                    onSetAssignment(cluster.name, name, assigned)
-                  }
-                  availableProjects={projectNames}
-                  isRecommended={state.assignments.some(
-                    (a) => a.clusterName === cluster.name && a.projectNames.length > 0
-                  )}
-                  installedOnCluster={installedOnCluster}
-                />
-                </div>
+                  <div key={cluster.name} data-testid={`mission-control-cluster-${cluster.name}`}>
+                    <ClusterReadinessCard
+                      cluster={cluster}
+                      assignment={mergedAssignment}
+                      onToggleProject={(name, assigned) =>
+                        onSetAssignment(cluster.name, name, assigned)
+                      }
+                      availableProjects={projectNames}
+                      isRecommended={state.assignments.some(
+                        (a) => a.clusterName === cluster.name && a.projectNames.length > 0
+                      )}
+                      installedOnCluster={installedOnCluster}
+                      projects={state.projects}
+                    />
+                  </div>
                 )
               })}
             </div>
@@ -429,7 +355,7 @@ function AIAssignmentStreamPreview({ planningMission }: { planningMission?: Miss
         className="px-4 py-3 max-h-40 overflow-y-auto text-xs text-foreground/80 leading-relaxed prose prose-invert prose-xs max-w-none [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_p]:my-1 [&_strong]:text-foreground/90"
       >
         {displayText ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
             {displayText}
           </ReactMarkdown>
         ) : (

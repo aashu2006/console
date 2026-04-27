@@ -1,4 +1,5 @@
 import { Shield, AlertTriangle, User, Network, Server, ChevronRight } from 'lucide-react'
+import { VULN_SEVERITY_ORDER } from '../../types/alerts'
 import type { SecurityIssue } from '../../hooks/useMCP'
 import { useCachedSecurityIssues } from '../../hooks/useCachedData'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
@@ -120,7 +121,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
     consecutiveFailures,
     lastRefresh: isDemoMode ? null : lastRefresh })
 
-  const severityOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
+  const severityOrder = VULN_SEVERITY_ORDER
 
   // Use shared card data hook for filtering, sorting, and pagination
   const {
@@ -179,7 +180,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <div className="flex items-center gap-2">
             <div className="h-4 w-24 bg-secondary rounded animate-pulse" />
             <div className="h-4 w-12 bg-secondary rounded animate-pulse" />
@@ -243,7 +244,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           {highCount > 0 && (
             <StatusBadge color="red" title={t('securityIssues.highSeverityTitle', { count: highCount })}>
@@ -310,7 +311,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
               title={t('securityIssues.clickViewPod', { name: issue.name, issue: issue.issue })}
             >
               <div className="flex items-start gap-2 group">
-                <div className={`p-1.5 rounded-lg ${colors.badge} flex-shrink-0`} title={iconTooltip}>
+                <div className={`p-1.5 rounded-lg ${colors.badge} shrink-0`} title={iconTooltip}>
                   <Icon className={`w-4 h-4 ${colors.text}`} />
                 </div>
                 <div className="flex-1 min-w-0">
@@ -344,7 +345,7 @@ function SecurityIssuesInternal({ config }: SecurityIssuesProps) {
                   issues={[{ name: issue.issue, message: issue.details || issue.issue }]}
                   additionalContext={{ severity: issue.severity, securityIssue: issue.issue }}
                 />
-                <span title="Click to view details"><ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-1" /></span>
+                <span title="Click to view details"><ChevronRight className="w-4 h-4 text-muted-foreground shrink-0 mt-1" /></span>
               </div>
             </div>
           )

@@ -14,6 +14,7 @@ import { useCardLoadingState } from '../../CardDataContext'
 import { MultiTenancyDetailModal } from './MultiTenancyDetailModal'
 import { useModalState } from '../../../../lib/modals'
 
+import { ISOLATION_STATUS_COLORS } from '../shared'
 import type { ComponentStatus, IsolationLevel, IsolationStatus } from './useMultiTenancyOverview'
 
 /** Grid columns for the component status grid */
@@ -52,12 +53,6 @@ function IsolationStatusIcon({ status }: { status: IsolationStatus }) {
   }
 }
 
-/** Status color text for isolation levels */
-const ISOLATION_STATUS_COLORS: Record<IsolationStatus, string> = {
-  ready: 'text-green-400',
-  degraded: 'text-orange-400',
-  missing: 'text-zinc-500' }
-
 /** Single component badge in the 2x2 grid */
 function ComponentBadge({ component, onClick }: { component: ComponentStatus; onClick?: () => void }) {
   const IconComponent = ICON_MAP[component.icon] || Shield
@@ -81,7 +76,7 @@ function ComponentBadge({ component, onClick }: { component: ComponentStatus; on
 /** Single isolation level row */
 function IsolationRow({ level, onClick }: { level: IsolationLevel; onClick?: () => void }) {
   return (
-    <div className="flex items-center justify-between py-1.5 cursor-pointer hover:bg-secondary/50 transition-colors rounded px-1 -mx-1" role="button" tabIndex={0} aria-label={`${level.type} isolation: ${level.status}`} onClick={onClick} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick?.() } }}>
+    <div className="flex flex-wrap items-center justify-between gap-y-2 py-1.5 cursor-pointer hover:bg-secondary/50 transition-colors rounded px-1 -mx-1" role="button" tabIndex={0} aria-label={`${level.type} isolation: ${level.status}`} onClick={onClick} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick?.() } }}>
       <div className="flex items-center gap-2">
         <IsolationStatusIcon status={level.status} />
         <span className="text-xs font-medium text-foreground">{level.type}</span>
@@ -151,7 +146,7 @@ export function MultiTenancyOverview() {
   return (
     <div className="h-full flex flex-col gap-3">
       {/* Overall score header */}
-      <div className="flex items-center justify-between px-2 py-1.5 bg-secondary/30 rounded-lg cursor-pointer hover:bg-secondary/50 transition-colors" role="button" tabIndex={0} aria-labelledby="multi-tenancy-isolation-score-header" onClick={openDetailModal} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetailModal() } }}>
+      <div className="flex flex-wrap items-center justify-between gap-y-2 px-2 py-1.5 bg-secondary/30 rounded-lg cursor-pointer hover:bg-secondary/50 transition-colors" role="button" tabIndex={0} aria-labelledby="multi-tenancy-isolation-score-header" onClick={openDetailModal} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetailModal() } }}>
         <div className="flex items-center gap-2">
           <Shield className="w-4 h-4 text-cyan-400" />
           <span className="text-xs font-medium text-foreground" id="multi-tenancy-isolation-score-header">

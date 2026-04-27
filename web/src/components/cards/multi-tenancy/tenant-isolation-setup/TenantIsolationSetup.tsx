@@ -23,6 +23,7 @@ import {
   KUBEVIRT_INSTALL_PROMPT } from './missionPrompts'
 import { loadMissionPrompt } from '../missionLoader'
 
+import { ISOLATION_STATUS_COLORS } from '../shared'
 import type { ComponentReadiness, IsolationLevel, IsolationStatus } from './useTenantIsolationSetup'
 
 /** Icon map for component keys */
@@ -50,12 +51,6 @@ function IsolationStatusIcon({ status }: { status: IsolationStatus }) {
       return <XCircle className="w-3.5 h-3.5 text-zinc-500" />
   }
 }
-
-/** Color classes for isolation status */
-const ISOLATION_STATUS_COLORS: Record<IsolationStatus, string> = {
-  ready: 'text-green-400',
-  degraded: 'text-orange-400',
-  missing: 'text-zinc-500' }
 
 /** Component readiness badge */
 function ReadinessBadge({ component, onInstall }: {
@@ -87,7 +82,7 @@ function ReadinessBadge({ component, onInstall }: {
 /** Isolation level row */
 function IsolationLevelRow({ level }: { level: IsolationLevel }) {
   return (
-    <div className="flex items-center justify-between py-1">
+    <div className="flex flex-wrap items-center justify-between gap-y-2 py-1">
       <div className="flex items-center gap-1.5">
         <IsolationStatusIcon status={level.status} />
         <span className="text-xs text-foreground">{level.type}</span>
@@ -204,7 +199,7 @@ export function TenantIsolationSetup() {
         <div className="text-xs text-muted-foreground mb-1.5 font-medium">
           {t('cards:multiTenancy.componentReadiness', 'Component Readiness')} ({data.readyCount}/{data.totalComponents})
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 @md:grid-cols-4 gap-2">
           {(data.components || []).map((component) => (
             <ReadinessBadge
               key={component.key}
@@ -217,7 +212,7 @@ export function TenantIsolationSetup() {
 
       {/* Isolation levels */}
       <div className="flex-1">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 @md:grid-cols-2 gap-3">
           {/* Isolation level indicators */}
           <div>
             <div className="text-xs text-muted-foreground mb-1.5 font-medium">

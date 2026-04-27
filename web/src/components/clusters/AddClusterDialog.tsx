@@ -93,7 +93,7 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
     try {
       const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/kubeconfig/preview`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ kubeconfig: kubeconfigYaml }),
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
       if (!res.ok) {
@@ -115,7 +115,7 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
     try {
       const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/kubeconfig/import`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ kubeconfig: kubeconfigYaml }),
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
       if (!res.ok) {
@@ -144,7 +144,7 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
     try {
       const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/kubeconfig/test`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({
           serverUrl,
           authType,
@@ -169,7 +169,7 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
     try {
       const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/kubeconfig/add`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({
           contextName,
           clusterName,
@@ -227,6 +227,17 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
     setConnectStep(step)
   }
 
+  // Clear stale close timers when the dialog is closed (#7593)
+  // Also reset per-tab form state on close so the next open starts fresh.
+  // (During a single open session, state is preserved across tab switches — see #8913.)
+  useEffect(() => {
+    if (!open) {
+      clearTimeout(closeTimerRef.current)
+      resetConnectState()
+      resetImportState()
+    }
+  }, [open])
+
   if (!open) return null
 
   const tabs: { id: TabId; label: string; icon: React.ReactNode; disabled?: boolean }[] = [
@@ -239,7 +250,7 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
     <div className="fixed inset-0 z-modal flex items-center justify-center">
       {/* Backdrop */}
       <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        className="absolute inset-0 bg-black/60 backdrop-blur-xs"
         aria-hidden="true"
       />
 
@@ -269,9 +280,11 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
               key={tab.id}
               onClick={() => {
                 if (!tab.disabled) {
+                  // Preserve each tab's form state when switching tabs so users
+                  // don't lose work if they click the wrong tab by mistake (#8913).
+                  // State is still cleared on dialog close (handleClose) and on
+                  // successful import/add via resetImportState / resetConnectState.
                   setActiveTab(tab.id)
-                  if (tab.id !== 'connect') resetConnectState()
-                  if (tab.id !== 'import') resetImportState()
                 }
               }}
               disabled={tab.disabled}
@@ -339,6 +352,7 @@ export function AddClusterDialog({ open, onClose }: AddClusterDialogProps) {
               namespace={namespace}
               setNamespace={setNamespace}
               testResult={testResult}
+              resetTestResult={() => setTestResult(null)}
               connectError={connectError}
               showAdvanced={showAdvanced}
               setShowAdvanced={setShowAdvanced}

@@ -1,8 +1,9 @@
 import { useState, useMemo, useImperativeHandle, type Ref } from 'react'
 import {
   GitBranch, AlertTriangle, CheckCircle, XCircle,
-  Clock, Loader2, ExternalLink, Key, Settings, Plus, X, Check } from 'lucide-react'
+  Clock, Loader2, ExternalLink, Key, Settings, Plus, X, Check, Stethoscope } from 'lucide-react'
 import { FETCH_EXTERNAL_TIMEOUT_MS } from '../../../lib/constants'
+import { MS_PER_SECOND, MS_PER_MINUTE, MS_PER_HOUR } from '../../../lib/constants/time'
 import { Button } from '../../ui/Button'
 import { Skeleton } from '../../ui/Skeleton'
 import { Pagination } from '../../ui/Pagination'
@@ -12,11 +13,25 @@ import { CardSearchInput, CardAIActions } from '../../../lib/cards/CardComponent
 import { useCardLoadingState } from '../CardDataContext'
 import { useCache } from '../../../lib/cache'
 import type { SortDirection } from '../../../lib/cards/cardHooks'
+import { useMissions } from '../../../hooks/useMissions'
+import { GitHubWorkflowRunsResponseSchema } from '../../../lib/schemas'
+import { validateResponse } from '../../../lib/schemas/validate'
 import { cn } from '../../../lib/cn'
 import { WorkloadMonitorAlerts } from './WorkloadMonitorAlerts'
 import type { MonitorIssue } from '../../../types/workloadMonitor'
 import { useTranslation } from 'react-i18next'
 import { formatTimeAgo, loadRepos, saveRepos } from './gitHubCIUtils'
+import { usePipelineFilter } from '../pipelines/PipelineFilterContext'
+import { RepoSubtitle } from '../pipelines/RepoSubtitle'
+
+const THIRTY_SECONDS_MS = 30 * MS_PER_SECOND
+const TWO_MINUTES_MS = 2 * MS_PER_MINUTE
+const FIVE_MINUTES_MS = 5 * MS_PER_MINUTE
+const TEN_MINUTES_MS = 10 * MS_PER_MINUTE
+const FIFTEEN_MINUTES_MS = 15 * MS_PER_MINUTE
+const TWENTY_MINUTES_MS = 20 * MS_PER_MINUTE
+const THIRTY_MINUTES_MS = 30 * MS_PER_MINUTE
+const TWO_HOURS_MS = 2 * MS_PER_HOUR
 
 interface GitHubCIMonitorProps {
   config?: Record<string, unknown>
@@ -42,6 +57,8 @@ interface WorkflowRun {
   createdAt: string
   updatedAt: string
   url: string
+  prNumber?: number
+  prUrl?: string
 }
 
 type SortField = 'name' | 'status' | 'repo' | 'branch'
@@ -75,25 +92,31 @@ const SORT_OPTIONS = [
   { value: 'branch', label: 'Branch' },
 ]
 
+const TITLE_DIAGNOSE = 'Diagnose with AI'
+
 // Demo data for when GitHub API is not available
 const DEMO_WORKFLOWS: WorkflowRun[] = [
-  { id: '1', name: 'CI / Build & Test', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'success', branch: 'main', event: 'push', runNumber: 1234, createdAt: new Date(Date.now() - 300000).toISOString(), updatedAt: new Date(Date.now() - 60000).toISOString(), url: '#' },
-  { id: '2', name: 'CI / Lint', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'failure', branch: 'feat/new-feature', event: 'pull_request', runNumber: 1233, createdAt: new Date(Date.now() - 600000).toISOString(), updatedAt: new Date(Date.now() - 300000).toISOString(), url: '#' },
-  { id: '3', name: 'Release / Publish', repo: 'kubestellar/kubestellar', status: 'in_progress', conclusion: null, branch: 'main', event: 'workflow_dispatch', runNumber: 1232, createdAt: new Date(Date.now() - 120000).toISOString(), updatedAt: new Date(Date.now() - 30000).toISOString(), url: '#' },
-  { id: '4', name: 'E2E Tests', repo: 'kubestellar/console', status: 'completed', conclusion: 'success', branch: 'main', event: 'push', runNumber: 567, createdAt: new Date(Date.now() - 900000).toISOString(), updatedAt: new Date(Date.now() - 600000).toISOString(), url: '#' },
-  { id: '5', name: 'CI / Build & Test', repo: 'kubestellar/console', status: 'completed', conclusion: 'success', branch: 'feat/workload-monitor', event: 'pull_request', runNumber: 566, createdAt: new Date(Date.now() - 1200000).toISOString(), updatedAt: new Date(Date.now() - 900000).toISOString(), url: '#' },
-  { id: '6', name: 'Deploy Preview', repo: 'kubestellar/console', status: 'queued', conclusion: null, branch: 'feat/card-factory', event: 'pull_request', runNumber: 565, createdAt: new Date(Date.now() - 60000).toISOString(), updatedAt: new Date(Date.now() - 30000).toISOString(), url: '#' },
-  { id: '7', name: 'Security Scan', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'timed_out', branch: 'main', event: 'schedule', runNumber: 1231, createdAt: new Date(Date.now() - 3600000).toISOString(), updatedAt: new Date(Date.now() - 1800000).toISOString(), url: '#' },
-  { id: '8', name: 'Dependabot', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'success', branch: 'dependabot/npm/react-19', event: 'pull_request', runNumber: 1230, createdAt: new Date(Date.now() - 7200000).toISOString(), updatedAt: new Date(Date.now() - 3600000).toISOString(), url: '#' },
+  { id: '1', name: 'CI / Build & Test', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'success', branch: 'main', event: 'push', runNumber: 1234, createdAt: new Date(Date.now() - FIVE_MINUTES_MS).toISOString(), updatedAt: new Date(Date.now() - MS_PER_MINUTE).toISOString(), url: '#' },
+  { id: '2', name: 'CI / Lint', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'failure', branch: 'feat/new-feature', event: 'pull_request', runNumber: 1233, createdAt: new Date(Date.now() - TEN_MINUTES_MS).toISOString(), updatedAt: new Date(Date.now() - FIVE_MINUTES_MS).toISOString(), url: '#' },
+  { id: '3', name: 'Release / Publish', repo: 'kubestellar/kubestellar', status: 'in_progress', conclusion: null, branch: 'main', event: 'workflow_dispatch', runNumber: 1232, createdAt: new Date(Date.now() - TWO_MINUTES_MS).toISOString(), updatedAt: new Date(Date.now() - THIRTY_SECONDS_MS).toISOString(), url: '#' },
+  { id: '4', name: 'E2E Tests', repo: 'kubestellar/console', status: 'completed', conclusion: 'success', branch: 'main', event: 'push', runNumber: 567, createdAt: new Date(Date.now() - FIFTEEN_MINUTES_MS).toISOString(), updatedAt: new Date(Date.now() - TEN_MINUTES_MS).toISOString(), url: '#' },
+  { id: '5', name: 'CI / Build & Test', repo: 'kubestellar/console', status: 'completed', conclusion: 'success', branch: 'feat/workload-monitor', event: 'pull_request', runNumber: 566, createdAt: new Date(Date.now() - TWENTY_MINUTES_MS).toISOString(), updatedAt: new Date(Date.now() - FIFTEEN_MINUTES_MS).toISOString(), url: '#' },
+  { id: '6', name: 'Deploy Preview', repo: 'kubestellar/console', status: 'queued', conclusion: null, branch: 'feat/card-factory', event: 'pull_request', runNumber: 565, createdAt: new Date(Date.now() - MS_PER_MINUTE).toISOString(), updatedAt: new Date(Date.now() - THIRTY_SECONDS_MS).toISOString(), url: '#' },
+  { id: '7', name: 'Security Scan', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'timed_out', branch: 'main', event: 'schedule', runNumber: 1231, createdAt: new Date(Date.now() - MS_PER_HOUR).toISOString(), updatedAt: new Date(Date.now() - THIRTY_MINUTES_MS).toISOString(), url: '#' },
+  { id: '8', name: 'Dependabot', repo: 'kubestellar/kubestellar', status: 'completed', conclusion: 'success', branch: 'dependabot/npm/react-19', event: 'pull_request', runNumber: 1230, createdAt: new Date(Date.now() - TWO_HOURS_MS).toISOString(), updatedAt: new Date(Date.now() - MS_PER_HOUR).toISOString(), url: '#' },
 ]
 
 
 export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: Ref<GitHubCIMonitorRef> }) {
   const { t } = useTranslation()
+  const { startMission } = useMissions()
   const ghConfig = config as GitHubCIConfig | undefined
+  const shared = usePipelineFilter()
 
-  // Repo configuration
-  const [repos, setRepos] = useState<string[]>(() => ghConfig?.repos || loadRepos())
+  // Repo configuration — shared filter overrides when on /ci-cd
+  const [localRepos, setLocalRepos] = useState<string[]>(() => ghConfig?.repos || loadRepos())
+  const repos = shared?.repoFilter ? [shared.repoFilter] : localRepos
+  const setRepos: React.Dispatch<React.SetStateAction<string[]>> = shared?.repoFilter ? () => {} : setLocalRepos
   const [isEditingRepos, setIsEditingRepos] = useState(false)
   const [newRepoInput, setNewRepoInput] = useState('')
 
@@ -120,20 +143,41 @@ export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: 
           if (!response.ok) continue // Skip this repo on other errors
           // Use .catch() directly to prevent Firefox from firing unhandledrejection
           // before the outer try/catch processes the rejection (Firefox-specific timing issue).
-          const data = await response.json().catch(() => null) as { workflow_runs?: Record<string, unknown>[] } | null
+          const rawGH = await response.json().catch(() => null)
+          const data = validateResponse(GitHubWorkflowRunsResponseSchema, rawGH, `/api/github/repos/${repo}/actions/runs`)
           if (!data) continue
-          const runs = (data.workflow_runs || []).map((run: Record<string, unknown>) => ({
-            id: String(run.id),
-            name: run.name as string,
-            repo,
-            status: run.status as WorkflowRun['status'],
-            conclusion: run.conclusion as WorkflowRun['conclusion'],
-            branch: (run.head_branch || 'unknown') as string,
-            event: (run.event || 'unknown') as string,
-            runNumber: run.run_number as number,
-            createdAt: run.created_at as string,
-            updatedAt: run.updated_at as string,
-            url: (run.html_url || '#') as string }))
+          const prFromCommit = /\(#(\d+)\)\s*$/
+          const runs = (data.workflow_runs || []).map((run: Record<string, unknown>) => {
+            const prs = run.pull_requests as { number: number; url: string }[] | undefined
+            let prNumber: number | undefined
+            let prUrl: string | undefined
+            if (prs && prs.length > 0) {
+              prNumber = prs[0].number
+              prUrl = `https://github.com/${repo}/pull/${prs[0].number}`
+            } else if (run.event === 'push') {
+              const msg = (run.head_commit as { message?: string } | undefined)?.message ?? ''
+              const m = prFromCommit.exec(msg)
+              if (m) {
+                prNumber = parseInt(m[1], 10)
+                prUrl = `https://github.com/${repo}/pull/${m[1]}`
+              }
+            }
+            return {
+              id: String(run.id),
+              name: run.name as string,
+              repo,
+              status: run.status as WorkflowRun['status'],
+              conclusion: run.conclusion as WorkflowRun['conclusion'],
+              branch: (run.head_branch || 'unknown') as string,
+              event: (run.event || 'unknown') as string,
+              runNumber: run.run_number as number,
+              createdAt: run.created_at as string,
+              updatedAt: run.updated_at as string,
+              url: (run.html_url || '#') as string,
+              prNumber,
+              prUrl,
+            }
+          })
           allRuns.push(...runs)
         } catch {
           // Network error for this repo — skip it
@@ -261,7 +305,7 @@ export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: 
     return (
       <div className="space-y-3">
         <Skeleton variant="text" width={160} height={20} />
-        <div className="grid grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 @md:grid-cols-4 gap-2">
           {Array.from({ length: 4 }).map((_, i) => (
             <Skeleton key={i} variant="rounded" height={48} />
           ))}
@@ -277,6 +321,7 @@ export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: 
       <div className="rounded-lg bg-card/50 border border-border p-2.5 mb-3 flex items-center gap-2">
         <GitBranch className="w-4 h-4 text-purple-400 shrink-0" />
         <span className="text-sm font-medium text-foreground">GitHub CI</span>
+        {shared && shared.repoFilter && <RepoSubtitle repo={shared.repoFilter} />}
         <button
           onClick={() => setIsEditingRepos(!isEditingRepos)}
           className={cn(
@@ -375,7 +420,7 @@ export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: 
       )}
 
       {/* Stats grid */}
-      <div className="grid grid-cols-4 gap-2 mb-3">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-3">
         <div className="rounded-md bg-card/50 border border-border p-2 text-center">
           <p className="text-lg font-semibold text-green-400">{stats.successRate}%</p>
           <p className="text-2xs text-muted-foreground">Pass Rate</p>
@@ -442,6 +487,9 @@ export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: 
                 <span className="text-xs text-foreground truncate block">{w.name}</span>
                 <span className="text-2xs text-muted-foreground truncate block">
                   {w.repo.split('/')[1]} · {w.branch}
+                  {w.prNumber && (
+                    <a href={w.prUrl || `https://github.com/${w.repo}/pull/${w.prNumber}`} target="_blank" rel="noopener noreferrer" className="ml-1 text-blue-400 hover:underline">#{w.prNumber}</a>
+                  )}
                 </span>
               </div>
               <span className={cn('text-2xs px-1 py-0.5 rounded shrink-0', badgeClass)}>
@@ -451,11 +499,26 @@ export function GitHubCIMonitor({ config, ref }: GitHubCIMonitorProps & { ref?: 
                 {formatTimeAgo(w.updatedAt)}
               </span>
               {(w.conclusion === 'failure' || w.conclusion === 'timed_out') && (
-                <CardAIActions
-                  resource={{ kind: 'GitHubWorkflow', name: w.name, status: w.conclusion }}
-                  issues={[{ name: `${w.conclusion} on ${w.repo}/${w.branch}`, message: `Run #${w.runNumber}, event: ${w.event}` }]}
-                  showRepair={false}
-                />
+                <>
+                  <button
+                    type="button"
+                    onClick={() => startMission({
+                      title: `Diagnose: ${w.name}`,
+                      description: `Diagnose failing workflow ${w.name} on ${w.repo}`,
+                      type: 'troubleshoot',
+                      initialPrompt: `Diagnose why the "${w.name}" workflow failed on ${w.repo} (branch: ${w.branch}).\n\nRun URL: ${w.url}\n\nPlease:\n1. Check the workflow logs and identify the root cause.\n2. Tell me what went wrong, then ask:\n   - "Should I create a fix?"\n   - "Show me more details"\n3. If I say fix it, create a branch with the fix and open a PR.`,
+                    })}
+                    className="text-muted-foreground hover:text-blue-400 p-1 rounded hover:bg-blue-500/10 shrink-0"
+                    title={TITLE_DIAGNOSE}
+                  >
+                    <Stethoscope className="w-3 h-3" />
+                  </button>
+                  <CardAIActions
+                    resource={{ kind: 'GitHubWorkflow', name: w.name, status: w.conclusion }}
+                    issues={[{ name: `${w.conclusion} on ${w.repo}/${w.branch}`, message: `Run #${w.runNumber}, event: ${w.event}` }]}
+                    showRepair={false}
+                  />
+                </>
               )}
               {w.url !== '#' && (
                 <a

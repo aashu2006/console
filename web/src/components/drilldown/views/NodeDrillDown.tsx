@@ -7,7 +7,7 @@ import { useTranslation } from 'react-i18next'
 import { UI_FEEDBACK_TIMEOUT_MS } from '../../../lib/constants/network'
 import { copyToClipboard } from '../../../lib/clipboard'
 import { useCachedNodes } from '../../../hooks/useCachedData'
-import { formatRelativeTime } from '../../../lib/formatters'
+import { formatTimeAgo } from '../../../lib/formatters'
 
 interface Props {
   data: Record<string, unknown>
@@ -95,13 +95,14 @@ export function NodeDrillDown({ data }: Props) {
 - Roles: ${(roles ?? []).join(', ') || 'unknown'}
 - Issue: ${issue || 'Node is not healthy'}
 
-Please help me:
-1. **Diagnose** - What could cause this node to be in this state?
-2. **Investigate** - What commands should I run to gather more information?
-3. **Remediate** - What are the steps to fix this issue?
-4. **Prevent** - How can I prevent this from happening again?
-
-Start by checking node events and conditions.`,
+Please:
+1. Diagnose the node — check events, conditions, and resource pressure.
+2. Tell me what you found, then ask:
+   - "Should I attempt a fix?"
+   - "Show me the raw diagnostics"
+3. If I say fix it, apply and verify. Then ask:
+   - "Should I check other nodes for similar issues?"
+   - "All done"`,
       context: { cluster: clusterShort, node: nodeName, status, unschedulable }
     })
   }
@@ -124,7 +125,7 @@ Start by checking node events and conditions.`,
       {isOffline && (
         <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/30">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+            <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
             <div>
               <h4 className="font-semibold text-red-400">{t('drilldown.node.nodeIssueDetected')}</h4>
               <p className="text-sm text-red-300/80 mt-1">{issue || 'This node is not accepting new workloads'}</p>
@@ -139,7 +140,7 @@ Start by checking node events and conditions.`,
           <h3 className="text-lg font-semibold text-foreground">Node: {nodeName}</h3>
           {nodeDataAge && (
             <span className="text-2xs text-muted-foreground" title={new Date(nodeLastRefresh!).toLocaleString()}>
-              Updated {formatRelativeTime(nodeDataAge)}
+              Updated {formatTimeAgo(nodeDataAge)}
             </span>
           )}
         </div>
@@ -244,7 +245,7 @@ Start by checking node events and conditions.`,
             <code className="text-muted-foreground truncate">kubectl --context {clusterShort} describe node {nodeName}</code>
             <button
               onClick={() => copyCommand(`kubectl --context ${clusterShort} describe node ${nodeName}`, 'describe')}
-              className="ml-2 p-1 hover:bg-card rounded flex-shrink-0"
+              className="ml-2 p-1 hover:bg-card rounded shrink-0"
               title={t('drilldown.tooltips.copyCommand')}
             >
               {copied === 'describe' ? <CheckCircle className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
@@ -256,7 +257,7 @@ Start by checking node events and conditions.`,
             <code className="text-muted-foreground truncate">kubectl --context {clusterShort} get events --field-selector involvedObject.name={nodeName}</code>
             <button
               onClick={() => copyCommand(`kubectl --context ${clusterShort} get events --field-selector involvedObject.name=${nodeName}`, 'events')}
-              className="ml-2 p-1 hover:bg-card rounded flex-shrink-0"
+              className="ml-2 p-1 hover:bg-card rounded shrink-0"
               title={t('drilldown.tooltips.copyCommand')}
             >
               {copied === 'events' ? <CheckCircle className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
@@ -269,7 +270,7 @@ Start by checking node events and conditions.`,
               <code className="text-green-400 truncate">kubectl --context {clusterShort} uncordon {nodeName}</code>
               <button
                 onClick={() => copyCommand(`kubectl --context ${clusterShort} uncordon ${nodeName}`, 'uncordon')}
-                className="ml-2 p-1 hover:bg-card rounded flex-shrink-0"
+                className="ml-2 p-1 hover:bg-card rounded shrink-0"
                 title={t('drilldown.tooltips.copyCommand')}
               >
                 {copied === 'uncordon' ? <CheckCircle className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
@@ -282,7 +283,7 @@ Start by checking node events and conditions.`,
             <code className="text-muted-foreground truncate">kubectl --context {clusterShort} get node {nodeName} -o jsonpath='{'{.status.conditions}'}'</code>
             <button
               onClick={() => copyCommand(`kubectl --context ${clusterShort} get node ${nodeName} -o jsonpath='{.status.conditions}'`, 'conditions')}
-              className="ml-2 p-1 hover:bg-card rounded flex-shrink-0"
+              className="ml-2 p-1 hover:bg-card rounded shrink-0"
               title={t('drilldown.tooltips.copyCommand')}
             >
               {copied === 'conditions' ? <CheckCircle className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
@@ -314,13 +315,14 @@ Start by checking node events and conditions.`,
 **Cluster:** ${clusterShort}
 **Status:** Cordoned (unschedulable)
 
-Please help me:
-1. What are common reasons a node gets cordoned?
-2. What should I check to understand why this node was cordoned?
-3. Is it safe to uncordon this node?
-4. What kubectl commands should I run to investigate?
-
-Provide specific commands I can run to diagnose the issue.`,
+Please:
+1. Investigate why this node was cordoned — check events, taints, and conditions.
+2. Tell me what you found, then ask:
+   - "It looks safe to uncordon — should I proceed?"
+   - "There are issues to fix first — want me to show details?"
+3. If I approve, uncordon and verify. Then ask:
+   - "Should I monitor the node for a few minutes?"
+   - "All done"`,
                     context: { cluster: clusterShort, node: nodeName }
                   })
                 }}
@@ -342,14 +344,14 @@ Provide specific commands I can run to diagnose the issue.`,
 **Cluster:** ${clusterShort}
 **Current Status:** Cordoned (unschedulable)
 
-Please guide me through:
-1. Pre-flight checks before uncordoning (node health, resource availability)
-2. The uncordon command and what to expect
-3. Post-uncordon verification steps
-4. How to monitor the node after uncordoning
-5. Rollback plan if issues occur
-
-Provide the specific kubectl commands for cluster context "${clusterShort}".`,
+Please:
+1. Run pre-flight checks — node health, resource availability, pending pods.
+2. Tell me the results, then ask:
+   - "Looks good — should I uncordon now?"
+   - "There are concerns — want to see details?"
+3. If I say go ahead, uncordon and verify scheduling resumes. Then ask:
+   - "Should I monitor the node post-uncordon?"
+   - "All done"`,
                     context: { cluster: clusterShort, node: nodeName }
                   })
                 }}

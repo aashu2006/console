@@ -54,6 +54,16 @@ const DESCRIPTORS: CardDescriptor[] = [
     component: () => import('./StockMarketTicker').then(m => ({ default: m.StockMarketTicker as ComponentType<CardComponentProps> })),
   },
 
+  // ── NATS monitoring card ──────────────────────────────────────────
+  {
+    id: 'nats_status',
+    title: 'NATS',
+    description: 'NATS messaging server status, JetStream streams, and consumer health.',
+    category: 'Streaming & Messaging',
+    defaultWidth: 6,
+    visualization: 'status',
+    component: () => import('./nats_status').then(m => ({ default: m.NatsStatus as ComponentType<CardComponentProps> })),
+  },
   // ── Active Alerts card ────────────────────────────────────────────────
   {
     id: 'active_alerts',
@@ -63,6 +73,48 @@ const DESCRIPTORS: CardDescriptor[] = [
     defaultWidth: 4,
     visualization: 'status',
     component: () => import('./ActiveAlerts').then(m => ({ default: m.ActiveAlerts as ComponentType<CardComponentProps> })),
+  },
+  // ── Thanos Distributed Metrics card ────────────────────────────────
+  {
+    id: 'thanos_status',
+    title: 'Thanos',
+    description: 'Thanos global view metrics, store gateway status, and query health.',
+    category: 'Observability',
+    defaultWidth: 6,
+    visualization: 'status',
+    isLiveData: true,
+    component: () => import('./thanos_status').then(m => ({ default: m.ThanosStatus as ComponentType<CardComponentProps> })),
+  },
+  // ── Cilium Monitoring card ──────────────────────────────────────────
+  {
+    id: 'cilium_status',
+    title: 'Cilium',
+    description: 'Cilium eBPF networking, network policy enforcement, and Hubble flow visibility.',
+    category: 'Network',
+    defaultWidth: 6,
+    visualization: 'status',
+    isLiveData: true,
+    component: () => import('./cilium_status').then(m => ({ default: m.CiliumStatus as ComponentType<CardComponentProps> })),
+  },
+  // ── CubeFS distributed file system card ────────────────────────────
+  {
+    id: 'cubefs_status',
+    title: 'CubeFS',
+    description: 'CubeFS distributed file system health, volume status, and node topology.',
+    category: 'Storage',
+    defaultWidth: 6,
+    visualization: 'status',
+    component: () => import('./cubefs_status').then(m => ({ default: m.CubefsStatus as ComponentType<CardComponentProps> })),
+  },
+  // ── Harbor registry card ──────────────────────────────────────────
+  {
+    id: 'harbor_status',
+    title: 'Harbor Registry',
+    description: 'Harbor container registry health, project status, and vulnerability scanning.',
+    category: 'Storage',
+    defaultWidth: 6,
+    visualization: 'status',
+    component: () => import('./harbor_status').then(m => ({ default: m.HarborStatus as ComponentType<CardComponentProps> })),
   },
 ]
 

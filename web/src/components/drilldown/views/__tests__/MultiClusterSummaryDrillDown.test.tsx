@@ -37,11 +37,22 @@ vi.mock('../../../../hooks/useClusterData', () => ({
 }))
 
 vi.mock('../../../../hooks/useDrillDown', () => ({
-  useDrillDownActions: () => ({ drillToCluster: vi.fn(), drillToNamespace: vi.fn(), drillToDeployment: vi.fn(), drillToPod: vi.fn(), drillToNode: vi.fn(), drillToEvents: [], drillToHelm: null, drillToOperator: null }),
+  useDrillDownActions: () => ({ drillToCluster: vi.fn(), drillToNamespace: vi.fn(), drillToDeployment: vi.fn(), drillToPod: vi.fn(), drillToNode: vi.fn(), drillToEvents: [], drillToHelm: null, drillToOperator: null, drillToAlert: vi.fn() }),
+}))
+
+// Issue 8844 — MultiClusterSummaryDrillDown now reads alerts from useAlerts so the
+// all-alerts drill-down matches the Alerts dashboard stat blocks.
+vi.mock('../../../../hooks/useAlerts', () => ({
+  useAlerts: () => ({ alerts: [], stats: { total: 0, firing: 0, resolved: 0, critical: 0, warning: 0, info: 0, acknowledged: 0 } }),
 }))
 
 vi.mock('../../../../hooks/useCachedData', () => ({
-  useCachedNodes: () => ({ nodes: [], lastRefresh: Date.now() }),
+  useCachedNodes: () => ({ nodes: [], lastRefresh: Date.now(), isLoading: false, isFailed: false, isDemoFallback: false, isRefreshing: false, consecutiveFailures: 0, refetch: vi.fn() }),
+  // `clusterErrors` is the Issue 9355 addition — per-cluster RBAC/timeout
+  // breakdown the drill-down uses when the nodes list comes back empty but
+  // the cluster summary reported a non-zero count.
+  useCachedAllNodes: () => ({ nodes: [], clusterErrors: [], lastRefresh: Date.now(), isLoading: false, isFailed: false, isDemoFallback: false, isRefreshing: false, consecutiveFailures: 0, refetch: vi.fn() }),
+  useCachedPVCs: () => ({ pvcs: [], lastRefresh: Date.now(), isLoading: false, isFailed: false, isDemoFallback: false, isRefreshing: false, consecutiveFailures: 0, refetch: vi.fn() }),
 }))
 
 import { MultiClusterSummaryDrillDown } from '../MultiClusterSummaryDrillDown'

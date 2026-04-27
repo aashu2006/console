@@ -79,10 +79,11 @@ export function EtcdStatus() {
   const { t } = useTranslation('cards')
   // Fetch from all namespaces so we catch etcd pods outside kube-system
   const { pods, isLoading, isRefreshing, isDemoFallback, isFailed, consecutiveFailures } = useCachedPods()
+  const hasData = pods.length > 0
   const { showSkeleton } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasData,
     isRefreshing,
-    hasAnyData: pods.length > 0,
+    hasAnyData: hasData,
     isDemoData: isDemoFallback,
     isFailed,
     consecutiveFailures })
@@ -145,7 +146,7 @@ export function EtcdStatus() {
 
         return (
           <div key={cluster} className="px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-y-2">
               <div className="flex items-center gap-2">
                 <div className={`w-2 h-2 rounded-full ${allHealthy ? 'bg-green-500' : 'bg-red-500'}`} />
                 <span className="text-sm font-medium">{cluster}</span>

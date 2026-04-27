@@ -252,7 +252,7 @@ function PodSweeperInternal(_props: CardComponentProps) {
   return (
     <div className="h-full flex flex-col p-2 select-none">
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-3 text-xs">
           <div className="flex items-center gap-1 text-red-400">
             <Flag className="w-3 h-3" />
@@ -278,6 +278,7 @@ function PodSweeperInternal(_props: CardComponentProps) {
             onClick={() => newGame()}
             className="p-1.5 rounded hover:bg-secondary"
             title="New Game"
+            aria-label="New Game"
           >
             <RotateCcw className="w-4 h-4" />
           </button>
@@ -334,9 +335,22 @@ function PodSweeperInternal(_props: CardComponentProps) {
                 return (
                   <div
                     key={colIdx}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Cell row ${rowIdx + 1} column ${colIdx + 1}`}
                     onClick={() => handleClick(rowIdx, colIdx)}
                     onContextMenu={(e) => handleRightClick(e, rowIdx, colIdx)}
-                    className={`${cellSize} flex items-center justify-center border border-border/50 cursor-pointer transition-colors ${bgClass}`}
+                    onKeyDown={(e) => {
+                      // Issue #8837: Enter/Space reveal, F to toggle flag (matches right-click)
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault()
+                        handleClick(rowIdx, colIdx)
+                      } else if (e.key === "f" || e.key === "F") {
+                        e.preventDefault()
+                        handleRightClick(e as unknown as React.MouseEvent, rowIdx, colIdx)
+                      }
+                    }}
+                    className={`${cellSize} flex items-center justify-center border border-border/50 cursor-pointer transition-colors ${bgClass} focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400`}
                   >
                     {content}
                   </div>

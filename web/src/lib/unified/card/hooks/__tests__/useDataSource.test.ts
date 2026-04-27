@@ -304,6 +304,61 @@ describe('useDataSource — hook type', () => {
     // Should not throw
     result.current.refetch()
   })
+
+  // Issues 9356 and 9357: hooks that report demo-fallback state must
+  // propagate that through useDataSource so UnifiedCard can show the Demo
+  // badge only for actual demo output.
+  it('propagates isDemoData: true from hook return value', () => {
+    const mockHook = vi.fn().mockReturnValue({
+      data: [{ id: 'demo' }],
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+      isDemoData: true,
+    })
+    registerDataHook('useDemoDataTrueTest', mockHook)
+
+    const { result } = renderHook(() =>
+      useDataSource({ type: 'hook', hook: 'useDemoDataTrueTest' })
+    )
+
+    expect(result.current.isDemoData).toBe(true)
+  })
+
+  it('propagates isDemoData: false from hook return value', () => {
+    const mockHook = vi.fn().mockReturnValue({
+      data: [{ id: 'live' }],
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+      isDemoData: false,
+    })
+    registerDataHook('useDemoDataFalseTest', mockHook)
+
+    const { result } = renderHook(() =>
+      useDataSource({ type: 'hook', hook: 'useDemoDataFalseTest' })
+    )
+
+    expect(result.current.isDemoData).toBe(false)
+  })
+
+  it('returns isDemoData: undefined when hook does not report it', () => {
+    const mockHook = vi.fn().mockReturnValue({
+      data: [{ id: 1 }],
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+      // no isDemoData property - hook doesn't know its demo status
+    })
+    registerDataHook('useNoDemoDataTest', mockHook)
+
+    const { result } = renderHook(() =>
+      useDataSource({ type: 'hook', hook: 'useNoDemoDataTest' })
+    )
+
+    // When undefined, UnifiedCard falls back to the card config's isDemoData.
+    expect(result.current.isDemoData).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -582,7 +637,7 @@ describe('useDataSource — api type', () => {
     const fetchCall = mockFetch.mock.calls[0]
     expect(fetchCall[0]).toBe('/api/query')
     expect(fetchCall[1].method).toBe('POST')
-    expect(fetchCall[1].headers).toEqual({ 'Content-Type': 'application/json' })
+    expect(fetchCall[1].headers).toEqual({ 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' })
     expect(fetchCall[1].body).toBe(JSON.stringify(params))
   })
 

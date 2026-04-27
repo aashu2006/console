@@ -32,7 +32,15 @@ import type { MissionExport, MissionStep } from '../../lib/missions/types'
 import { UI_FEEDBACK_TIMEOUT_MS } from '../../lib/constants/network'
 import { copyToClipboard } from '../../lib/clipboard'
 
-type TabId = 'install' | 'uninstall' | 'upgrade' | 'troubleshooting'
+type TabId = 'install' | 'uninstall' | 'upgrade' | 'troubleshooting' | 'security'
+
+/** Primary (kubestellar.io) URL for the Console security model. Linked
+ *  from the Security tab fallback / footer. Prefer the rendered docs site
+ *  for users; the repo version is the source-grounded reference. */
+const SECURITY_MODEL_DOC_URL = 'https://kubestellar.io/docs/console/main/console/security-model/'
+/** AI-specific threat model for LLM-backed automation (prompt injection,
+ *  supply chain, agent drift). Only lives in the repo. */
+const SECURITY_AI_DOC_URL = 'https://github.com/kubestellar/console/blob/main/docs/security/SECURITY-AI.md'
 
 interface TabDef {
   id: TabId
@@ -131,7 +139,7 @@ function StepCard({ step, index, accentColor }: { step: MissionStep; index: numb
     <div className="flex gap-3 p-4 rounded-lg bg-secondary/50 border border-border">
       <span
         className={cn(
-          'flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-xs font-bold',
+          'shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-xs font-bold',
           accentColor
         )}
       >
@@ -249,6 +257,13 @@ export function MissionDetailView({
       steps: mission.troubleshooting || [],
       emptyMessage: t('missions.detail.tabs.troubleshootingEmpty'),
       color: 'bg-yellow-500/20 text-yellow-400' },
+    {
+      id: 'security',
+      label: t('missions.detail.tabs.security'),
+      icon: Shield,
+      steps: mission.security || [],
+      emptyMessage: t('missions.detail.tabs.securityEmpty'),
+      color: 'bg-purple-500/20 text-purple-400' },
   ]
 
   const [activeTab, setActiveTab] = useState<TabId>('install')
@@ -286,7 +301,7 @@ export function MissionDetailView({
           <h2 className="text-xl font-semibold text-foreground">{mission.title}</h2>
           <p className="mt-1 text-sm text-muted-foreground">{mission.description}</p>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           {matchScore != null && matchScore > 0 && (
             <StatusBadge color="purple" size="md" variant="outline" rounded="full">
               <Star className="w-3 h-3" />
@@ -510,7 +525,7 @@ export function MissionDetailView({
               <ul className="space-y-1">
                 {mission.prerequisites.map((p, i) => (
                   <li key={i} className="flex items-start gap-2 text-sm text-muted-foreground">
-                    <CheckCircle className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
                     {p}
                   </li>
                 ))}
@@ -521,12 +536,12 @@ export function MissionDetailView({
           {/* Error banner — shown when full mission content could not be fetched */}
           {error && (
             <div role="alert" className="flex items-center gap-3 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/20 text-sm">
-              <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0" />
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
               <span className="text-red-400 flex-1">{error}</span>
               {onRetry && (
                 <button
                   onClick={onRetry}
-                  className="flex-shrink-0 px-3 py-1 text-xs rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 transition-colors"
+                  className="shrink-0 px-3 py-1 text-xs rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 transition-colors"
                 >
                   Retry
                 </button>
@@ -571,7 +586,7 @@ export function MissionDetailView({
               /* Shimmer skeleton placeholders while full mission content loads */
               Array.from({ length: LOADING_SKELETON_COUNT }).map((_, i) => (
                 <div key={i} className="flex gap-3 p-4 rounded-lg bg-secondary/50 border border-border">
-                  <div className="flex-shrink-0 w-7 h-7 rounded-full animate-shimmer" />
+                  <div className="shrink-0 w-7 h-7 rounded-full animate-shimmer" />
                   <div className="flex-1 space-y-2">
                     <div className="h-4 w-1/3 rounded animate-shimmer" />
                     <div className="h-3 w-full rounded animate-shimmer" />
@@ -581,14 +596,91 @@ export function MissionDetailView({
                 </div>
               ))
             ) : activeTabDef.steps.length > 0 ? (
-              activeTabDef.steps.map((step, i) => (
-                <StepCard
-                  key={`${activeTab}-${i}`}
-                  step={step}
-                  index={i}
-                  accentColor={activeTabDef.color}
-                />
-              ))
+              <>
+                {activeTabDef.steps.map((step, i) => (
+                  <StepCard
+                    key={`${activeTab}-${i}`}
+                    step={step}
+                    index={i}
+                    accentColor={activeTabDef.color}
+                  />
+                ))}
+                {activeTab === 'security' && (
+                  <div className="mt-4 p-4 rounded-lg border border-purple-500/20 bg-purple-500/5 text-xs text-muted-foreground space-y-1">
+                    <p>
+                      The bullets above are specific to this mission. For the Console's overall security model — how kc-agent binds,
+                      where AI keys live, what leaves your machine, and how to run air-gapped — read the
+                      {' '}
+                      <a
+                        href={SECURITY_MODEL_DOC_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-purple-400 hover:text-purple-300"
+                      >
+                        KubeStellar Console Security Model
+                        <ExternalLink className="w-3 h-3" />
+                      </a>.
+                    </p>
+                    <p>
+                      For the LLM-specific threat model (prompt injection, supply chain, agent drift), see the
+                      {' '}
+                      <a
+                        href={SECURITY_AI_DOC_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-purple-400 hover:text-purple-300"
+                      >
+                        AI automation threat model
+                        <ExternalLink className="w-3 h-3" />
+                      </a>.
+                    </p>
+                  </div>
+                )}
+              </>
+            ) : activeTab === 'security' ? (
+              <div className="py-6 px-4 rounded-lg border border-purple-500/20 bg-purple-500/5 text-sm text-muted-foreground space-y-3">
+                <div className="flex items-start gap-3">
+                  <Shield className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
+                  <div className="space-y-2">
+                    <p className="font-medium text-foreground">No mission-specific security notes yet</p>
+                    <p>
+                      This mission does not yet include a <code className="font-mono text-foreground/70">security</code> section
+                      in its definition. The Console's overall security posture — kc-agent loopback bind, user-kubeconfig RBAC,
+                      AI-key storage, air-gapped and local-LLM options — applies regardless:
+                    </p>
+                    <p>
+                      <a
+                        href={SECURITY_MODEL_DOC_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-purple-400 hover:text-purple-300"
+                      >
+                        Read the KubeStellar Console Security Model
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                      {' · '}
+                      <a
+                        href={SECURITY_AI_DOC_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-purple-400 hover:text-purple-300"
+                      >
+                        AI automation threat model
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    </p>
+                    {onImprove && (
+                      <button
+                        onClick={onImprove}
+                        className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border border-purple-500/30 text-purple-400 hover:bg-purple-500/10 transition-colors"
+                      >
+                        <MessageSquarePlus className="w-3.5 h-3.5" />
+                        Suggest security notes for this mission
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
             ) : (
               <div className="py-8 text-center">
                 <AlertTriangle className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />

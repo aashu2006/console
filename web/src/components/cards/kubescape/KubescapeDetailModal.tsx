@@ -29,6 +29,10 @@ interface KubescapeDetailModalProps {
   onClose: () => void
   clusterName: string
   status: KubescapeClusterStatus
+  /** All cluster names available in the kubescape statuses */
+  clusters?: string[]
+  /** Callback to switch to a different cluster */
+  onClusterChange?: (cluster: string) => void
   onRefresh: () => void
   isRefreshing?: boolean
 }
@@ -38,6 +42,8 @@ export function KubescapeDetailModal({
   onClose,
   clusterName,
   status,
+  clusters,
+  onClusterChange,
   onRefresh,
   isRefreshing = false }: KubescapeDetailModalProps) {
   const [search, setSearch] = useState('')
@@ -75,11 +81,24 @@ export function KubescapeDetailModal({
           </StatusBadge>
         }
         extra={
-          <RefreshButton
-            isRefreshing={isRefreshing}
-            onRefresh={onRefresh}
-            size="sm"
-          />
+          <div className="flex items-center gap-2">
+            {clusters && clusters.length > 1 && onClusterChange && (
+              <select
+                value={clusterName}
+                onChange={(e) => onClusterChange(e.target.value)}
+                className="text-xs bg-secondary/50 border border-border rounded px-2 py-1 text-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500"
+              >
+                {clusters.map(c => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            )}
+            <RefreshButton
+              isRefreshing={isRefreshing}
+              onRefresh={onRefresh}
+              size="sm"
+            />
+          </div>
         }
       />
 
@@ -88,7 +107,7 @@ export function KubescapeDetailModal({
           {/* Score gauge + framework breakdown */}
           <div className="flex items-start gap-6">
             {/* Score gauge */}
-            <div className="flex-shrink-0">
+            <div className="shrink-0">
               <div className="relative w-24 h-24">
                 <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36">
                   <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeWidth="3" className="text-secondary" />
@@ -109,7 +128,7 @@ export function KubescapeDetailModal({
               <h3 className="text-sm font-medium text-muted-foreground">Framework Scores</h3>
               {(status.frameworks || []).map((fw, i) => (
                 <div key={i} className="space-y-1">
-                  <div className="flex items-center justify-between text-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2 text-sm">
                     <span className="text-foreground">{fw.name}</span>
                     <span className={`font-medium ${
                       fw.score >= SCORE_GOOD_THRESHOLD ? 'text-green-400' :
@@ -137,7 +156,7 @@ export function KubescapeDetailModal({
           </div>
 
           {/* Summary stats */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <div className="p-3 rounded-lg bg-secondary/30 text-center">
               <p className="text-xl font-bold text-foreground">{status.totalControls}</p>
               <p className="text-xs text-muted-foreground">Total Controls</p>
@@ -162,7 +181,7 @@ export function KubescapeDetailModal({
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="Search controls..."
-                  className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500"
                 />
               </div>
 

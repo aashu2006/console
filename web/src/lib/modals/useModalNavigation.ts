@@ -1,5 +1,47 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { UseModalNavigationOptions, UseModalNavigationResult } from './types'
+
+// ---------------------------------------------------------------------------
+// Modal stack — ensures only the front-most open modal handles ESC.
+// Each open modal registers itself (push) and deregisters on close (splice).
+// The ESC handler checks whether this modal's ID is at the top of the stack
+// before processing the key — background modals pass through silently.
+// ---------------------------------------------------------------------------
+const modalStack: number[] = []
+let modalStackCounter = 0
+
+/** Returns true when at least one BaseModal is currently open. Used by
+ *  non-modal ESC handlers (e.g. the mission sidebar) to yield to the
+ *  front-most modal instead of closing the sidebar behind it. */
+export function isAnyModalOpen(): boolean {
+  return modalStack.length > 0
+}
+
+/**
+ * #6749-B (Copilot on PR #6746) — Module-level stable no-op ref object
+ * used as a fallback when a `useModal` caller omits `modalRef`/`backdropRef`.
+ *
+ * A single shared `{ current: null }` singleton is safe here because
+ * `useModalBackdropClose` and `useModalFocusTrap` gate their behavior on
+ * the `enabled` flag (`!!backdropRef && enableBackdropClose` and
+ * `!!modalRef && enableFocusTrap`), so when a caller omits the real ref
+ * the hook short-circuits and never reads or writes `.current`. The
+ * shared object therefore can't be trampled by another consumer.
+ *
+ * The previous code created a fresh `{ current: null }` object literal
+ * inside `useModal` on every render. Both `useModalBackdropClose` and
+ * `useModalFocusTrap` include `ref` in their effect dep arrays, so the
+ * effects re-ran on every render when the caller omitted a ref —
+ * detaching and reattaching event listeners hundreds of times during
+ * streaming renders. The module-level singleton makes that identity
+ * stable for free, with no per-component `useMemo` cost.
+ *
+ * #6758 (Copilot on PR #6755) — The previous comment claimed a
+ * module-level singleton but the implementation used `useMemo`. The
+ * module-level form actually achieves the stated intent and is cheaper,
+ * so this file now matches its header comment.
+ */
+const NOOP_REF: React.RefObject<HTMLElement | null> = { current: null }
 
 /**
  * useModalNavigation - Keyboard navigation hook for modals
@@ -46,11 +88,15 @@ export function useModalNavigation({
         return
       }
 
-      // Don't handle other keys if user is typing in an input
+      // Don't handle other keys if user is interacting with an input or interactive control.
+      // Use closest() so child elements (e.g. <span>/<svg> inside a <button>) are caught too.
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement ||
-        (e.target instanceof HTMLElement && e.target.isContentEditable)
+        (e.target instanceof HTMLElement && (
+          e.target.isContentEditable ||
+          (e.target as HTMLElement).closest('button, a, select, [role="button"], [role="link"], [role="option"], [role="menuitem"]')
+        ))
       ) {
         return
       }
@@ -72,13 +118,41 @@ export function useModalNavigation({
     [onClose, onBack, enableEscape, enableBackspace]
   )
 
-  // Set up keyboard listener
+  // Register this modal in the global stack so only the top-most open
+  // modal handles ESC. Without this, stacked modals (e.g. ACMM intro
+  // behind + mission-prompt-review on top) both fire their ESC handlers
+  // and the wrong one closes.
+  const modalIdRef = useRef(++modalStackCounter)
   useEffect(() => {
     if (!isOpen) return
+    const id = modalIdRef.current
+    modalStack.push(id)
+    return () => {
+      const idx = modalStack.indexOf(id)
+      if (idx >= 0) modalStack.splice(idx, 1)
+    }
+  }, [isOpen])
 
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isOpen, handleKeyDown])
+  // Set up keyboard listener — only process ESC when this modal is the
+  // top of the stack. Other keys (Backspace/Space) pass through
+  // unconditionally because they only affect focused elements inside
+  // the modal anyway.
+  const guardedHandleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        const topId = modalStack[modalStack.length - 1]
+        if (topId !== modalIdRef.current) return // not the top modal
+      }
+      handleKeyDown(e)
+    },
+    [handleKeyDown],
+  )
+
+  useEffect(() => {
+    if (!isOpen) return
+    window.addEventListener('keydown', guardedHandleKeyDown)
+    return () => window.removeEventListener('keydown', guardedHandleKeyDown)
+  }, [isOpen, guardedHandleKeyDown])
 
   // Disable body scroll when modal is open
   useEffect(() => {
@@ -206,17 +280,25 @@ export function useModal({
     enableBackspace,
     disableBodyScroll })
 
-  // Backdrop close
-  if (backdropRef && enableBackdropClose) {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    useModalBackdropClose(backdropRef, isOpen, onClose)
-  }
-
-  // Focus trap
-  if (modalRef && enableFocusTrap) {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    useModalFocusTrap(modalRef, isOpen)
-  }
+  // #6717 — Always call useModalBackdropClose and useModalFocusTrap
+  // unconditionally so React's rules-of-hooks invariant holds when callers
+  // toggle `enableBackdropClose` / `enableFocusTrap` / ref props across
+  // renders. The behavior is gated inside each hook via the `isOpen` flag:
+  // when `false`, the hook short-circuits and installs no listeners.
+  //
+  // Callers that pass no ref get the module-level NOOP_REF singleton so
+  // the hook signature is satisfied without allocating a fresh object on
+  // every render. See the file-header note on #6749-B / #6758 for why
+  // sharing is safe here.
+  useModalBackdropClose(
+    backdropRef ?? NOOP_REF,
+    isOpen && !!backdropRef && enableBackdropClose,
+    onClose,
+  )
+  useModalFocusTrap(
+    modalRef ?? NOOP_REF,
+    isOpen && !!modalRef && enableFocusTrap,
+  )
 }
 
 /**

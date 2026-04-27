@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,10 +11,28 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/store"
 )
+
+// bulkUtilizationsMaxIDs caps the number of reservation ids a single
+// GetBulkUtilizations API request may ask for. This is a DoS guard at the
+// handler level; the store now batches IN clauses internally (#6888).
+const bulkUtilizationsMaxIDs = 500
+
+// maxSnapshotQueryLimit caps the ?limit query parameter for utilization
+// snapshots, preventing requests for billions of rows that exhaust memory (#7023).
+const maxSnapshotQueryLimit = 10_000
+
+// maxGPUCountWithoutCapacity is the ceiling on GPUCount when no capacity
+// provider is configured. Prevents absurdly large values from being stored
+// when there is no cluster to validate against (#6962).
+const maxGPUCountWithoutCapacity = 1024
+
+// minDurationHours is the minimum acceptable DurationHours for a reservation.
+const minDurationHours = 1
 
 // ClusterCapacityProvider returns the total GPU capacity for a cluster
 // by querying authoritative server-side data (e.g. k8s node resources).
@@ -54,6 +73,14 @@ func (h *GPUHandler) CreateReservation(c *fiber.Ctx) error {
 	if input.GPUCount < 1 {
 		return fiber.NewError(fiber.StatusBadRequest, "GPU count must be at least 1")
 	}
+	if input.GPUCount > maxGPUCountWithoutCapacity {
+		return fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("GPU count must not exceed %d", maxGPUCountWithoutCapacity))
+	}
+	if input.DurationHours < minDurationHours {
+		return fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("Duration must be at least %d hour(s)", minDurationHours))
+	}
 	if input.StartDate == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "Start date is required")
 	}
@@ -61,14 +88,27 @@ func (h *GPUHandler) CreateReservation(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Start date must be RFC 3339 format (e.g. 2024-01-15T09:00:00Z)")
 	}
 
-	// Check over-allocation using server-side cluster capacity (never trust client input).
-	// The client-supplied MaxClusterGPUs is intentionally ignored.
-	if err := h.checkOverAllocation(c.Context(), input.Cluster, input.GPUCount, nil); err != nil {
+	// #6612: resolve server-side capacity up front so we can pass it into
+	// the atomic CreateGPUReservationWithCapacity call below. The old
+	// two-step flow (checkOverAllocation THEN CreateGPUReservation) was
+	// TOCTOU-racy: two concurrent requests could both read the same stale
+	// reserved total, both pass the check, and both insert — pushing the
+	// cluster above its declared capacity. Passing the capacity into a
+	// single SQL statement makes the check+insert atomic.
+	capacity := 0
+	if h.clusterCapacity != nil {
+		capacity = h.clusterCapacity(c.Context(), input.Cluster)
+	}
+	// A pre-check is still useful when capacity > 0 so clients get a
+	// descriptive 409 message with available/reserved numbers, but the
+	// authoritative decision is made inside the transaction below.
+	// Pass the already-resolved capacity so we don't re-fetch it (#6958).
+	if err := h.checkOverAllocationWithCapacity(c.Context(), input.Cluster, input.GPUCount, nil, capacity); err != nil {
 		return err
 	}
 
 	// Get user info for user_name
-	user, err := h.store.GetUser(userID)
+	user, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || user == nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get user")
 	}
@@ -82,20 +122,30 @@ func (h *GPUHandler) CreateReservation(c *fiber.Ctx) error {
 		Namespace:     input.Namespace,
 		GPUCount:      input.GPUCount,
 		GPUType:       input.GPUType,
+		GPUTypes:      input.GPUTypes,
 		StartDate:     input.StartDate,
 		DurationHours: input.DurationHours,
 		Notes:         input.Notes,
 		QuotaName:     input.QuotaName,
 		QuotaEnforced: input.QuotaEnforced,
 	}
+	// Reconcile legacy single + new multi fields. NormalizeGPUTypes
+	// is idempotent and handles all combinations (legacy-only, multi-only,
+	// both, neither) uniformly. Called here so validation and capacity
+	// checks see the canonical shape before the store call below.
+	reservation.NormalizeGPUTypes()
 
-	if reservation.DurationHours == 0 {
-		reservation.DurationHours = 24
-	}
-
-	if err := h.store.CreateGPUReservation(reservation); err != nil {
+	if err := h.store.CreateGPUReservationWithCapacity(c.UserContext(), reservation, capacity); err != nil {
+		if errors.Is(err, store.ErrGPUQuotaExceeded) {
+			return fiber.NewError(fiber.StatusConflict,
+				fmt.Sprintf("Over-allocation: cluster %q would exceed capacity of %d GPUs", input.Cluster, capacity))
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to create reservation")
 	}
+
+	// #9890: persist audit entry after successful mutation.
+	audit.Log(c, audit.ActionCreateGPUReservation, "gpu_reservation", reservation.ID.String(),
+		fmt.Sprintf("cluster=%s namespace=%s gpus=%d", reservation.Cluster, reservation.Namespace, reservation.GPUCount))
 
 	return c.Status(fiber.StatusCreated).JSON(reservation)
 }
@@ -104,7 +154,7 @@ func (h *GPUHandler) CreateReservation(c *fiber.Ctx) error {
 // response if the user cannot be resolved.
 func (h *GPUHandler) getCallerUser(c *fiber.Ctx) (*models.User, error) {
 	userID := middleware.GetUserID(c)
-	user, err := h.store.GetUser(userID)
+	user, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || user == nil {
 		return nil, fiber.NewError(fiber.StatusForbidden, "Unable to verify user")
 	}
@@ -134,7 +184,7 @@ func (h *GPUHandler) ListReservations(c *fiber.Ctx) error {
 
 	// Non-admin users always see only their own reservations
 	if user.Role != models.UserRoleAdmin {
-		reservations, err := h.store.ListUserGPUReservations(user.ID)
+		reservations, err := h.store.ListUserGPUReservations(c.UserContext(), user.ID)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "Failed to list reservations")
 		}
@@ -147,7 +197,7 @@ func (h *GPUHandler) ListReservations(c *fiber.Ctx) error {
 	// Admins: honour ?mine=true filter, otherwise return all
 	mine := c.Query("mine") == "true"
 	if mine {
-		reservations, err := h.store.ListUserGPUReservations(user.ID)
+		reservations, err := h.store.ListUserGPUReservations(c.UserContext(), user.ID)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "Failed to list reservations")
 		}
@@ -157,7 +207,7 @@ func (h *GPUHandler) ListReservations(c *fiber.Ctx) error {
 		return c.JSON(reservations)
 	}
 
-	reservations, err := h.store.ListGPUReservations()
+	reservations, err := h.store.ListGPUReservations(c.UserContext())
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to list reservations")
 	}
@@ -180,7 +230,7 @@ func (h *GPUHandler) GetReservation(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid reservation ID")
 	}
 
-	reservation, err := h.store.GetGPUReservation(id)
+	reservation, err := h.store.GetGPUReservation(c.UserContext(), id)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get reservation")
 	}
@@ -208,7 +258,7 @@ func (h *GPUHandler) UpdateReservation(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid reservation ID")
 	}
 
-	existing, err := h.store.GetGPUReservation(id)
+	existing, err := h.store.GetGPUReservation(c.UserContext(), id)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get reservation")
 	}
@@ -225,28 +275,56 @@ func (h *GPUHandler) UpdateReservation(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
 	}
 
-	// Apply partial updates
+	// Apply partial updates with validation (#6959, #6960, #6962)
 	if input.Title != nil {
+		if strings.TrimSpace(*input.Title) == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "Title must not be empty")
+		}
 		existing.Title = *input.Title
 	}
 	if input.Description != nil {
 		existing.Description = *input.Description
 	}
 	if input.Cluster != nil {
+		if strings.TrimSpace(*input.Cluster) == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "Cluster must not be empty")
+		}
 		existing.Cluster = *input.Cluster
 	}
 	if input.Namespace != nil {
+		if strings.TrimSpace(*input.Namespace) == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "Namespace must not be empty")
+		}
 		existing.Namespace = *input.Namespace
 	}
 	if input.GPUCount != nil {
 		if *input.GPUCount < 1 {
 			return fiber.NewError(fiber.StatusBadRequest, "GPU count must be at least 1")
 		}
+		if *input.GPUCount > maxGPUCountWithoutCapacity {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("GPU count must not exceed %d", maxGPUCountWithoutCapacity))
+		}
 		existing.GPUCount = *input.GPUCount
 	}
 	if input.GPUType != nil {
 		existing.GPUType = *input.GPUType
+		// Legacy singular write clears any previously-stored multi list
+		// so the two fields cannot drift out of sync. If the caller
+		// also sent GPUTypes, the block below re-overwrites with the
+		// authoritative list.
+		existing.GPUTypes = nil
 	}
+	if input.GPUTypes != nil {
+		// Copy-by-value so later caller mutations of the input
+		// slice cannot retroactively change the stored reservation.
+		copied := make([]string, len(*input.GPUTypes))
+		copy(copied, *input.GPUTypes)
+		existing.GPUTypes = copied
+	}
+	// Normalize after any type-related write so GPUType and GPUTypes
+	// stay in lock-step before the store call.
+	existing.NormalizeGPUTypes()
 	if input.StartDate != nil {
 		if _, err := time.Parse(time.RFC3339, *input.StartDate); err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, "Start date must be RFC 3339 format (e.g. 2024-01-15T09:00:00Z)")
@@ -254,8 +332,9 @@ func (h *GPUHandler) UpdateReservation(c *fiber.Ctx) error {
 		existing.StartDate = *input.StartDate
 	}
 	if input.DurationHours != nil {
-		if *input.DurationHours <= 0 {
-			return fiber.NewError(fiber.StatusBadRequest, "Duration must be greater than 0")
+		if *input.DurationHours < minDurationHours {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("Duration must be at least %d hour(s)", minDurationHours))
 		}
 		existing.DurationHours = *input.DurationHours
 	}
@@ -263,7 +342,16 @@ func (h *GPUHandler) UpdateReservation(c *fiber.Ctx) error {
 		existing.Notes = *input.Notes
 	}
 	if input.Status != nil {
-		existing.Status = *input.Status
+		newStatus := *input.Status
+		if !newStatus.IsValid() {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("Invalid status %q; must be one of: pending, active, completed, cancelled", newStatus))
+		}
+		if !existing.Status.CanTransitionTo(newStatus) {
+			return fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("Cannot transition from %q to %q", existing.Status, newStatus))
+		}
+		existing.Status = newStatus
 	}
 	if input.QuotaName != nil {
 		existing.QuotaName = *input.QuotaName
@@ -273,19 +361,44 @@ func (h *GPUHandler) UpdateReservation(c *fiber.Ctx) error {
 	}
 
 	// Re-validate capacity whenever the cluster, GPU count, or status changes —
-	// not just when GPUCount is provided (#5423). Uses server-side capacity (#5421).
+	// not just when GPUCount is provided (#5423). Uses atomic
+	// UpdateGPUReservationWithCapacity to eliminate the TOCTOU race (#6957).
 	clusterChanged := input.Cluster != nil
 	countChanged := input.GPUCount != nil
 	statusChanged := input.Status != nil
 	if clusterChanged || countChanged || statusChanged {
-		if err := h.checkOverAllocation(c.Context(), existing.Cluster, existing.GPUCount, &existing.ID); err != nil {
+		capacity := 0
+		if h.clusterCapacity != nil {
+			capacity = h.clusterCapacity(c.Context(), existing.Cluster)
+		}
+		// Descriptive pre-check for a nicer error message.
+		if err := h.checkOverAllocationWithCapacity(c.Context(), existing.Cluster, existing.GPUCount, &existing.ID, capacity); err != nil {
 			return err
 		}
+		// Atomic capacity-checked update (#6957).
+		if err := h.store.UpdateGPUReservationWithCapacity(c.UserContext(), existing, capacity); err != nil {
+			if errors.Is(err, store.ErrGPUReservationNotFound) {
+				return fiber.NewError(fiber.StatusNotFound, "Reservation not found")
+			}
+			if errors.Is(err, store.ErrGPUQuotaExceeded) {
+				return fiber.NewError(fiber.StatusConflict,
+					fmt.Sprintf("Over-allocation: cluster %q would exceed capacity of %d GPUs", existing.Cluster, capacity))
+			}
+			return fiber.NewError(fiber.StatusInternalServerError, "Failed to update reservation")
+		}
+		// #9890: persist audit entry after successful mutation.
+		audit.Log(c, audit.ActionUpdateGPUReservation, "gpu_reservation", existing.ID.String(),
+			fmt.Sprintf("cluster=%s namespace=%s gpus=%d status=%s", existing.Cluster, existing.Namespace, existing.GPUCount, existing.Status))
+		return c.JSON(existing)
 	}
 
-	if err := h.store.UpdateGPUReservation(existing); err != nil {
+	if err := h.store.UpdateGPUReservation(c.UserContext(), existing); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to update reservation")
 	}
+
+	// #9890: persist audit entry after successful mutation.
+	audit.Log(c, audit.ActionUpdateGPUReservation, "gpu_reservation", existing.ID.String(),
+		fmt.Sprintf("cluster=%s namespace=%s gpus=%d status=%s", existing.Cluster, existing.Namespace, existing.GPUCount, existing.Status))
 
 	return c.JSON(existing)
 }
@@ -303,7 +416,7 @@ func (h *GPUHandler) DeleteReservation(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid reservation ID")
 	}
 
-	existing, err := h.store.GetGPUReservation(id)
+	existing, err := h.store.GetGPUReservation(c.UserContext(), id)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get reservation")
 	}
@@ -315,9 +428,13 @@ func (h *GPUHandler) DeleteReservation(c *fiber.Ctx) error {
 		return authErr
 	}
 
-	if err := h.store.DeleteGPUReservation(id); err != nil {
+	if err := h.store.DeleteGPUReservation(c.UserContext(), id); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to delete reservation")
 	}
+
+	// #9890: persist audit entry after successful mutation.
+	audit.Log(c, audit.ActionDeleteGPUReservation, "gpu_reservation", existing.ID.String(),
+		fmt.Sprintf("cluster=%s namespace=%s gpus=%d", existing.Cluster, existing.Namespace, existing.GPUCount))
 
 	return c.JSON(fiber.Map{"status": "ok"})
 }
@@ -337,7 +454,7 @@ func (h *GPUHandler) GetReservationUtilization(c *fiber.Ctx) error {
 	}
 
 	// Verify ownership before returning utilization data
-	reservation, err := h.store.GetGPUReservation(parsedID)
+	reservation, err := h.store.GetGPUReservation(c.UserContext(), parsedID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get reservation")
 	}
@@ -348,7 +465,12 @@ func (h *GPUHandler) GetReservationUtilization(c *fiber.Ctx) error {
 		return authErr
 	}
 
-	snapshots, err := h.store.GetUtilizationSnapshots(id)
+	limit := c.QueryInt("limit", store.DefaultSnapshotQueryLimit)
+	// Clamp to upper bound to prevent unbounded row requests (#7023).
+	if limit <= 0 || limit > maxSnapshotQueryLimit {
+		limit = store.DefaultSnapshotQueryLimit
+	}
+	snapshots, err := h.store.GetUtilizationSnapshots(c.UserContext(), id, limit)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get utilization data")
 	}
@@ -373,18 +495,37 @@ func (h *GPUHandler) GetBulkUtilizations(c *fiber.Ctx) error {
 	}
 
 	ids := strings.Split(idsParam, ",")
-	// Validate all IDs and check ownership for non-admin users
+	// #6605: reject oversized fan-outs at the API boundary as a DoS
+	// guard. The store now batches IN clauses internally (#6888), but
+	// we still cap the API to avoid unbounded work.
+	if len(ids) > bulkUtilizationsMaxIDs {
+		return fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("too many reservation ids: %d (max %d)", len(ids), bulkUtilizationsMaxIDs))
+	}
+	// Parse and trim all IDs up front.
+	parsedIDs := make([]uuid.UUID, 0, len(ids))
+	trimmedIDs := make([]string, 0, len(ids))
 	for _, id := range ids {
 		trimmed := strings.TrimSpace(id)
 		parsedID, err := uuid.Parse(trimmed)
 		if err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("Invalid reservation ID: %s", id))
 		}
-		// Non-admin: verify each reservation belongs to the caller
-		if user.Role != models.UserRoleAdmin {
-			reservation, err := h.store.GetGPUReservation(parsedID)
-			if err != nil || reservation == nil {
-				return fiber.NewError(fiber.StatusNotFound, fmt.Sprintf("Reservation not found: %s", trimmed))
+		parsedIDs = append(parsedIDs, parsedID)
+		trimmedIDs = append(trimmedIDs, trimmed)
+	}
+
+	// Non-admin: batch-fetch reservations and verify ownership in one query
+	// instead of N sequential round-trips (#6963).
+	if user.Role != models.UserRoleAdmin {
+		reservations, err := h.store.GetGPUReservationsByIDs(c.UserContext(), parsedIDs)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "Failed to verify reservation ownership")
+		}
+		for _, pid := range parsedIDs {
+			reservation, ok := reservations[pid]
+			if !ok || reservation == nil {
+				return fiber.NewError(fiber.StatusNotFound, fmt.Sprintf("Reservation not found: %s", pid.String()))
 			}
 			if reservation.UserID != user.ID {
 				return fiber.NewError(fiber.StatusForbidden, "Not authorized — owner or admin access required")
@@ -392,13 +533,7 @@ func (h *GPUHandler) GetBulkUtilizations(c *fiber.Ctx) error {
 		}
 	}
 
-	// Trim spaces
-	trimmedIDs := make([]string, len(ids))
-	for i, id := range ids {
-		trimmedIDs[i] = strings.TrimSpace(id)
-	}
-
-	result, err := h.store.GetBulkUtilizationSnapshots(trimmedIDs)
+	result, err := h.store.GetBulkUtilizationSnapshots(c.UserContext(), trimmedIDs)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get utilization data")
 	}
@@ -406,24 +541,19 @@ func (h *GPUHandler) GetBulkUtilizations(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-// checkOverAllocation verifies that the requested GPU count does not exceed the
-// cluster's server-side capacity. excludeID is used on updates to exclude the
+// checkOverAllocationWithCapacity verifies that the requested GPU count does
+// not exceed the already-resolved cluster capacity. The capacity parameter
+// must be fetched once by the caller and reused to avoid inconsistencies from
+// multiple fetches (#6958). excludeID is used on updates to exclude the
 // current reservation from the "already reserved" tally.
-func (h *GPUHandler) checkOverAllocation(ctx context.Context, cluster string, gpuCount int, excludeID *uuid.UUID) error {
-	if h.clusterCapacity == nil {
-		// No capacity provider configured — skip check (e.g. unit tests).
-		return nil
-	}
-
-	capacity := h.clusterCapacity(ctx, cluster)
+func (h *GPUHandler) checkOverAllocationWithCapacity(ctx context.Context, cluster string, gpuCount int, excludeID *uuid.UUID, capacity int) error {
 	if capacity <= 0 {
-		// Cluster has no GPUs or is unreachable — allow the reservation
-		// (the admin can cancel it later). Blocking here would prevent all
-		// reservations when the cluster is temporarily offline.
+		// No capacity data — skip the pre-check. The authoritative check
+		// is inside the atomic SQL statement.
 		return nil
 	}
 
-	reserved, err := h.store.GetClusterReservedGPUCount(cluster, excludeID)
+	reserved, err := h.store.GetClusterReservedGPUCount(ctx, cluster, excludeID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to check cluster GPU usage")
 	}

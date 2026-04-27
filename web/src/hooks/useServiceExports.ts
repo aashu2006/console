@@ -16,6 +16,8 @@ import { useClusters } from './useMCP'
 import { STORAGE_KEY_TOKEN } from '../lib/constants'
 import { FETCH_DEFAULT_TIMEOUT_MS } from '../lib/constants/network'
 import type { ServiceExport } from '../types/mcs'
+import { DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS } from '../lib/constants'
+import { MS_PER_DAY, MS_PER_HOUR } from '../lib/constants/time'
 
 // ============================================================================
 // Constants
@@ -25,7 +27,6 @@ import type { ServiceExport } from '../types/mcs'
 const CACHE_EXPIRY_MS = 300_000
 
 /** Auto-refresh interval — 2 minutes */
-const REFRESH_INTERVAL_MS = 120_000
 
 /** Number of consecutive failures before marking as failed */
 const FAILURE_THRESHOLD = 3
@@ -97,10 +98,6 @@ function saveToCache(data: ServiceExport[], isDemoData: boolean): void {
 // Demo Data Generator
 // ============================================================================
 
-/** Days in milliseconds */
-const MS_PER_DAY = 86_400_000
-/** Hours in milliseconds */
-const MS_PER_HOUR = 3_600_000
 
 function getDemoServiceExports(clusterNames: string[]): ServiceExport[] {
   const exports: ServiceExport[] = []
@@ -146,6 +143,7 @@ export interface UseServiceExportsResult {
   exports: ServiceExport[]
   isDemoData: boolean
   isLoading: boolean
+  isRefreshing: boolean
   isFailed: boolean
   consecutiveFailures: number
   lastRefresh: number | null
@@ -161,6 +159,7 @@ export function useServiceExports(): UseServiceExportsResult {
   const [exports, setExports] = useState<ServiceExport[]>(cachedSnapshot?.data || [])
   const [isDemoData, setIsDemoData] = useState(cachedSnapshot?.isDemoData ?? true)
   const [isLoading, setIsLoading] = useState(!cachedSnapshot)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const [consecutiveFailures, setConsecutiveFailures] = useState(0)
   const [lastRefresh, setLastRefresh] = useState<number | null>(
     cachedSnapshot?.timestamp || null
@@ -170,6 +169,9 @@ export function useServiceExports(): UseServiceExportsResult {
   const refetch = useCallback(async (silent = false) => {
     if (!silent && !initialLoadDone.current) {
       setIsLoading(true)
+    }
+    if (silent && initialLoadDone.current) {
+      setIsRefreshing(true)
     }
 
     try {
@@ -213,6 +215,7 @@ export function useServiceExports(): UseServiceExportsResult {
       saveToCache(demoExports, true)
     } finally {
       setIsLoading(false)
+      setIsRefreshing(false)
     }
   }, [clusters])
 
@@ -238,6 +241,7 @@ export function useServiceExports(): UseServiceExportsResult {
     exports,
     isDemoData,
     isLoading: isLoading || clustersLoading,
+    isRefreshing,
     isFailed: consecutiveFailures >= FAILURE_THRESHOLD,
     consecutiveFailures,
     lastRefresh,

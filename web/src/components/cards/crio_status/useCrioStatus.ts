@@ -1,7 +1,7 @@
 import { useCache } from '../../../lib/cache'
 import { useCardLoadingState } from '../CardDataContext'
 import { CRIO_DEMO_DATA, type CrioStatusDemoData } from './demoData'
-import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/constants/network'
+import { FETCH_DEFAULT_TIMEOUT_MS, LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 import {
   buildRecentImagePulls,
   extractCrioVersion,
@@ -109,15 +109,15 @@ interface BackendEventInfo {
  */
 async function fetchCrioStatus(): Promise<CrioStatus> {
   const [nodesResp, podsResp, eventsResp] = await Promise.all([
-    fetch('/api/mcp/nodes', {
+    fetch(`${LOCAL_AGENT_HTTP_URL}/nodes`, {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
     }),
-    fetch('/api/mcp/pods', {
+    fetch(`${LOCAL_AGENT_HTTP_URL}/pods`, {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
     }),
-    fetch('/api/mcp/events?limit=200', {
+    fetch(`${LOCAL_AGENT_HTTP_URL}/events?limit=200`, {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
     }).catch(() => undefined),
@@ -142,10 +142,21 @@ async function fetchCrioStatus(): Promise<CrioStatus> {
 
   // Filter for CRI-O nodes only
   const crioNodes = items.filter((n) => isCrioRuntime(n.containerRuntime))
-  const crioNodeNames = new Set(crioNodes.map((node) => node.name).filter(Boolean))
+  // Build a set of CRI-O node names for pod matching.
+  // Use both raw name and the short hostname (before the first dot) so pods
+  // whose node field uses a different identifier format still match (#7356).
+  const crioNodeNames = new Set<string>()
+  for (const node of crioNodes) {
+    if (node.name) {
+      crioNodeNames.add(node.name)
+      const shortName = node.name.split('.')[0]
+      if (shortName) crioNodeNames.add(shortName)
+    }
+  }
   const crioPods = allPods.filter((pod) => {
     const nodeName = pod.node ?? ''
-    return crioNodeNames.has(nodeName)
+    if (!nodeName) return false
+    return crioNodeNames.has(nodeName) || crioNodeNames.has(nodeName.split('.')[0])
   })
 
   if (crioNodes.length === 0) {
@@ -273,7 +284,7 @@ export function useCrioStatus(): UseCrioStatusResult {
   const hasAnyData = data.detected
 
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasAnyData,
     isRefreshing,
     hasAnyData,
     isFailed,

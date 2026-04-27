@@ -51,9 +51,12 @@ describe('BaseModal', () => {
         <p>Content</p>
       </BaseModal>
     )
-    // Click on the backdrop (the outermost fixed element)
+    // Click on the backdrop (the outermost fixed element).
+    // BaseModal requires mousedown + click on the backdrop to trigger
+    // close (mousedown-tracking guard added in #9165).
     const backdrop = document.querySelector('.fixed.inset-0')
     if (backdrop) {
+      fireEvent.mouseDown(backdrop)
       fireEvent.click(backdrop)
       expect(onClose).toHaveBeenCalledTimes(1)
     }
@@ -68,6 +71,7 @@ describe('BaseModal', () => {
     )
     const backdrop = document.querySelector('.fixed.inset-0')
     if (backdrop) {
+      fireEvent.mouseDown(backdrop)
       fireEvent.click(backdrop)
       expect(onClose).not.toHaveBeenCalled()
     }
@@ -80,7 +84,51 @@ describe('BaseModal', () => {
         <p>Inner content</p>
       </BaseModal>
     )
-    fireEvent.click(screen.getByText('Inner content'))
+    const inner = screen.getByText('Inner content')
+    fireEvent.mouseDown(inner)
+    fireEvent.click(inner)
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  // #9165 — Regression: pressing mouse inside the modal then releasing
+  // on the backdrop must NOT close the modal. The browser dispatches the
+  // synthetic `click` event on the deepest common ancestor (the backdrop),
+  // which previously bypassed the modal-content stopPropagation guard
+  // and triggered an unintended close when users clicked near the edge
+  // of internal sidebar items.
+  it('does not call onClose when mousedown starts inside modal but mouseup is on backdrop (#9165)', () => {
+    const onClose = vi.fn()
+    render(
+      <BaseModal isOpen={true} onClose={onClose}>
+        <p>Inner content</p>
+      </BaseModal>
+    )
+    const inner = screen.getByText('Inner content')
+    const backdrop = document.querySelector('.fixed.inset-0') as HTMLElement
+    // Press inside the modal content
+    fireEvent.mouseDown(inner)
+    // Release on the backdrop, which is what synthesizes the click event
+    // on the deepest common ancestor.
+    fireEvent.click(backdrop)
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  // #9165 — Regression: when mousedown happens on the backdrop and
+  // mouseup happens on the modal content (e.g. user starts dragging
+  // outside and releases on a sidebar item), the modal must not close.
+  it('does not call onClose when click target is inside modal even if mousedown was on backdrop (#9165)', () => {
+    const onClose = vi.fn()
+    render(
+      <BaseModal isOpen={true} onClose={onClose}>
+        <p>Inner content</p>
+      </BaseModal>
+    )
+    const inner = screen.getByText('Inner content')
+    const backdrop = document.querySelector('.fixed.inset-0') as HTMLElement
+    fireEvent.mouseDown(backdrop)
+    // click bubbles up from the inner element; the contains() check
+    // must reject it even though mousedown was on the backdrop.
+    fireEvent.click(inner)
     expect(onClose).not.toHaveBeenCalled()
   })
 
@@ -141,9 +189,35 @@ describe('BaseModal.Header', () => {
         <BaseModal.Header title="Title" onClose={onClose} />
       </BaseModal>
     )
-    const closeBtn = screen.getByLabelText('Close modal')
+    // Default closeOnEscape=true → aria-label includes the shortcut
+    const closeBtn = screen.getByLabelText('Close modal (Esc)')
     fireEvent.click(closeBtn)
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('close button title and aria-label advertise Esc when closeOnEscape is default', () => {
+    // See BaseModal.tsx ModalEscapeContext — escape enablement drives tooltip/aria.
+    render(
+      <BaseModal isOpen={true} onClose={vi.fn()}>
+        <BaseModal.Header title="Title" onClose={vi.fn()} />
+      </BaseModal>
+    )
+    const closeBtn = screen.getByLabelText('Close modal (Esc)')
+    expect(closeBtn).toHaveAttribute('title', 'Close (Esc)')
+  })
+
+  it('close button title and aria-label omit Esc when closeOnEscape is false', () => {
+    // Regression test for #8386 — sticky modals (closeOnEscape=false) must not
+    // advertise an Esc shortcut that does nothing.
+    render(
+      <BaseModal isOpen={true} onClose={vi.fn()} closeOnEscape={false}>
+        <BaseModal.Header title="Title" onClose={vi.fn()} />
+      </BaseModal>
+    )
+    const closeBtn = screen.getByLabelText('Close modal')
+    expect(closeBtn).toHaveAttribute('title', 'Close')
+    // And the old Esc variant must not be present.
+    expect(screen.queryByLabelText('Close modal (Esc)')).not.toBeInTheDocument()
   })
 
   it('renders back button when onBack and showBack are provided', () => {

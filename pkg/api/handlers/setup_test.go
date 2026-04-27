@@ -11,6 +11,7 @@ import (
 	"github.com/kubestellar/console/pkg/settings"
 	"github.com/kubestellar/console/pkg/store"
 	"github.com/kubestellar/console/pkg/test"
+	"github.com/stretchr/testify/mock"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
@@ -48,8 +49,9 @@ func setupTestEnv(t *testing.T) *testEnv {
 	// Ensure we start with a clean state for this test run relative to the file.
 	_ = manager.Load()
 
-	// Initialize K8s Client with a fake cluster
-	k8sClient, _ := k8s.NewMultiClusterClient("")
+	// Initialize K8s Client with a non-existent kubeconfig path to ensure
+	// predictable error handling and avoid interference from local ~/.kube/config.
+	k8sClient, _ := k8s.NewMultiClusterClient("/tmp/kubestellar-test-kubeconfig")
 	// Inject a fake client for a "test-cluster" context
 	fakeClient := k8sfake.NewSimpleClientset()
 	k8sClient.InjectClient("test-cluster", fakeClient)
@@ -80,6 +82,14 @@ func setupTestEnv(t *testing.T) *testEnv {
 		ID:   testAdminUserID,
 		Role: "admin",
 	}, nil)
+
+	// Cluster-group CRUD handlers persist definitions to the store (#7013).
+	// Register permissive mocks so TestClusterGroupsCRUD doesn't panic when
+	// the handler calls Save/Delete/List. Individual tests can override with
+	// an explicit expectation to assert specific persistence behavior.
+	mockStore.On("SaveClusterGroup", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockStore.On("DeleteClusterGroup", mock.Anything).Return(nil).Maybe()
+	mockStore.On("ListClusterGroups").Return(map[string][]byte{}, nil).Maybe()
 
 	app := fiber.New()
 

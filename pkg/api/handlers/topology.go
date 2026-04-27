@@ -73,7 +73,7 @@ type TopologyClusterSummary struct {
 // GET /api/topology
 func (h *TopologyHandlers) GetTopology(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), topologyTimeout)

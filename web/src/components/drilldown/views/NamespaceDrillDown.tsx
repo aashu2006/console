@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { ChevronRight, Search, Box, Network, HardDrive, Layers, Server } from 'lucide-react'
-import { usePodIssues, useDeploymentIssues, useEvents, useDeployments, useServices, usePVCs, usePods } from '../../../hooks/useMCP'
+import { usePodIssues, useDeploymentIssues, useEvents, useDeployments, useServices, usePods } from '../../../hooks/useMCP'
+import { useCachedPVCs } from '../../../hooks/useCachedData'
 import { useDrillDownActions } from '../../../hooks/useDrillDown'
 import { ClusterBadge } from '../../ui/ClusterBadge'
 import { StatusIndicator } from '../../charts/StatusIndicator'
@@ -33,7 +34,7 @@ export function NamespaceDrillDown({ data }: Props) {
   const clusterShort = cluster.split('/').pop() || cluster
   const { deployments: allDeployments } = useDeployments(clusterShort, namespace)
   const { services: allServices } = useServices(clusterShort, namespace)
-  const { pvcs: allPVCs } = usePVCs(clusterShort, namespace)
+  const { pvcs: allPVCs } = useCachedPVCs(clusterShort, namespace)
   const { pods: allPods } = usePods(clusterShort, namespace)
 
   const podIssues = allPodIssues.filter(p => p.namespace === namespace)
@@ -81,9 +82,9 @@ export function NamespaceDrillDown({ data }: Props) {
   })()
 
   const tabs: { id: TabType; label: string; count: number }[] = [
-    { id: 'issues', label: 'Issues', count: podIssues.length + deploymentIssues.length },
+    { id: 'issues', label: t('drilldown.tabs.issues', 'Issues'), count: podIssues.length + deploymentIssues.length },
     { id: 'events', label: t('drilldown.fields.recentEvents'), count: nsEvents.length },
-    { id: 'resources', label: 'Resources', count: (allDeployments?.length || 0) + (allServices?.length || 0) + (allPVCs?.length || 0) + (allPods?.length || 0) },
+    { id: 'resources', label: t('drilldown.tabs.resources', 'Resources'), count: (allDeployments?.length || 0) + (allServices?.length || 0) + (allPVCs?.length || 0) + (allPods?.length || 0) },
   ]
 
   return (
@@ -106,11 +107,11 @@ export function NamespaceDrillDown({ data }: Props) {
       {/* Overview Stats */}
       <div className="grid grid-cols-3 gap-4">
         <div className="p-4 rounded-lg bg-card/50 border border-border">
-          <div className="text-sm text-muted-foreground mb-2">Deployments with Issues</div>
+          <div className="text-sm text-muted-foreground mb-2">{t('drilldown.namespace.deploymentsWithIssues', 'Deployments with Issues')}</div>
           <div className="text-2xl font-bold text-foreground">{deploymentIssues.length}</div>
         </div>
         <div className="p-4 rounded-lg bg-card/50 border border-border">
-          <div className="text-sm text-muted-foreground mb-2">Pods with Issues</div>
+          <div className="text-sm text-muted-foreground mb-2">{t('drilldown.namespace.podsWithIssues', 'Pods with Issues')}</div>
           <div className="text-2xl font-bold text-foreground">{podIssues.length}</div>
         </div>
         <div className="p-4 rounded-lg bg-card/50 border border-border">
@@ -155,7 +156,7 @@ export function NamespaceDrillDown({ data }: Props) {
           {/* Deployment Issues */}
           {deploymentIssues.length > 0 && (
             <div>
-              <h3 className="text-lg font-semibold text-foreground mb-4">Deployment Issues</h3>
+              <h3 className="text-lg font-semibold text-foreground mb-4">{t('drilldown.namespace.deploymentIssues', 'Deployment Issues')}</h3>
               <div className="space-y-2">
                 {deploymentIssues.map((issue, i) => (
                   <div
@@ -178,7 +179,7 @@ export function NamespaceDrillDown({ data }: Props) {
                           <div className="text-xs text-orange-400 mt-1">{issue.message}</div>
                         )}
                       </div>
-                      <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0 ml-4" />
+                      <ChevronRight className="w-5 h-5 text-muted-foreground shrink-0 ml-4" />
                     </div>
                   </div>
                 ))}
@@ -189,7 +190,7 @@ export function NamespaceDrillDown({ data }: Props) {
           {/* Pod Issues */}
           {podIssues.length > 0 && (
             <div>
-              <h3 className="text-lg font-semibold text-foreground mb-4">Pod Issues</h3>
+              <h3 className="text-lg font-semibold text-foreground mb-4">{t('drilldown.namespace.podIssues', 'Pod Issues')}</h3>
               <div className="space-y-2">
                 {podIssues.map((issue, i) => (
                   <div
@@ -209,9 +210,9 @@ export function NamespaceDrillDown({ data }: Props) {
                           <span>{issue.restarts} restarts</span>
                           {issue.reason && <span>• {issue.reason}</span>}
                         </div>
-                        {issue.issues.length > 0 && (
+                        {(issue.issues?.length ?? 0) > 0 && (
                           <div className="flex flex-wrap gap-1 mt-2">
-                            {issue.issues.map((iss, j) => (
+                            {issue.issues?.map((iss, j) => (
                               <StatusBadge key={j} color="red" size="xs">
                                 {iss}
                               </StatusBadge>
@@ -219,7 +220,7 @@ export function NamespaceDrillDown({ data }: Props) {
                           </div>
                         )}
                       </div>
-                      <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0 ml-4" />
+                      <ChevronRight className="w-5 h-5 text-muted-foreground shrink-0 ml-4" />
                     </div>
                   </div>
                 ))}
@@ -289,7 +290,7 @@ export function NamespaceDrillDown({ data }: Props) {
                 value={resourceSearch}
                 onChange={(e) => setResourceSearch(e.target.value)}
                 placeholder="Search resources..."
-                className="w-full pl-10 pr-4 py-2 bg-secondary rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="w-full pl-10 pr-4 py-2 bg-secondary rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
               />
             </div>
             <div className="flex flex-wrap gap-2">

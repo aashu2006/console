@@ -4,12 +4,14 @@ import { OPENFEATURE_DEMO_DATA } from './demoData'
 import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/constants/network'
 import { authFetch } from '../../../lib/api'
 import type { OpenFeatureDemoData } from './demoData'
+import { LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 
 export type OpenFeatureStatus = OpenFeatureDemoData
 
 const INITIAL_DATA: OpenFeatureStatus = {
   health: 'not-installed',
   providers: [],
+  flags: [],
   featureFlags: { total: 0, enabled: 0, disabled: 0, errorRate: 0 },
   totalEvaluations: 0,
   lastCheckTime: new Date().toISOString(),
@@ -101,7 +103,7 @@ function extractProviderName(pod: BackendPodInfo): string {
 async function fetchCR(group: string, version: string, resource: string): Promise<CRItem[]> {
   try {
     const params = new URLSearchParams({ group, version, resource })
-    const resp = await authFetch(`/api/mcp/custom-resources?${params}`, {
+    const resp = await authFetch(`${LOCAL_AGENT_HTTP_URL}/custom-resources?${params}`, {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
     })
@@ -147,7 +149,7 @@ function countFlags(items: CRItem[]): { total: number; enabled: number; disabled
 
 async function fetchOpenFeatureStatus(): Promise<OpenFeatureStatus> {
   // Step 1: Detect OpenFeature pods
-  const resp = await authFetch('/api/mcp/pods', {
+  const resp = await authFetch(`${LOCAL_AGENT_HTTP_URL}/pods`, {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
   })
@@ -212,6 +214,7 @@ async function fetchOpenFeatureStatus(): Promise<OpenFeatureStatus> {
   return {
     health,
     providers,
+    flags: [],
     featureFlags: {
       total: flagStats.total,
       enabled: flagStats.enabled,
@@ -251,7 +254,7 @@ export function useOpenFeatureStatus(): UseOpenFeatureStatusResult {
   const hasAnyData = (data.providers || []).length > 0 || data.health !== 'not-installed'
 
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasAnyData,
     isRefreshing,
     isDemoData: effectiveIsDemoData,
     hasAnyData,

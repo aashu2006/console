@@ -22,6 +22,7 @@ export interface SortableDashboardCardProps {
   onConfigure: () => void
   onRemove: () => void
   onWidthChange: (newWidth: number) => void
+  onHeightChange: (newHeight: number) => void
   isDragging: boolean
   isRefreshing?: boolean
   onRefresh?: () => void
@@ -35,6 +36,7 @@ export const SortableDashboardCard = memo(function SortableDashboardCard({
   onConfigure,
   onRemove,
   onWidthChange,
+  onHeightChange,
   isDragging,
   isRefreshing,
   onRefresh,
@@ -72,7 +74,10 @@ export const SortableDashboardCard = memo(function SortableDashboardCard({
       {onInsertAfter && (
         <button
           onClick={(e) => { e.stopPropagation(); onInsertAfter() }}
-          className="absolute -top-2 -right-2 z-20 opacity-0 group-hover/card:opacity-100 transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
+          // Anchor to the right edge centered vertically so the "+"
+          // sits between this card and the next column, consistent with
+          // SharedSortableCard.tsx (#8383, #8561).
+          className="absolute top-1/2 -translate-y-1/2 right-2 z-20 opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary transition-all w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-bold shadow-lg hover:scale-110 ring-2 ring-background"
           aria-label="Add card"
           title="Add card here"
         >
@@ -84,9 +89,11 @@ export const SortableDashboardCard = memo(function SortableDashboardCard({
         cardType={card.card_type}
         title={card.title || formatCardTitle(card.card_type)}
         cardWidth={cardWidth}
+        cardHeight={cardHeight}
         onConfigure={onConfigure}
         onRemove={onRemove}
         onWidthChange={onWidthChange}
+        onHeightChange={onHeightChange}
         isDemoData={DEMO_DATA_CARDS.has(card.card_type)}
         isRefreshing={isRefreshing}
         onRefresh={onRefresh}

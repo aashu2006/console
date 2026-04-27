@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { CheckCircle, AlertTriangle, XCircle, Clock, ChevronRight, Server, Package } from 'lucide-react'
+import { formatTimeAgo } from '../../../lib/formatters'
 import { useClusters, BuildpackImage } from '../../../hooks/useMCP'
 import { useCachedBuildpackImages } from '../../../hooks/useCachedData'
 import { Skeleton } from '../../ui/Skeleton'
@@ -52,24 +53,6 @@ const STATUS_ORDER: Record<string, number> = {
   unknown: 2,
   succeeded: 3 }
 
-const formatTime = (timestamp: string | number | Date): string => {
-  const time = new Date(timestamp).getTime()
-  if (isNaN(time)) return ''
-
-  const diff = Date.now() - time
-
-  if (diff <= 0) return 'just now'
-
-  const minute = 60 * 1000
-  const hour = 60 * minute
-  const day = 24 * hour
-
-  if (diff < minute) return 'just now'
-  if (diff < hour) return `${Math.floor(diff / minute)}m ago`
-  if (diff < day) return `${Math.floor(diff / hour)}h ago`
-
-  return `${Math.floor(diff / day)}d ago`
-}
 
 export function BuildpacksStatus({ config }: BuildpacksStatusProps) {
   const { t } = useTranslation('cards')
@@ -190,7 +173,7 @@ export function BuildpacksStatus({ config }: BuildpacksStatusProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded overflow-hidden">
       {/* Controls */}
-      <div className="flex items-center justify-between gap-2 mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2 mb-4">
         <div className="flex items-center gap-2">
           {localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -306,7 +289,7 @@ export function BuildpacksStatus({ config }: BuildpacksStatusProps) {
                   : 'bg-secondary/30'
               } hover:bg-secondary/50`}
             >
-              <div className="flex items-center justify-between mb-1">
+              <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                 <div className="flex items-center gap-2">
                   <Icon className={`w-4 h-4 ${styles.icon}`} />
                   <span className="text-sm font-medium group-hover:text-purple-400">
@@ -343,7 +326,7 @@ export function BuildpacksStatus({ config }: BuildpacksStatusProps) {
                 )}
                 <span>{build.builder}</span>
                 <span className="ml-auto">
-                  {formatTime(build.updated)}
+                  {formatTimeAgo(build.updated)}
                 </span>
               </div>
             </div>

@@ -106,7 +106,27 @@ func (sm *SettingsManager) Load() error {
 		return fmt.Errorf("failed to parse settings: %w", err)
 	}
 
-	// Merge with defaults for forward compatibility (new fields get defaults)
+	// Detect missing boolean fields in older settings files (#7572).
+	// Booleans deserialize to false when absent, which silently disables
+	// features whose default is true. We probe the raw JSON to distinguish
+	// "explicitly false" from "missing" and restore defaults only for
+	// the latter.
+	var rawSettings struct {
+		Settings json.RawMessage `json:"settings"`
+	}
+	var rawPredictions map[string]json.RawMessage
+	if json.Unmarshal(data, &rawSettings) == nil && rawSettings.Settings != nil {
+		var inner map[string]json.RawMessage
+		if json.Unmarshal(rawSettings.Settings, &inner) == nil {
+			if pRaw, ok := inner["predictions"]; ok {
+				_ = json.Unmarshal(pRaw, &rawPredictions)
+			}
+		}
+	}
+
+	// Merge with defaults for forward compatibility (new fields get defaults).
+	// Covers all nested structures so older settings files don't zero-out
+	// intended defaults (#7370).
 	defaults := DefaultSettings()
 	if sf.Settings.AIMode == "" {
 		sf.Settings.AIMode = defaults.Settings.AIMode
@@ -116,6 +136,45 @@ func (sm *SettingsManager) Load() error {
 	}
 	if sf.Settings.Widget.SelectedWidget == "" {
 		sf.Settings.Widget.SelectedWidget = defaults.Settings.Widget.SelectedWidget
+	}
+	// Backfill boolean fields that default to true when absent from older files (#7572).
+	if _, found := rawPredictions["aiEnabled"]; !found {
+		sf.Settings.Predictions.AIEnabled = defaults.Settings.Predictions.AIEnabled
+	}
+	// Prediction defaults — backfill zero-valued nested fields
+	if sf.Settings.Predictions.Interval == 0 {
+		sf.Settings.Predictions.Interval = defaults.Settings.Predictions.Interval
+	}
+	if sf.Settings.Predictions.MinConfidence == 0 {
+		sf.Settings.Predictions.MinConfidence = defaults.Settings.Predictions.MinConfidence
+	}
+	if sf.Settings.Predictions.MaxPredictions == 0 {
+		sf.Settings.Predictions.MaxPredictions = defaults.Settings.Predictions.MaxPredictions
+	}
+	if sf.Settings.Predictions.Thresholds.HighRestartCount == 0 {
+		sf.Settings.Predictions.Thresholds.HighRestartCount = defaults.Settings.Predictions.Thresholds.HighRestartCount
+	}
+	if sf.Settings.Predictions.Thresholds.CPUPressure == 0 {
+		sf.Settings.Predictions.Thresholds.CPUPressure = defaults.Settings.Predictions.Thresholds.CPUPressure
+	}
+	if sf.Settings.Predictions.Thresholds.MemoryPressure == 0 {
+		sf.Settings.Predictions.Thresholds.MemoryPressure = defaults.Settings.Predictions.Thresholds.MemoryPressure
+	}
+	if sf.Settings.Predictions.Thresholds.GPUMemoryPressure == 0 {
+		sf.Settings.Predictions.Thresholds.GPUMemoryPressure = defaults.Settings.Predictions.Thresholds.GPUMemoryPressure
+	}
+	// Token usage defaults
+	if sf.Settings.TokenUsage.Limit == 0 {
+		sf.Settings.TokenUsage.Limit = defaults.Settings.TokenUsage.Limit
+	}
+	if sf.Settings.TokenUsage.WarningThreshold == 0 {
+		sf.Settings.TokenUsage.WarningThreshold = defaults.Settings.TokenUsage.WarningThreshold
+	}
+	if sf.Settings.TokenUsage.CriticalThreshold == 0 {
+		sf.Settings.TokenUsage.CriticalThreshold = defaults.Settings.TokenUsage.CriticalThreshold
+	}
+	if sf.Settings.TokenUsage.StopThreshold == 0 {
+		sf.Settings.TokenUsage.StopThreshold = defaults.Settings.TokenUsage.StopThreshold
 	}
 
 	sm.settings = &sf
@@ -187,6 +246,8 @@ func (sm *SettingsManager) GetAll() (*AllSettings, error) {
 		Accessibility:       sm.settings.Settings.Accessibility,
 		Profile:             sm.settings.Settings.Profile,
 		Widget:              sm.settings.Settings.Widget,
+		AutoUpdateEnabled:   sm.settings.Settings.AutoUpdateEnabled,
+		AutoUpdateChannel:   sm.settings.Settings.AutoUpdateChannel,
 		APIKeys:             make(map[string]APIKeyEntry),
 		FeedbackGitHubToken: "",
 		Notifications:       NotificationSecrets{},
@@ -268,6 +329,8 @@ func (sm *SettingsManager) SaveAll(all *AllSettings) error {
 	sm.settings.Settings.Accessibility = all.Accessibility
 	sm.settings.Settings.Profile = all.Profile
 	sm.settings.Settings.Widget = all.Widget
+	sm.settings.Settings.AutoUpdateEnabled = all.AutoUpdateEnabled
+	sm.settings.Settings.AutoUpdateChannel = all.AutoUpdateChannel
 
 	// Encrypt API keys (only if non-empty)
 	if len(all.APIKeys) > 0 {
@@ -298,8 +361,11 @@ func (sm *SettingsManager) SaveAll(all *AllSettings) error {
 		sm.settings.Encrypted.FeedbackGitHubToken = nil
 	}
 
-	// Encrypt notification secrets (only if any field is set)
-	if all.Notifications.SlackWebhookURL != "" || all.Notifications.EmailSMTPHost != "" ||
+	// Encrypt notification secrets (only if any field is set).
+	// Check ALL notification fields to prevent silently dropping valid config (#7369).
+	if all.Notifications.SlackWebhookURL != "" || all.Notifications.SlackChannel != "" ||
+		all.Notifications.EmailSMTPHost != "" || all.Notifications.EmailSMTPPort != 0 ||
+		all.Notifications.EmailFrom != "" || all.Notifications.EmailTo != "" ||
 		all.Notifications.EmailUsername != "" || all.Notifications.EmailPassword != "" {
 		data, err := json.Marshal(all.Notifications)
 		if err != nil {
@@ -320,6 +386,10 @@ func (sm *SettingsManager) SaveAll(all *AllSettings) error {
 // MigrateFromConfigYaml performs a one-time migration of API keys from ~/.kc/config.yaml.
 // Accepts a ConfigProvider to avoid circular dependency with the agent package.
 func (sm *SettingsManager) MigrateFromConfigYaml(cp ConfigProvider) error {
+	if cp == nil {
+		return fmt.Errorf("config provider must not be nil")
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -414,8 +484,61 @@ func (sm *SettingsManager) ImportEncrypted(data []byte) error {
 		sm.settings = DefaultSettings()
 	}
 
-	// Import plaintext settings
+	// Import plaintext settings, then merge defaults for any missing nested
+	// values so that an incomplete import doesn't zero-out intended defaults
+	// (#7372, #7501).
 	sm.settings.Settings = imported.Settings
+	defaults := DefaultSettings()
+	if sm.settings.Settings.AIMode == "" {
+		sm.settings.Settings.AIMode = defaults.Settings.AIMode
+	}
+	if sm.settings.Settings.Theme == "" {
+		sm.settings.Settings.Theme = defaults.Settings.Theme
+	}
+	if sm.settings.Settings.Widget.SelectedWidget == "" {
+		sm.settings.Settings.Widget.SelectedWidget = defaults.Settings.Widget.SelectedWidget
+	}
+
+	// Merge nested Prediction defaults when the imported file omits them (#7501)
+	dp := defaults.Settings.Predictions
+	p := &sm.settings.Settings.Predictions
+	if p.Interval == 0 {
+		p.Interval = dp.Interval
+	}
+	if p.MinConfidence == 0 {
+		p.MinConfidence = dp.MinConfidence
+	}
+	if p.MaxPredictions == 0 {
+		p.MaxPredictions = dp.MaxPredictions
+	}
+	if p.Thresholds.HighRestartCount == 0 {
+		p.Thresholds.HighRestartCount = dp.Thresholds.HighRestartCount
+	}
+	if p.Thresholds.CPUPressure == 0 {
+		p.Thresholds.CPUPressure = dp.Thresholds.CPUPressure
+	}
+	if p.Thresholds.MemoryPressure == 0 {
+		p.Thresholds.MemoryPressure = dp.Thresholds.MemoryPressure
+	}
+	if p.Thresholds.GPUMemoryPressure == 0 {
+		p.Thresholds.GPUMemoryPressure = dp.Thresholds.GPUMemoryPressure
+	}
+
+	// Merge nested TokenUsage defaults when the imported file omits them (#7501)
+	dt := defaults.Settings.TokenUsage
+	t := &sm.settings.Settings.TokenUsage
+	if t.Limit == 0 {
+		t.Limit = dt.Limit
+	}
+	if t.WarningThreshold == 0 {
+		t.WarningThreshold = dt.WarningThreshold
+	}
+	if t.CriticalThreshold == 0 {
+		t.CriticalThreshold = dt.CriticalThreshold
+	}
+	if t.StopThreshold == 0 {
+		t.StopThreshold = dt.StopThreshold
+	}
 
 	// Import encrypted fields only if the key fingerprint matches
 	if imported.KeyFingerprint == keyFingerprint(sm.key) {

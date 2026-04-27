@@ -1,3 +1,6 @@
+// Modal safety: the ApiKeyPromptModal used here is the shared BaseModal-based
+// prompt that already guards its own close behavior; no form state on this
+// card can be lost to a backdrop click. Treat as closeOnBackdropClick={false}.
 import { useMemo, useState, useEffect, useRef } from 'react'
 import { AlertCircle, CheckCircle, Clock, ChevronRight, TrendingUp, TrendingDown, Minus, Cpu, HardDrive, RefreshCw, Info, Sparkles, ThumbsUp, ThumbsDown, Zap, Layers, List } from 'lucide-react'
 import { useCardDemoState } from '../CardDataContext'
@@ -14,6 +17,7 @@ import { cn } from '../../../lib/cn'
 import { useApiKeyCheck, ApiKeyPromptModal } from './shared'
 import type { ConsoleMissionCardProps } from './shared'
 import { useCardLoadingState } from '../CardDataContext'
+import { ALERT_SEVERITY_ORDER } from '../../../types/alerts'
 import type { PredictedRisk, TrendDirection } from '../../../types/predictions'
 import { CardControlsRow, CardSearchInput, CardPaginationFooter, CardAIActions } from '../../../lib/cards/CardComponents'
 import { ClusterBadge } from '../../ui/ClusterBadge'
@@ -153,6 +157,8 @@ function analyzeRootCause(node: NodeData): { cause: string; details: string } | 
 let nodesCache: NodeData[] = []
 let nodesCacheTimestamp = 0
 let nodesFetchInProgress = false
+/** Last fetch error message, or null if the most recent fetch succeeded */
+let nodesFetchError: string | null = null
 const NODES_CACHE_TTL = 30000 // 30 seconds
 /** Cluster-level GPU allocation threshold — flag when >80% of a cluster's GPUs are allocated */
 const GPU_CLUSTER_EXHAUSTION_THRESHOLD = 0.8
@@ -181,10 +187,13 @@ async function fetchAllNodes(): Promise<NodeData[]> {
       const data = await response.json()
       nodesCache = data.nodes || []
       nodesCacheTimestamp = Date.now()
+      nodesFetchError = null
       notifyNodesSubscribers()
     }
   } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error'
     console.error('[OfflineDetection] Error fetching nodes:', error)
+    nodesFetchError = message
   } finally {
     nodesFetchInProgress = false
   }
@@ -219,7 +228,7 @@ function generatePredictionId(type: string, name: string, cluster?: string): str
   return `heuristic-${type}-${name}-${cluster || 'unknown'}`
 }
 
-// Card 4: Predictive Health Monitor - Detect issues, predict failures, group by root cause
+// Card 4: AI Cluster Issue Predictor - Detect issues, predict failures, group by root cause
 export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
   const { t } = useTranslation(['cards', 'common'])
   const { startMission, missions } = useMissions()
@@ -274,6 +283,9 @@ export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
     fetchAllNodes().then(nodes => {
       setAllNodes(nodes)
       setNodesLoading(false)
+      if (nodesFetchError) {
+        console.warn('[OfflineDetection] Node fetch degraded:', nodesFetchError)
+      }
     }).catch(() => { /* fetchAllNodes always resolves — defensive catch */ })
 
     // Poll every 30 seconds
@@ -623,7 +635,7 @@ export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
 
   // Sort items
   const sortedItems = (() => {
-    const severityOrder: Record<string, number> = { critical: 0, warning: 1, info: 2 }
+    const sevOrder = ALERT_SEVERITY_ORDER as Record<string, number>
     const categoryOrder: Record<string, number> = { offline: 0, gpu: 1, prediction: 2 }
 
     return [...filteredItems].sort((a, b) => {
@@ -636,7 +648,7 @@ export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
           cmp = a.cluster.localeCompare(b.cluster)
           break
         case 'severity':
-          cmp = (severityOrder[a.severity] ?? 999) - (severityOrder[b.severity] ?? 999)
+          cmp = (sevOrder[a.severity] ?? 999) - (sevOrder[b.severity] ?? 999)
           break
         case 'category':
           cmp = (categoryOrder[a.category] ?? 999) - (categoryOrder[b.category] ?? 999)
@@ -753,8 +765,7 @@ export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
       // First by count (descending)
       if (b.items.length !== a.items.length) return b.items.length - a.items.length
       // Then by severity
-      const severityOrder = { critical: 0, warning: 1, info: 2 }
-      return severityOrder[a.severity] - severityOrder[b.severity]
+      return (ALERT_SEVERITY_ORDER as Record<string, number>)[a.severity] - (ALERT_SEVERITY_ORDER as Record<string, number>)[b.severity]
     })
   }, [sortedItems])
 
@@ -874,7 +885,7 @@ Please:
       </div>
 
       {/* Status Summary */}
-      <div className="grid grid-cols-3 gap-2 mb-4">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-4">
         <div
           className={cn(
             'p-2 rounded-lg border',
@@ -984,11 +995,20 @@ ${aiEnabled ? '\nClick to run AI analysis now' : ''}`}
 
       {/* Search and View Mode Toggle */}
       <div className="flex items-center gap-2 mb-3">
+        {/*
+          * #8385: `CardSearchInput` wraps the <input> in a div with a baked-in
+          * `mb-4`, so when it sits inline with the view-mode toggle the search
+          * input's outer box is taller than the toggle group. `items-center`
+          * then vertically centers the two children but the visual top edges
+          * no longer align, which reads as a misaligned "list / root cause"
+          * toggle. `mb-0!` overrides the default bottom margin so both
+          * children occupy the same vertical box.
+          */}
         <CardSearchInput
           value={search}
           onChange={setSearch}
           placeholder={t('common:common.searchIssues')}
-          className="flex-1"
+          className="flex-1 mb-0!"
         />
         {/* View mode toggle - only show if there are grouped items */}
         {rootCauseGroups.length > 0 && rootCauseGroups.some(g => g.items.length > 1) && (
@@ -1033,7 +1053,7 @@ ${aiEnabled ? '\nClick to run AI analysis now' : ''}`}
                   {/* Group Header */}
                   <div
                     className={cn(
-                      'p-2 rounded text-xs cursor-pointer transition-colors flex items-center justify-between',
+                      'p-2 rounded text-xs cursor-pointer transition-colors flex flex-wrap items-center justify-between gap-y-2',
                       `bg-${severityColor}-500/10 hover:bg-${severityColor}-500/20 border border-${severityColor}-500/20`
                     )}
                     style={{
@@ -1044,7 +1064,7 @@ ${aiEnabled ? '\nClick to run AI analysis now' : ''}`}
                     <div className="flex items-center gap-2 min-w-0 flex-1">
                       <ChevronRight
                         className={cn(
-                          'w-3.5 h-3.5 flex-shrink-0 transition-transform',
+                          'w-3.5 h-3.5 shrink-0 transition-transform',
                           isExpanded && 'rotate-90'
                         )}
                         style={{ color: `rgb(${severityColor === 'red' ? '248,113,113' : severityColor === 'yellow' ? '250,204,21' : '96,165,250'})` }}
@@ -1071,7 +1091,7 @@ ${aiEnabled ? '\nClick to run AI analysis now' : ''}`}
                     </div>
                     <button
                       className={cn(
-                        'px-2 py-1 text-2xs rounded font-medium transition-colors flex-shrink-0 ml-2',
+                        'px-2 py-1 text-2xs rounded font-medium transition-colors shrink-0 ml-2',
                         'bg-purple-500/20 text-purple-400 hover:bg-purple-500/30'
                       )}
                       onClick={(e) => {
@@ -1110,7 +1130,7 @@ TASK:
                       {group.items.map((item) => (
                         <div
                           key={item.id}
-                          className="p-1.5 rounded bg-secondary/30 text-xs cursor-pointer hover:bg-secondary/50 transition-colors flex items-center justify-between"
+                          className="p-1.5 rounded bg-secondary/30 text-xs cursor-pointer hover:bg-secondary/50 transition-colors flex flex-wrap items-center justify-between gap-y-2"
                           onClick={() => {
                             if (item.category === 'offline' && item.nodeData?.cluster) {
                               drillToNode(item.nodeData.cluster, item.name, {})
@@ -1123,7 +1143,7 @@ TASK:
                             <span className="text-foreground truncate">{item.name}</span>
                             <ClusterBadge cluster={item.cluster} size="sm" />
                           </div>
-                          <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                          <ChevronRight className="w-3 h-3 text-muted-foreground shrink-0" />
                         </div>
                       ))}
                     </div>
@@ -1153,7 +1173,7 @@ TASK:
             return (
               <div
                 key={item.id}
-                className="p-2 rounded bg-red-500/10 text-xs cursor-pointer hover:bg-red-500/20 transition-colors group flex items-center justify-between"
+                className="p-2 rounded bg-red-500/10 text-xs cursor-pointer hover:bg-red-500/20 transition-colors group flex flex-wrap items-center justify-between gap-y-2"
                 onClick={() => node.cluster && drillToNode(node.cluster, node.name, {
                   status: node.unschedulable ? 'Cordoned' : node.status,
                   unschedulable: node.unschedulable,
@@ -1165,7 +1185,7 @@ TASK:
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="font-medium text-foreground truncate">{node.name}</span>
-                    <StatusBadge color="red" size="xs" className="flex-shrink-0">
+                    <StatusBadge color="red" size="xs" className="shrink-0">
                       {rootCause?.cause || t('cards:consoleOfflineDetection.offline')}
                     </StatusBadge>
                     {node.cluster && (
@@ -1177,7 +1197,7 @@ TASK:
                   </div>
                 </div>
                 {/* Item action buttons */}
-                <div className="flex items-center gap-1 flex-shrink-0 ml-2">
+                <div className="flex items-center gap-1 shrink-0 ml-2">
                   <CardAIActions
                     resource={{ kind: 'Node', name: node.name, cluster: node.cluster, status: node.unschedulable ? 'Cordoned' : node.status }}
                     issues={rootCause ? [{ name: rootCause.cause, message: rootCause.details }] : []}
@@ -1194,14 +1214,14 @@ TASK:
             return (
               <div
                 key={item.id}
-                className="p-2 rounded bg-yellow-500/10 text-xs cursor-pointer hover:bg-yellow-500/20 transition-colors group flex items-center justify-between"
+                className="p-2 rounded bg-yellow-500/10 text-xs cursor-pointer hover:bg-yellow-500/20 transition-colors group flex flex-wrap items-center justify-between gap-y-2"
                 onClick={() => drillToCluster(issue.cluster)}
                 title={`Click to view cluster ${issue.cluster}`}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="font-medium text-foreground truncate">{issue.nodeName}</span>
-                    <StatusBadge color="yellow" size="xs" className="flex-shrink-0">
+                    <StatusBadge color="yellow" size="xs" className="shrink-0">
                       GPU
                     </StatusBadge>
                     <ClusterBadge cluster={issue.cluster} size="sm" />
@@ -1209,7 +1229,7 @@ TASK:
                   <div className="text-yellow-400 truncate mt-0.5">0 GPUs available</div>
                 </div>
                 {/* Item action buttons */}
-                <div className="flex items-center gap-1 flex-shrink-0 ml-2">
+                <div className="flex items-center gap-1 shrink-0 ml-2">
                   <CardAIActions
                     resource={{ kind: 'GPU', name: issue.nodeName, cluster: issue.cluster, status: `${issue.available}/${issue.expected} GPUs available` }}
                     issues={[{ name: 'GPU Unavailable', message: issue.reason }]}
@@ -1234,19 +1254,19 @@ TASK:
                 )}
                 title={risk.reasonDetailed || risk.reason}
               >
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-y-2">
                   <div
                     className="min-w-0 flex items-center gap-2 flex-1 cursor-pointer"
                     onClick={() => risk.cluster && drillToCluster(risk.cluster)}
                   >
                     {/* Type Icon - all blue */}
                     {risk.type === 'pod-crash' && (
-                      <RefreshCw className="w-3 h-3 flex-shrink-0 text-blue-400" />
+                      <RefreshCw className="w-3 h-3 shrink-0 text-blue-400" />
                     )}
-                    {risk.type === 'resource-exhaustion' && <Cpu className="w-3 h-3 flex-shrink-0 text-blue-400" />}
-                    {risk.type === 'gpu-exhaustion' && <HardDrive className="w-3 h-3 flex-shrink-0 text-blue-400" />}
+                    {risk.type === 'resource-exhaustion' && <Cpu className="w-3 h-3 shrink-0 text-blue-400" />}
+                    {risk.type === 'gpu-exhaustion' && <HardDrive className="w-3 h-3 shrink-0 text-blue-400" />}
                     {(risk.type === 'resource-trend' || risk.type === 'capacity-risk' || risk.type === 'anomaly') && (
-                      <Sparkles className="w-3 h-3 flex-shrink-0 text-blue-400" />
+                      <Sparkles className="w-3 h-3 shrink-0 text-blue-400" />
                     )}
 
                     <div className="min-w-0 flex-1">
@@ -1254,11 +1274,11 @@ TASK:
                         <span className="font-medium text-foreground truncate">{risk.name}</span>
                         {/* Source Badge */}
                         {risk.source === 'ai' ? (
-                          <StatusBadge color="blue" size="xs" className="flex-shrink-0">
+                          <StatusBadge color="blue" size="xs" className="shrink-0">
                             AI
                           </StatusBadge>
                         ) : (
-                          <StatusBadge color="blue" size="xs" className="flex-shrink-0">
+                          <StatusBadge color="blue" size="xs" className="shrink-0">
                             <Zap className="w-2 h-2" />
                           </StatusBadge>
                         )}
@@ -1270,7 +1290,7 @@ TASK:
                         {risk.trend && <TrendIcon trend={risk.trend} />}
                         {/* Namespace Badge */}
                         {risk.namespace && (
-                          <StatusBadge color="gray" size="xs" className="flex-shrink-0 truncate max-w-[80px]" title={`namespace: ${risk.namespace}`}>
+                          <StatusBadge color="gray" size="xs" className="shrink-0 truncate max-w-[80px]" title={`namespace: ${risk.namespace}`}>
                             {risk.namespace}
                           </StatusBadge>
                         )}
@@ -1286,7 +1306,7 @@ TASK:
                   </div>
 
                   {/* Action Buttons + Feedback + Chevron */}
-                  <div className="flex items-center gap-1 flex-shrink-0 ml-2">
+                  <div className="flex items-center gap-1 shrink-0 ml-2">
                     {/* Diagnose & Prevent buttons */}
                     <CardAIActions
                       resource={{ kind: risk.type, name: risk.name, namespace: risk.namespace, cluster: risk.cluster, status: risk.severity }}

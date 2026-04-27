@@ -1,6 +1,7 @@
 # KubeStellar Console
 
 ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/clubanderson/b9a9ae8469f1897a22d5a40629bc1e82/raw/coverage-badge.json)
+[![ACMM](https://img.shields.io/endpoint?url=https%3A%2F%2Fconsole.kubestellar.io%2Fapi%2Facmm%2Fbadge%3Frepo%3Dkubestellar%252Fconsole%26v%3D3)](https://console.kubestellar.io/acmm?repo=kubestellar%2Fconsole)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/kubestellar/console/badge)](https://securityscorecards.dev/viewer/?uri=github.com/kubestellar/console)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12343/badge?v=2)](https://www.bestpractices.dev/projects/12343)
 
@@ -170,6 +171,8 @@ export GOOGLE_API_KEY=...             # Gemini  (note: GOOGLE_API_KEY, not GEMIN
 > **A note on the Settings → API Keys modal**: the console UI exposes a "Manage Keys" button under **Settings → API Keys**. This modal is wired to the agent's `/settings/keys` endpoint, but in the current build that endpoint returns an empty providers list (`providers := []providerDef{}` in `pkg/agent/server_operations.go:288`) — the comment in the source explains that "API-key-driven agents are hidden because they cannot execute commands to diagnose/repair clusters." So the modal will render no providers and you can't enter keys through it. **Use the environment-variable path above.** This README will be updated if/when the providers list is re-enabled.
 
 **If no key is configured**, AI-powered features fall back to deterministic / rule-based behavior. The card suggestions, missions, and dashboards remain fully usable.
+
+**Security model, air-gapped deployments, and local / self-hosted LLMs** are covered in [`docs/security/SECURITY-MODEL.md`](docs/security/SECURITY-MODEL.md). That document explains the data flow between browser, Go backend, kc-agent, and AI providers; how to run the console with no external AI access; and the currently supported self-hosted path using kc-agent's CLI-based agents. It also notes that OpenAI-compatible local LLM endpoints (for example Ollama, vLLM, LM Studio, or an internal gateway) are a planned follow-up for the base-URL-overridable HTTP providers referenced by `GROQ_BASE_URL` / `OPENROUTER_BASE_URL` / `OPEN_WEBUI_URL`, which are not yet wired into the selectable provider list in the current build.
 
 ## How It Works
 

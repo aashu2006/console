@@ -75,6 +75,7 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
       }
       reader.onerror = (err) => {
         console.error(`[Screenshot] FileReader failed for ${file.name}:`, err)
+        showToast(`Failed to read screenshot "${file.name}". Try a different image.`, 'error')
       }
       reader.readAsDataURL(file)
     })
@@ -112,6 +113,7 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
         }
         reader.onerror = (err) => {
           console.error('[Screenshot] Paste FileReader failed:', err)
+          showToast('Failed to read pasted screenshot. Try attaching the image instead.', 'error')
         }
         reader.readAsDataURL(file)
       }
@@ -249,7 +251,11 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
     forceClose()
   }, [forceClose])
 
-  // Keyboard navigation - ESC to close, Space to close when not typing
+  // Submit form programmatically via ref (used by Cmd/Ctrl+Enter shortcut)
+  const formRef = useRef<HTMLFormElement>(null)
+
+  // Keyboard navigation - ESC to close, Space to close when not typing,
+  // Cmd/Ctrl+Enter to submit (#8651)
   useEffect(() => {
     if (!isOpen) return
 
@@ -258,6 +264,13 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
       if (e.key === 'Escape') {
         e.preventDefault()
         handleClose()
+        return
+      }
+
+      // Cmd+Enter (Mac) or Ctrl+Enter (Win/Linux) submits the form
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault()
+        formRef.current?.requestSubmit()
         return
       }
 
@@ -283,8 +296,24 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
 
   const coins = type === 'bug' ? REWARD_ACTIONS.bug_report.coins : REWARD_ACTIONS.feature_suggestion.coins
 
+  // Close on backdrop click — only when the click target is the backdrop
+  // itself, not any child element (so clicks inside the modal content do
+  // not dismiss it). Routes through handleClose() so the unsaved-changes
+  // confirmation flow runs if the user has typed anything. (Fixes #9159)
+  const handleBackdropClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.target === e.currentTarget) {
+      handleClose()
+    }
+  }
+
   return createPortal(
-    <div className="fixed inset-0 z-modal flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div
+      className="fixed inset-0 z-modal flex items-center justify-center bg-black/60 backdrop-blur-xs"
+      onClick={handleBackdropClick}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Submit Feedback"
+    >
       <ConfirmDialog
         isOpen={showDiscardConfirm}
         onClose={() => setShowDiscardConfirm(false)}
@@ -418,7 +447,7 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
                 </button>
               </div>
 
-              <form onSubmit={handleSubmit}>
+              <form ref={formRef} onSubmit={handleSubmit}>
                 <div className="space-y-4">
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1.5">
@@ -429,7 +458,7 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
                       value={title}
                       onChange={(e) => setTitle(e.target.value)}
                       placeholder={type === 'bug' ? 'Brief description of the bug' : 'Brief description of the feature'}
-                      className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                      className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                       required
                     />
                   </div>
@@ -447,7 +476,7 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
                         : 'Describe the feature, use case, and how it would help... (paste screenshots here!)'
                       }
                       rows={4}
-                      className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none"
+                      className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50 resize-none"
                       required
                     />
                   </div>
@@ -486,7 +515,7 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
                     {screenshots.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-2">
                         {screenshots.map((s, i) => (
-                          <div key={i} className="relative group w-20 h-20 flex-shrink-0">
+                          <div key={i} className="relative group w-20 h-20 shrink-0">
                             <img
                               src={s.preview}
                               alt={`Screenshot ${i + 1}`}
@@ -519,13 +548,13 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
                   {/* Error message */}
                   {submitError && (
                     <div className="flex items-start gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs">
-                      <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+                      <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
                       <span className="text-red-400">{submitError}</span>
                     </div>
                   )}
 
                   <div className="flex items-center gap-2 p-3 rounded-lg bg-blue-500/10 border border-blue-500/20 text-xs">
-                    <ExternalLink className="w-4 h-4 text-blue-400 flex-shrink-0" />
+                    <ExternalLink className="w-4 h-4 text-blue-400 shrink-0" />
                     <span className="text-muted-foreground">
                       {screenshots.length > 0
                         ? 'A GitHub issue will be created automatically with your screenshots attached.'
@@ -544,6 +573,11 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
                       <Send className="w-4 h-4" />
                     )}
                     {isSubmitting ? 'Creating issue...' : `Submit & Earn ${coins} Coins`}
+                    {!isSubmitting && (
+                      <kbd className="ml-1 px-1.5 py-0.5 rounded bg-white/20 text-[10px] font-mono leading-none">
+                        {navigator.platform?.includes('Mac') ? '⌘' : 'Ctrl'}↵
+                      </kbd>
+                    )}
                   </button>
                 </div>
               </form>
@@ -554,6 +588,9 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
         <div className="flex items-center justify-end gap-3 px-4 py-2 border-t border-border/50 text-2xs text-muted-foreground/50">
           <span><kbd className="px-1 py-0.5 rounded bg-secondary/50 text-[9px]">Esc</kbd> close</span>
           <span><kbd className="px-1 py-0.5 rounded bg-secondary/50 text-[9px]">Space</kbd> close</span>
+          {!success && (
+            <span><kbd className="px-1 py-0.5 rounded bg-secondary/50 text-[9px]">{navigator.platform?.includes('Mac') ? '⌘' : 'Ctrl'}+↵</kbd> submit</span>
+          )}
         </div>
       </div>
     </div>,
@@ -590,7 +627,7 @@ export function LinkedInShareButton({ onShare, compact = false }: { onShare?: ()
     return (
       <button
         onClick={handleShare}
-        className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg bg-[#0A66C2]/20 hover:bg-[#0A66C2]/30 text-[#0A66C2] transition-colors"
+        className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg bg-linkedin/20 hover:bg-linkedin/30 text-linkedin transition-colors"
         title="Share on LinkedIn"
       >
         <Linkedin className="w-4 h-4" />
@@ -603,7 +640,7 @@ export function LinkedInShareButton({ onShare, compact = false }: { onShare?: ()
   return (
     <button
       onClick={handleShare}
-      className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#0A66C2] hover:bg-[#004182] text-white font-medium transition-colors"
+      className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-linkedin hover:bg-linkedin-dark text-white font-medium transition-colors"
     >
       <Linkedin className="w-4 h-4" />
       <span>{t('feedback.shareOnLinkedIn')}</span>

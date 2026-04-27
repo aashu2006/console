@@ -80,10 +80,12 @@ export function Weather({ config }: { config?: WeatherConfig }) {
   const [expandedDay, setExpandedDay] = useState<string | null>(null)
   const hourlyScrollRef = useRef<HTMLDivElement>(null)
 
-  // Current location state - restore from localStorage
+  // Current location state - restore from sessionStorage
+  // security: stored in sessionStorage, not localStorage — location preference is
+  // user-provided and only used client-side; clears on tab close to reduce exposure window
   const [currentLocation, setCurrentLocation] = useState<SavedLocation>(() => {
     try {
-      const saved = localStorage.getItem('weather-current-location')
+      const saved = sessionStorage.getItem('weather-current-location')
       if (saved) {
         return JSON.parse(saved)
       }
@@ -104,9 +106,11 @@ export function Weather({ config }: { config?: WeatherConfig }) {
   const [showCityDropdown, setShowCityDropdown] = useState(false)
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
+  // security: stored in sessionStorage, not localStorage — location list is
+  // user-provided and only used client-side; clears on tab close to reduce exposure window
   const [savedLocations, setSavedLocations] = useState<SavedLocation[]>(() => {
     try {
-      const saved = localStorage.getItem('weather-saved-locations-v2')
+      const saved = sessionStorage.getItem('weather-saved-locations-v2')
       return saved ? JSON.parse(saved) : []
     } catch {
       return []
@@ -187,21 +191,24 @@ export function Weather({ config }: { config?: WeatherConfig }) {
   const hourlyForecast = weatherData.hourly
   // #6219: pass isFailed through so CardWrapper enters its error render path
   // immediately on a failed fetch instead of waiting for CARD_LOADING_TIMEOUT_MS.
-  useCardLoadingState({ isLoading, isRefreshing, hasAnyData: !!currentWeather, isDemoData: isDemoFallback, isFailed, lastRefresh })
+  const hasData = !!currentWeather
+  useCardLoadingState({ isLoading: isLoading && !hasData, isRefreshing, hasAnyData: hasData, isDemoData: isDemoFallback, isFailed, lastRefresh })
 
-  // Save locations to localStorage whenever they change
+  // Save locations to sessionStorage whenever they change.
+  // Location preferences are user-selected city names, not credentials or sensitive cluster data.
   useEffect(() => {
     try {
-      localStorage.setItem('weather-saved-locations-v2', JSON.stringify(savedLocations))
+      sessionStorage.setItem('weather-saved-locations-v2', JSON.stringify(savedLocations)) // lgtm[js/clear-text-storage-of-sensitive-data]
     } catch {
       // Ignore storage errors (e.g. private browsing, quota exceeded)
     }
   }, [savedLocations])
 
-  // Save current location to localStorage whenever it changes
+  // Save current location to sessionStorage whenever it changes.
+  // Location preferences are user-selected city names, not credentials or sensitive cluster data.
   useEffect(() => {
     try {
-      localStorage.setItem('weather-current-location', JSON.stringify(currentLocation))
+      sessionStorage.setItem('weather-current-location', JSON.stringify(currentLocation)) // lgtm[js/clear-text-storage-of-sensitive-data]
     } catch {
       // Ignore storage errors (e.g. private browsing, quota exceeded)
     }
@@ -330,7 +337,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Compact Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <button
           onClick={() => setShowSettings(!showSettings)}
           className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg transition-colors ${showSettings ? 'bg-primary/20 text-primary' : 'hover:bg-secondary/50 text-muted-foreground'}`}
@@ -342,7 +349,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
 
       {/* Settings Panel */}
       {showSettings && (
-        <div className="mb-3 p-3 rounded-xl bg-secondary backdrop-blur-sm border border-border/30 space-y-3">
+        <div className="mb-3 p-3 rounded-xl bg-secondary backdrop-blur-xs border border-border/30 space-y-3">
           {/* City Search */}
           <div>
             <label className="text-xs text-muted-foreground mb-1.5 block font-medium">Search for a city</label>
@@ -362,7 +369,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
 
               {/* City Search Dropdown */}
               {showCityDropdown && citySearchResults.length > 0 && (
-                <div className="absolute z-50 w-full mt-1 bg-secondary/95 backdrop-blur-sm border border-border/30 rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                <div className="absolute z-50 w-full mt-1 bg-secondary/95 backdrop-blur-xs border border-border/30 rounded-lg shadow-lg max-h-60 overflow-y-auto">
                   {citySearchResults.map((city) => (
                     <button
                       key={city.id}
@@ -381,7 +388,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
           </div>
 
           {/* Current Location + Save Button */}
-          <div className="flex items-center justify-between p-2.5 rounded-lg bg-secondary/50 border border-border/30">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 p-2.5 rounded-lg bg-secondary/50 border border-border/30">
             <div className="flex items-center gap-2">
               <MapPin className="w-4 h-4 text-primary" />
               <div>
@@ -484,7 +491,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
         {currentWeather && (
           <div
             key={`weather-hero-${currentLocation.id}`}
-            className={`relative rounded-3xl bg-gradient-to-b ${backgroundGradient} overflow-hidden shadow-lg`}
+            className={`relative rounded-3xl bg-linear-to-b ${backgroundGradient} overflow-hidden shadow-lg`}
           >
             <div className="absolute inset-0 bg-black/20 z-0"></div>
 
@@ -611,7 +618,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
                         </span>
                         <div className="flex-1 h-1.5 bg-secondary/50 rounded-full overflow-hidden relative">
                           <div
-                            className="absolute h-full bg-gradient-to-r from-blue-400 to-orange-400 rounded-full"
+                            className="absolute h-full bg-linear-to-r from-blue-400 to-orange-400 rounded-full"
                             style={{
                               left: `${leftPercent}%`,
                               width: `${Math.max(widthPercent, 5)}%` }}
@@ -631,11 +638,11 @@ export function Weather({ config }: { config?: WeatherConfig }) {
 
                     {isExpanded && (
                       <div className="px-4 py-3 ml-6 space-y-2 text-sm">
-                        <div className="flex items-center justify-between">
+                        <div className="flex flex-wrap items-center justify-between gap-y-2">
                           <span className="text-muted-foreground">Condition</span>
                           <span className="font-medium">{condition.label}</span>
                         </div>
-                        <div className="flex items-center justify-between">
+                        <div className="flex flex-wrap items-center justify-between gap-y-2">
                           <span className="text-muted-foreground">Precipitation</span>
                           <span className="font-medium">{day.precipitation}%</span>
                         </div>
@@ -715,7 +722,7 @@ export function Weather({ config }: { config?: WeatherConfig }) {
       </div>
 
       {/* Footer */}
-      <div className="mt-3 pt-2 border-t border-border/30 text-xs text-muted-foreground flex items-center justify-between">
+      <div className="mt-3 pt-2 border-t border-border/30 text-xs text-muted-foreground flex flex-wrap items-center justify-between gap-y-2">
         <a
           href="https://open-meteo.com"
           target="_blank"

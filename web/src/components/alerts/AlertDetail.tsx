@@ -14,6 +14,7 @@ import {
 import { Slack } from '@/lib/icons'
 import { useAlerts, useSlackNotification, useSlackWebhooks } from '../../hooks/useAlerts'
 import { useMissions } from '../../hooks/useMissions'
+import { useAuth } from '../../lib/auth'
 import { getSeverityIcon, getSeverityColor } from '../../types/alerts'
 import type { Alert } from '../../types/alerts'
 import { useToast } from '../ui/Toast'
@@ -21,10 +22,13 @@ import { Button } from '../ui/Button'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { TOAST_DISMISS_MS } from '../../lib/constants/network'
+import { MS_PER_MINUTE, MINUTES_PER_HOUR, HOURS_PER_DAY } from '../../lib/constants/time'
+
+// Issue 9256 — fallback label used for acknowledgement when no authenticated
+// user is available (e.g. in demo mode without login).
+const ANONYMOUS_ACK_LABEL = 'anonymous'
 
 // Time thresholds for relative time formatting
-const MINUTES_PER_HOUR = 60 // Minutes in an hour
-const HOURS_PER_DAY = 24 // Hours in a day
 
 interface AlertDetailProps {
   alert: Alert
@@ -36,7 +40,7 @@ function formatRelativeTime(dateString: string, t: TFunction): string {
   const date = new Date(dateString)
   const now = new Date()
   const diffMs = now.getTime() - date.getTime()
-  const diffMins = Math.floor(diffMs / 60000)
+  const diffMins = Math.floor(diffMs / MS_PER_MINUTE)
   const diffHours = Math.floor(diffMins / 60)
   const diffDays = Math.floor(diffHours / 24)
 
@@ -53,6 +57,7 @@ export function AlertDetail({ alert, onClose }: AlertDetailProps) {
   const { sendNotification } = useSlackNotification()
   const { missions, setActiveMission, openSidebar } = useMissions()
   const { showToast } = useToast()
+  const { user } = useAuth()
 
   const [showDetails, setShowDetails] = useState(false)
   const [isSendingSlack, setIsSendingSlack] = useState(false)
@@ -68,16 +73,21 @@ export function AlertDetail({ alert, onClose }: AlertDetailProps) {
     ? missions.find(m => m.id === alert.aiDiagnosis?.missionId)
     : null
 
-  // Cleanup timeouts on unmount
+  // Cleanup all timeouts (including diagnosis timer) on unmount
   useEffect(() => {
     return () => {
       timeoutsRef.current.forEach(clearTimeout)
       timeoutsRef.current = []
+      clearTimeout(diagnosisTimerRef.current)
     }
   }, [])
 
   const handleAcknowledge = () => {
-    acknowledgeAlert(alert.id, 'Current User')
+    // Issue 9256 — record the actual authenticated user's github_login so
+    // team environments can track who acknowledged which alert. Falls back to
+    // ANONYMOUS_ACK_LABEL only when no user session is available.
+    const ackBy = user?.github_login || ANONYMOUS_ACK_LABEL
+    acknowledgeAlert(alert.id, ackBy)
   }
 
   const handleResolve = () => {
@@ -92,7 +102,16 @@ export function AlertDetail({ alert, onClose }: AlertDetailProps) {
   const handleRunDiagnosis = async () => {
     diagnosisAtStartRef.current = alert.aiDiagnosis // snapshot before starting
     setIsRunningDiagnosis(true)
-    runAIDiagnosis(alert.id)
+    try {
+      await runAIDiagnosis(alert.id)
+    } catch {
+      // #7334 — Clear spinner on failure instead of letting it persist
+      // Issue 9254 — previously failure was silent; now surface a toast so
+      // the user understands the diagnosis did not run.
+      setIsRunningDiagnosis(false)
+      showToast(t('alerts.diagnosisFailed', 'AI diagnosis failed — please try again'), 'error')
+      return
+    }
     // Safety-net timeout: clear loading after 60s even if diagnosis never completes (#5714)
     const AI_DIAGNOSIS_SAFETY_TIMEOUT_MS = 60_000
     clearTimeout(diagnosisTimerRef.current) // clear any previous timer (Copilot followup)
@@ -155,6 +174,19 @@ export function AlertDetail({ alert, onClose }: AlertDetailProps) {
               >
                 {alert.status === 'firing' ? 'FIRING' : 'RESOLVED'}
               </span>
+              {/* Signal type classification badge (#8750) */}
+              {alert.signalType && alert.signalType !== 'state' && (
+                <span
+                  className={`px-2 py-0.5 text-xs rounded ${
+                    alert.signalType === 'acknowledged'
+                      ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30'
+                      : 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
+                  }`}
+                  title={t(`settings.notifications.signalTypes.${alert.signalType}Description`)}
+                >
+                  {t(`settings.notifications.signalTypes.${alert.signalType}`)}
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -193,6 +225,13 @@ export function AlertDetail({ alert, onClose }: AlertDetailProps) {
               <CheckCircle className="w-4 h-4 text-green-400" />
               <span className="text-muted-foreground">{t('alerts.acknowledged')}</span>
               <span className="text-green-400">{formatRelativeTime(alert.acknowledgedAt, t)}</span>
+              {/* Issue 9256 — show who acknowledged the alert so teams can
+                  audit responders, not just the timestamp. */}
+              {alert.acknowledgedBy && (
+                <span className="text-muted-foreground text-xs">
+                  {t('alerts.acknowledgedBy', { user: alert.acknowledgedBy, defaultValue: 'by {{user}}' })}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -221,7 +260,9 @@ export function AlertDetail({ alert, onClose }: AlertDetailProps) {
               <Bot className="w-4 h-4 text-purple-400" />
               <span className="text-sm font-medium text-foreground">{t('alerts.aiDiagnosis')}</span>
             </div>
-            {!alert.aiDiagnosis?.missionId && (
+            {/* #7333 — Allow re-running diagnosis when the mission no longer exists,
+                not just when missionId is unset */}
+            {(!alert.aiDiagnosis?.missionId || !associatedMission) && (
               <Button
                 variant="accent"
                 size="sm"

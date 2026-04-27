@@ -81,6 +81,8 @@ const DASHBOARD_NAMES: Record<DashboardStatsType, string> = {
   'multi-tenancy': 'Multi-Tenancy',
   'ci-cd': 'CI/CD',
   'karmada-ops': 'Karmada Ops',
+  drasi: 'Drasi',
+  acmm: 'AI Codebase Maturity',
 }
 
 const DASHBOARD_ROUTES: Record<DashboardStatsType, string> = {
@@ -106,13 +108,15 @@ const DASHBOARD_ROUTES: Record<DashboardStatsType, string> = {
   'multi-tenancy': '/multi-tenancy',
   'ci-cd': '/ci-cd',
   'karmada-ops': '/karmada-ops',
+  drasi: '/drasi',
+  acmm: '/acmm',
 }
 
 const ALL_STATS_DASHBOARD_TYPES: DashboardStatsType[] = [
   'dashboard', 'clusters', 'workloads', 'pods', 'gitops', 'storage',
   'network', 'security', 'compliance', 'data-compliance', 'compute',
   'events', 'cost', 'alerts', 'operators', 'deploy', 'ai-agents',
-  'cluster-admin', 'insights', 'ci-cd',
+  'cluster-admin', 'insights', 'ci-cd', 'drasi', 'acmm',
 ]
 
 // --- Dashboard storage keys → routes (for scanning placed cards) ---
@@ -294,7 +298,7 @@ const PAGE_ITEMS: SearchItem[] = [
   { id: 'page-clusters', name: 'My Clusters', description: 'Manage Kubernetes clusters', category: 'page', href: '/clusters', keywords: ['kubernetes', 'k8s', 'clusters'] },
   { id: 'page-workloads', name: 'Workloads', description: 'View deployments, pods, and workloads', category: 'page', href: '/workloads', keywords: ['deployment', 'pod', 'replica'] },
   { id: 'page-compute', name: 'Compute', description: 'Nodes, CPUs, GPUs, and compute resources', category: 'page', href: '/compute', keywords: ['node', 'cpu', 'gpu', 'tpu'] },
-  { id: 'page-storage', name: 'Storage', description: 'Persistent volumes and storage classes', category: 'page', href: '/storage', keywords: ['pvc', 'volume', 'disk'] },
+  { id: 'page-storage', name: 'Storage', description: 'PVCs, storage classes, and capacity management', category: 'page', href: '/storage', keywords: ['pvc', 'volume', 'disk'] },
   { id: 'page-network', name: 'Network', description: 'Services, ingress, and network policies', category: 'page', href: '/network', keywords: ['service', 'ingress', 'loadbalancer'] },
   { id: 'page-events', name: 'Events', description: 'Kubernetes cluster events', category: 'page', href: '/events', keywords: ['warning', 'error', 'log'] },
   { id: 'page-security', name: 'Security', description: 'RBAC, roles, and security policies', category: 'page', href: '/security', keywords: ['rbac', 'role', 'policy'] },
@@ -370,7 +374,9 @@ function matchesQuery(item: SearchItem, query: string): boolean {
 export function useSearchIndex(query: string) {
   const { clusters } = useClusters()
   const { deployments } = useDeployments()
-  const { pods } = usePods(undefined, undefined, 'name', 50)
+  // Search should index all available pods, not just a small subset (#7217).
+  const SEARCH_POD_LIMIT = 500
+  const { pods } = usePods(undefined, undefined, 'name', SEARCH_POD_LIMIT)
   const { services } = useServices()
   const { nodes } = useNodes()
   const { releases } = useHelmReleases()

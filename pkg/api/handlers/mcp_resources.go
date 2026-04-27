@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+
+	"github.com/kubestellar/console/pkg/api/audit"
+
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -40,6 +43,7 @@ func (h *MCPHandlers) GetGPUNodes(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allNodes := make([]k8s.GPUNode, 0)
 			clusterTimeout := mcpExtendedTimeout // Increased for large GPU clusters
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -52,7 +56,9 @@ func (h *MCPHandlers) GetGPUNodes(c *fiber.Ctx) error {
 					defer cancel()
 
 					nodes, err := h.k8sClient.GetGPUNodes(ctx, clusterName)
-					if err == nil && len(nodes) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(nodes) > 0 {
 						mu.Lock()
 						allNodes = append(allNodes, nodes...)
 						mu.Unlock()
@@ -61,7 +67,7 @@ func (h *MCPHandlers) GetGPUNodes(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"nodes": allNodes, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"nodes": allNodes, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpExtendedTimeout)
@@ -77,7 +83,7 @@ func (h *MCPHandlers) GetGPUNodes(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"nodes": nodes, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetGPUNodeHealth returns proactive health check results for GPU nodes
@@ -102,6 +108,7 @@ func (h *MCPHandlers) GetGPUNodeHealth(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allNodes := make([]k8s.GPUNodeHealthStatus, 0)
 			clusterTimeout := mcpExtendedTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -114,7 +121,9 @@ func (h *MCPHandlers) GetGPUNodeHealth(c *fiber.Ctx) error {
 					defer cancel()
 
 					nodes, err := h.k8sClient.GetGPUNodeHealth(ctx, clusterName)
-					if err == nil && len(nodes) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(nodes) > 0 {
 						mu.Lock()
 						allNodes = append(allNodes, nodes...)
 						mu.Unlock()
@@ -123,7 +132,7 @@ func (h *MCPHandlers) GetGPUNodeHealth(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"nodes": allNodes, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"nodes": allNodes, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpExtendedTimeout)
@@ -139,7 +148,7 @@ func (h *MCPHandlers) GetGPUNodeHealth(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"nodes": nodes, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetGPUHealthCronJobStatus returns the installation status of the GPU health CronJob
@@ -150,14 +159,14 @@ func (h *MCPHandlers) GetGPUHealthCronJobStatus(c *fiber.Ctx) error {
 
 	cluster := c.Query("cluster")
 	if cluster == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster parameter is required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cluster parameter is required"})
 	}
 	if err := mcpValidateName("cluster", cluster); err != nil {
 		return err
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
+		return errNoClusterAccess(c)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -170,84 +179,13 @@ func (h *MCPHandlers) GetGPUHealthCronJobStatus(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"status": status})
 }
 
-// InstallGPUHealthCronJob installs the GPU health check CronJob on a cluster
-func (h *MCPHandlers) InstallGPUHealthCronJob(c *fiber.Ctx) error {
-	if isDemoMode(c) {
-		return c.JSON(fiber.Map{"success": true, "message": "CronJob installed (demo mode)"})
-	}
-
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
-	}
-
-	var body struct {
-		Cluster   string `json:"cluster"`
-		Namespace string `json:"namespace"`
-		Schedule  string `json:"schedule"`
-		Tier      int    `json:"tier"`
-	}
-	if err := c.BodyParser(&body); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
-	}
-	if body.Cluster == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster is required"})
-	}
-
-	// Validate cron schedule format (5-field standard cron expression)
-	if body.Schedule != "" && !isValidCronSchedule(body.Schedule) {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid cron schedule format — expected 5-field cron expression (e.g. '*/15 * * * *')"})
-	}
-
-	// Validate tier range.
-	// Tier 1 — Critical, Tier 2 — Standard, Tier 3 — Full, Tier 4 — Deep (privileged).
-	// Must stay in sync with the frontend TIER_OPTIONS in ProactiveGPUNodeHealthMonitor.tsx
-	// and with InstallGPUHealthCronJob in pkg/k8s/client_gpu.go (issue #6110).
-	const minTier = 1
-	const maxTier = 4
-	if body.Tier < minTier || body.Tier > maxTier {
-		return c.Status(400).JSON(fiber.Map{"error": fmt.Sprintf("tier must be between %d and %d", minTier, maxTier)})
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), mcpExtendedTimeout)
-	defer cancel()
-
-	if err := h.k8sClient.InstallGPUHealthCronJob(ctx, body.Cluster, body.Namespace, body.Schedule, body.Tier); err != nil {
-		return handleK8sError(c, err)
-	}
-
-	return c.JSON(fiber.Map{"success": true, "message": fmt.Sprintf("GPU health CronJob installed on %s (tier %d)", body.Cluster, body.Tier)})
-}
-
-// UninstallGPUHealthCronJob removes the GPU health check CronJob from a cluster
-func (h *MCPHandlers) UninstallGPUHealthCronJob(c *fiber.Ctx) error {
-	if isDemoMode(c) {
-		return c.JSON(fiber.Map{"success": true, "message": "CronJob removed (demo mode)"})
-	}
-
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
-	}
-
-	var body struct {
-		Cluster   string `json:"cluster"`
-		Namespace string `json:"namespace"`
-	}
-	if err := c.BodyParser(&body); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
-	}
-	if body.Cluster == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster is required"})
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
-	defer cancel()
-
-	if err := h.k8sClient.UninstallGPUHealthCronJob(ctx, body.Cluster, body.Namespace); err != nil {
-		return handleK8sError(c, err)
-	}
-
-	return c.JSON(fiber.Map{"success": true, "message": fmt.Sprintf("GPU health CronJob removed from %s", body.Cluster)})
-}
+// InstallGPUHealthCronJob and UninstallGPUHealthCronJob were removed in #7993
+// Phase 3e — these user-initiated tooling installs now go through kc-agent at
+// `/gpu-health-cronjob` (POST/DELETE), which runs under the user's own
+// kubeconfig instead of the backend pod ServiceAccount. The shared
+// pkg/k8s.MultiClusterClient.InstallGPUHealthCronJob /
+// UninstallGPUHealthCronJob methods stay — kc-agent calls them. See
+// pkg/agent/server_gpu_health.go.
 
 // GetGPUHealthCronJobResults returns the latest health check results from the ConfigMap.
 // This is the endpoint used by the AlertsContext to evaluate gpu_health_cronjob conditions.
@@ -258,14 +196,14 @@ func (h *MCPHandlers) GetGPUHealthCronJobResults(c *fiber.Ctx) error {
 
 	cluster := c.Query("cluster")
 	if cluster == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster parameter is required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cluster parameter is required"})
 	}
 	if err := mcpValidateName("cluster", cluster); err != nil {
 		return err
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
+		return errNoClusterAccess(c)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -302,6 +240,7 @@ func (h *MCPHandlers) GetNVIDIAOperatorStatus(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allStatus := make([]*k8s.NVIDIAOperatorStatus, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -314,7 +253,9 @@ func (h *MCPHandlers) GetNVIDIAOperatorStatus(c *fiber.Ctx) error {
 					defer cancel()
 
 					status, err := h.k8sClient.GetNVIDIAOperatorStatus(ctx, clusterName)
-					if err == nil && (status.GPUOperator != nil || status.NetworkOperator != nil) {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if status.GPUOperator != nil || status.NetworkOperator != nil {
 						mu.Lock()
 						allStatus = append(allStatus, status)
 						mu.Unlock()
@@ -323,7 +264,7 @@ func (h *MCPHandlers) GetNVIDIAOperatorStatus(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"operators": allStatus, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"operators": allStatus, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -336,7 +277,7 @@ func (h *MCPHandlers) GetNVIDIAOperatorStatus(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"operators": []*k8s.NVIDIAOperatorStatus{status}, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetConfigMaps returns ConfigMaps from clusters
@@ -364,6 +305,7 @@ func (h *MCPHandlers) GetConfigMaps(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allConfigMaps := make([]k8s.ConfigMap, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -376,7 +318,9 @@ func (h *MCPHandlers) GetConfigMaps(c *fiber.Ctx) error {
 					defer cancel()
 
 					configmaps, err := h.k8sClient.GetConfigMaps(ctx, clusterName, namespace)
-					if err == nil && len(configmaps) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(configmaps) > 0 {
 						mu.Lock()
 						allConfigMaps = append(allConfigMaps, configmaps...)
 						mu.Unlock()
@@ -385,7 +329,7 @@ func (h *MCPHandlers) GetConfigMaps(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"configmaps": allConfigMaps, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"configmaps": allConfigMaps, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -401,7 +345,7 @@ func (h *MCPHandlers) GetConfigMaps(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"configmaps": configmaps, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetSecrets returns Secrets from clusters
@@ -429,6 +373,7 @@ func (h *MCPHandlers) GetSecrets(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allSecrets := make([]k8s.Secret, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -441,7 +386,9 @@ func (h *MCPHandlers) GetSecrets(c *fiber.Ctx) error {
 					defer cancel()
 
 					secrets, err := h.k8sClient.GetSecrets(ctx, clusterName, namespace)
-					if err == nil && len(secrets) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(secrets) > 0 {
 						mu.Lock()
 						allSecrets = append(allSecrets, secrets...)
 						mu.Unlock()
@@ -450,7 +397,7 @@ func (h *MCPHandlers) GetSecrets(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"secrets": allSecrets, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"secrets": allSecrets, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -466,7 +413,7 @@ func (h *MCPHandlers) GetSecrets(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"secrets": secrets, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetServiceAccounts returns ServiceAccounts from clusters
@@ -494,6 +441,7 @@ func (h *MCPHandlers) GetServiceAccounts(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allServiceAccounts := make([]k8s.ServiceAccount, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -506,7 +454,9 @@ func (h *MCPHandlers) GetServiceAccounts(c *fiber.Ctx) error {
 					defer cancel()
 
 					serviceAccounts, err := h.k8sClient.GetServiceAccounts(ctx, clusterName, namespace)
-					if err == nil && len(serviceAccounts) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(serviceAccounts) > 0 {
 						mu.Lock()
 						allServiceAccounts = append(allServiceAccounts, serviceAccounts...)
 						mu.Unlock()
@@ -515,7 +465,7 @@ func (h *MCPHandlers) GetServiceAccounts(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"serviceAccounts": allServiceAccounts, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"serviceAccounts": allServiceAccounts, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -531,7 +481,7 @@ func (h *MCPHandlers) GetServiceAccounts(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"serviceAccounts": serviceAccounts, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetPVCs returns PersistentVolumeClaims from clusters
@@ -559,6 +509,7 @@ func (h *MCPHandlers) GetPVCs(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allPVCs := make([]k8s.PVC, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -571,7 +522,9 @@ func (h *MCPHandlers) GetPVCs(c *fiber.Ctx) error {
 					defer cancel()
 
 					pvcs, err := h.k8sClient.GetPVCs(ctx, clusterName, namespace)
-					if err == nil && len(pvcs) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(pvcs) > 0 {
 						mu.Lock()
 						allPVCs = append(allPVCs, pvcs...)
 						mu.Unlock()
@@ -580,7 +533,7 @@ func (h *MCPHandlers) GetPVCs(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"pvcs": allPVCs, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"pvcs": allPVCs, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -596,7 +549,7 @@ func (h *MCPHandlers) GetPVCs(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"pvcs": pvcs, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetPVs returns PersistentVolumes from clusters
@@ -622,6 +575,7 @@ func (h *MCPHandlers) GetPVs(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allPVs := make([]k8s.PV, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -634,7 +588,9 @@ func (h *MCPHandlers) GetPVs(c *fiber.Ctx) error {
 					defer cancel()
 
 					pvs, err := h.k8sClient.GetPVs(ctx, clusterName)
-					if err == nil && len(pvs) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(pvs) > 0 {
 						mu.Lock()
 						allPVs = append(allPVs, pvs...)
 						mu.Unlock()
@@ -643,7 +599,7 @@ func (h *MCPHandlers) GetPVs(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"pvs": allPVs, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"pvs": allPVs, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -659,7 +615,7 @@ func (h *MCPHandlers) GetPVs(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"pvs": pvs, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetResourceQuotas returns resource quotas from clusters
@@ -687,6 +643,7 @@ func (h *MCPHandlers) GetResourceQuotas(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allQuotas := make([]k8s.ResourceQuota, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -699,7 +656,9 @@ func (h *MCPHandlers) GetResourceQuotas(c *fiber.Ctx) error {
 					defer cancel()
 
 					quotas, err := h.k8sClient.GetResourceQuotas(ctx, clusterName, namespace)
-					if err == nil && len(quotas) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(quotas) > 0 {
 						mu.Lock()
 						allQuotas = append(allQuotas, quotas...)
 						mu.Unlock()
@@ -708,7 +667,7 @@ func (h *MCPHandlers) GetResourceQuotas(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"resourceQuotas": allQuotas, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"resourceQuotas": allQuotas, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -724,7 +683,7 @@ func (h *MCPHandlers) GetResourceQuotas(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"resourceQuotas": quotas, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetLimitRanges returns limit ranges from clusters
@@ -752,6 +711,7 @@ func (h *MCPHandlers) GetLimitRanges(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allRanges := make([]k8s.LimitRange, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -764,7 +724,9 @@ func (h *MCPHandlers) GetLimitRanges(c *fiber.Ctx) error {
 					defer cancel()
 
 					ranges, err := h.k8sClient.GetLimitRanges(ctx, clusterName, namespace)
-					if err == nil && len(ranges) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(ranges) > 0 {
 						mu.Lock()
 						allRanges = append(allRanges, ranges...)
 						mu.Unlock()
@@ -773,7 +735,7 @@ func (h *MCPHandlers) GetLimitRanges(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"limitRanges": allRanges, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"limitRanges": allRanges, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -789,11 +751,18 @@ func (h *MCPHandlers) GetLimitRanges(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"limitRanges": ranges, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // CreateOrUpdateResourceQuota creates or updates a ResourceQuota
 func (h *MCPHandlers) CreateOrUpdateResourceQuota(c *fiber.Ctx) error {
+	// SECURITY (#7490, #7492): mutating endpoint requires editor or admin role.
+	// This also covers the ensure_namespace path (#7492) since the whole handler
+	// is gated before any namespace or quota creation occurs.
+	if err := requireEditorOrAdmin(c, h.store); err != nil {
+		return err
+	}
+
 	var req struct {
 		Cluster         string            `json:"cluster"`
 		Name            string            `json:"name"`
@@ -805,11 +774,11 @@ func (h *MCPHandlers) CreateOrUpdateResourceQuota(c *fiber.Ctx) error {
 	}
 
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 	}
 
 	if req.Cluster == "" || req.Name == "" || req.Namespace == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster, name, and namespace are required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cluster, name, and namespace are required"})
 	}
 	if err := mcpValidateClusterAndNamespace(req.Cluster, req.Namespace); err != nil {
 		return err
@@ -819,7 +788,7 @@ func (h *MCPHandlers) CreateOrUpdateResourceQuota(c *fiber.Ctx) error {
 	}
 
 	if len(req.Hard) == 0 {
-		return c.Status(400).JSON(fiber.Map{"error": "At least one resource limit is required in 'hard'"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "At least one resource limit is required in 'hard'"})
 	}
 
 	if h.k8sClient != nil {
@@ -847,20 +816,28 @@ func (h *MCPHandlers) CreateOrUpdateResourceQuota(c *fiber.Ctx) error {
 			return handleK8sError(c, err)
 		}
 
+		audit.Log(c, audit.ActionCreateResourceQuota, "resource_quota", req.Name,
+			"cluster="+req.Cluster, "namespace="+req.Namespace)
+
 		return c.JSON(fiber.Map{"resourceQuota": quota, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // DeleteResourceQuota deletes a ResourceQuota
 func (h *MCPHandlers) DeleteResourceQuota(c *fiber.Ctx) error {
+	// SECURITY (#7491): destructive endpoint requires editor or admin role.
+	if err := requireEditorOrAdmin(c, h.store); err != nil {
+		return err
+	}
+
 	cluster := c.Query("cluster")
 	namespace := c.Query("namespace")
 	name := c.Query("name")
 
 	if cluster == "" || namespace == "" || name == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster, namespace, and name are required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cluster, namespace, and name are required"})
 	}
 	if err := mcpValidateClusterAndNamespace(cluster, namespace); err != nil {
 		return err
@@ -878,10 +855,13 @@ func (h *MCPHandlers) DeleteResourceQuota(c *fiber.Ctx) error {
 			return handleK8sError(c, err)
 		}
 
+		audit.Log(c, audit.ActionDeleteResourceQuota, "resource_quota", name,
+			"cluster="+cluster, "namespace="+namespace)
+
 		return c.JSON(fiber.Map{"deleted": true, "name": name, "namespace": namespace, "cluster": cluster})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetPodLogs returns logs from a pod
@@ -898,7 +878,7 @@ func (h *MCPHandlers) GetPodLogs(c *fiber.Ctx) error {
 	tailLines := c.QueryInt("tail", 100)
 
 	if cluster == "" || namespace == "" || pod == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "cluster, namespace, and pod are required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cluster, namespace, and pod are required"})
 	}
 	if err := mcpValidateClusterAndNamespace(cluster, namespace); err != nil {
 		return err
@@ -924,7 +904,7 @@ func (h *MCPHandlers) GetPodLogs(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"logs": logs, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // CallToolRequest represents a request to call an MCP tool
@@ -1044,13 +1024,19 @@ func validateToolName(name string, allowedTools map[string]bool) error {
 
 // CallOpsTool calls a kubestellar-ops tool
 func (h *MCPHandlers) CallOpsTool(c *fiber.Ctx) error {
+	// SECURITY (#7495): tool-call endpoint can expose sensitive cluster data;
+	// require at least editor role to invoke tools.
+	if err := requireEditorOrAdmin(c, h.store); err != nil {
+		return err
+	}
+
 	if h.bridge == nil {
 		return c.Status(503).JSON(fiber.Map{"error": "MCP bridge not available"})
 	}
 
 	var req CallToolRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
 	// SECURITY: Validate tool name against whitelist
@@ -1077,7 +1063,7 @@ func (h *MCPHandlers) CallDeployTool(c *fiber.Ctx) error {
 
 	var req CallToolRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
 	// SECURITY: Validate tool name against whitelist
@@ -1121,6 +1107,7 @@ func (h *MCPHandlers) GetFlatcarNodes(c *fiber.Ctx) error {
 			var wg sync.WaitGroup
 			var mu sync.Mutex
 			allNodes := make([]k8s.FlatcarNodeInfo, 0)
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -1133,7 +1120,9 @@ func (h *MCPHandlers) GetFlatcarNodes(c *fiber.Ctx) error {
 					defer cancel()
 
 					nodes, err := h.k8sClient.GetFlatcarNodes(ctx, clusterName)
-					if err == nil && len(nodes) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(nodes) > 0 {
 						mu.Lock()
 						allNodes = append(allNodes, nodes...)
 						mu.Unlock()
@@ -1142,7 +1131,7 @@ func (h *MCPHandlers) GetFlatcarNodes(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"nodes": allNodes, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"nodes": allNodes, "source": "k8s"}))
 		}
 
 		// Single cluster query
@@ -1156,7 +1145,7 @@ func (h *MCPHandlers) GetFlatcarNodes(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"nodes": nodes, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetIngresses returns Ingresses from clusters
@@ -1184,6 +1173,7 @@ func (h *MCPHandlers) GetIngresses(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allItems := make([]k8s.Ingress, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -1196,7 +1186,9 @@ func (h *MCPHandlers) GetIngresses(c *fiber.Ctx) error {
 					defer cancel()
 
 					items, err := h.k8sClient.GetIngresses(ctx, clusterName, namespace)
-					if err == nil && len(items) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(items) > 0 {
 						mu.Lock()
 						allItems = append(allItems, items...)
 						mu.Unlock()
@@ -1205,7 +1197,7 @@ func (h *MCPHandlers) GetIngresses(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"ingresses": allItems, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"ingresses": allItems, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -1221,7 +1213,7 @@ func (h *MCPHandlers) GetIngresses(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"ingresses": items, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // GetNetworkPolicies returns NetworkPolicies from clusters
@@ -1249,6 +1241,7 @@ func (h *MCPHandlers) GetNetworkPolicies(c *fiber.Ctx) error {
 			var mu sync.Mutex
 			allItems := make([]k8s.NetworkPolicy, 0)
 			clusterTimeout := mcpDefaultTimeout
+			var errTracker clusterErrorTracker
 
 			clusterCtx, clusterCancel := context.WithCancel(c.Context())
 			defer clusterCancel()
@@ -1261,7 +1254,9 @@ func (h *MCPHandlers) GetNetworkPolicies(c *fiber.Ctx) error {
 					defer cancel()
 
 					items, err := h.k8sClient.GetNetworkPolicies(ctx, clusterName, namespace)
-					if err == nil && len(items) > 0 {
+					if err != nil {
+						errTracker.add(clusterName, err)
+					} else if len(items) > 0 {
 						mu.Lock()
 						allItems = append(allItems, items...)
 						mu.Unlock()
@@ -1270,7 +1265,7 @@ func (h *MCPHandlers) GetNetworkPolicies(c *fiber.Ctx) error {
 			}
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-			return c.JSON(fiber.Map{"networkpolicies": allItems, "source": "k8s"})
+			return c.JSON(errTracker.annotate(fiber.Map{"networkpolicies": allItems, "source": "k8s"}))
 		}
 
 		ctx, cancel := context.WithTimeout(c.Context(), mcpDefaultTimeout)
@@ -1286,7 +1281,7 @@ func (h *MCPHandlers) GetNetworkPolicies(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"networkpolicies": items, "source": "k8s"})
 	}
 
-	return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+	return errNoClusterAccess(c)
 }
 
 // podNetworkStatsTimeout is the per-cluster timeout for network stats queries.
@@ -1348,7 +1343,7 @@ func (h *MCPHandlers) GetPodNetworkStats(c *fiber.Ctx) error {
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access available"})
+		return errNoClusterAccess(c)
 	}
 
 	clusters, _, err := h.k8sClient.HealthyClusters(c.Context())
@@ -1360,6 +1355,7 @@ func (h *MCPHandlers) GetPodNetworkStats(c *fiber.Ctx) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	allStats := make([]PodNetworkStats, 0)
+	var errTracker clusterErrorTracker
 
 	clusterCtx, clusterCancel := context.WithCancel(c.Context())
 	defer clusterCancel()
@@ -1374,7 +1370,7 @@ func (h *MCPHandlers) GetPodNetworkStats(c *fiber.Ctx) error {
 
 			client, clientErr := h.k8sClient.GetClient(clusterName)
 			if clientErr != nil {
-				slog.Info("[MCP] network stats: cannot get client", "cluster", clusterName, "error", clientErr)
+				errTracker.add(clusterName, clientErr)
 				return
 			}
 
@@ -1391,7 +1387,7 @@ func (h *MCPHandlers) GetPodNetworkStats(c *fiber.Ctx) error {
 							continue
 						}
 					}
-					slog.Info("[MCP] network stats: list pods failed", "app", label, "cluster", clusterName, "error", listErr)
+					slog.Warn("[MCP] network stats: list pods failed", "app", label, "cluster", clusterName, "error", listErr)
 					continue
 				}
 
@@ -1428,7 +1424,7 @@ func (h *MCPHandlers) GetPodNetworkStats(c *fiber.Ctx) error {
 	}
 
 	waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
-	return c.JSON(fiber.Map{"stats": allStats, "source": "k8s"})
+	return c.JSON(errTracker.annotate(fiber.Map{"stats": allStats, "source": "k8s"}))
 }
 
 // kubeletStatsSummary is a minimal representation of the kubelet /stats/summary response.

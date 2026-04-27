@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,40 @@ import (
 	"github.com/kubestellar/console/pkg/agent/protocol"
 )
 
+// maxWSGoroutines limits concurrent chat/kubectl goroutines per connection
+// to prevent resource exhaustion from bursty or malicious traffic (#7277).
+const maxWSGoroutines = 20
+
+// activeChatEntry pairs an in-progress session's context cancel function with
+// the WebSocket connection that started it. Storing the conn reference allows
+// handleCancelChat to verify the cancelling client owns the session, preventing
+// cross-session cancellation (CSRF/bypass — #9712).
+type activeChatEntry struct {
+	cancel context.CancelFunc
+	// conn is the WebSocket connection that registered this session.
+	// It is used as an ownership key: only the originating connection may
+	// cancel the session via the WebSocket cancel path. The HTTP cancel path
+	// (handleCancelChatHTTP) is separately guarded by validateToken.
+	conn *websocket.Conn
+}
+
+// cmdPrefixRe matches lines like "CMD: ...", "CMD:...", "Command: ...", or "command: ..."
+// used by extractCommandsFromResponse to parse mixed-mode thinking output (#9440).
+var cmdPrefixRe = regexp.MustCompile(`(?i)^(?:cmd|command)\s*:\s*(.+)`)
+
+// codeBlockCmdRe matches kubectl/helm/oc commands inside markdown code blocks (#9440).
+var codeBlockCmdRe = regexp.MustCompile(`^\s*(kubectl|helm|oc)\s+.+`)
+
+// wsMaxMessageBytes caps the size of any single WebSocket frame the agent
+// will accept from a client. Without this, an authenticated client could
+// send arbitrarily large prompts that get forwarded to paid LLM APIs.
+const wsMaxMessageBytes = 1 << 20 // 1 MB
+
+// maxPromptChars caps the per-request prompt length forwarded to LLM
+// providers. Set well above interactive use but below the WebSocket frame
+// limit to keep cost and latency bounded.
+const maxPromptChars = 100_000
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Handle CORS preflight for Private Network Access (required by Chrome 104+)
 	if r.Method == http.MethodOptions {
@@ -26,7 +61,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -44,6 +79,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(wsMaxMessageBytes)
 
 	wsc := &wsClient{}
 	s.clientsMux.Lock()
@@ -65,6 +101,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	writeMu := &wsc.writeMu
 	// closed is set when the read loop exits; goroutines check it before writing
 	var closed atomic.Bool
+
+	// connCtx is cancelled when the WebSocket read loop exits (client disconnect).
+	// AI goroutines derive their context from connCtx so that in-progress
+	// StreamChat calls are interrupted immediately on disconnect (#9709).
+	connCtx, connCancel := context.WithCancel(context.Background())
+	defer connCancel()
+
+	// Semaphore to limit concurrent work goroutines per connection (#7277)
+	sem := make(chan struct{}, maxWSGoroutines)
 
 	// --- Ping/pong keepalive to detect dead connections ---
 	// Set initial read deadline; each pong resets it.
@@ -108,30 +153,35 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// Reset read deadline after each successful read (active client)
 		conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
 
-		// For chat messages, run in a goroutine so cancel messages can be received
+		// For chat messages, run in a goroutine so cancel messages can be received.
+		// Goroutine count is bounded by a semaphore to prevent resource exhaustion (#7277).
 		if msg.Type == protocol.TypeChat || msg.Type == protocol.TypeClaude {
 			forceAgent := ""
 			if msg.Type == protocol.TypeClaude {
 				forceAgent = "claude"
 			}
+			sem <- struct{}{} // acquire slot
 			go func(m protocol.Message, fa string) {
+				defer func() { <-sem }() // release slot
 				defer func() {
 					if r := recover(); r != nil {
-						slog.Info("[Chat] recovered from panic in streaming handler", "panic", r)
+						slog.Error("[Chat] recovered from panic in streaming handler", "panic", r)
 						// Send error frame to the client so the frontend
 						// can display an error state instead of spinning forever.
 						if !closed.Load() {
 							writeMu.Lock()
+							conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 							_ = conn.WriteJSON(protocol.Message{
 								ID:      m.ID,
 								Type:    protocol.TypeError,
 								Payload: protocol.ErrorPayload{Code: "panic", Message: "Internal server error during chat streaming"},
 							})
+							conn.SetWriteDeadline(time.Time{})
 							writeMu.Unlock()
 						}
 					}
 				}()
-				s.handleChatMessageStreaming(conn, m, fa, writeMu, &closed)
+				s.handleChatMessageStreaming(connCtx, conn, m, fa, writeMu, &closed)
 			}(msg, forceAgent)
 		} else if msg.Type == protocol.TypeCancelChat {
 			// Cancel an in-progress chat by session ID
@@ -139,58 +189,107 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		} else if msg.Type == protocol.TypeKubectl {
 			// Handle kubectl messages concurrently so one slow cluster
 			// doesn't block the entire WebSocket message loop.
+			// Bounded by semaphore (#7277).
+			sem <- struct{}{} // acquire slot
 			go func(m protocol.Message) {
+				defer func() { <-sem }() // release slot
 				defer func() {
 					if r := recover(); r != nil {
-						slog.Info("[Kubectl] recovered from panic in message handler", "panic", r)
+						slog.Error("[Kubectl] recovered from panic in message handler", "panic", r)
 						// Notify the client about the panic so the UI can show an error
 						if !closed.Load() {
 							writeMu.Lock()
+							conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 							_ = conn.WriteJSON(protocol.Message{
 								ID:      m.ID,
 								Type:    protocol.TypeError,
 								Payload: protocol.ErrorPayload{Code: "panic", Message: "Internal server error during kubectl execution"},
 							})
+							conn.SetWriteDeadline(time.Time{})
 							writeMu.Unlock()
 						}
 					}
 				}()
-				response := s.handleMessage(m)
+				response := s.handleMessage(connCtx, m)
 				if closed.Load() {
 					return
 				}
 				writeMu.Lock()
 				defer writeMu.Unlock()
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 				if err := conn.WriteJSON(response); err != nil {
 					slog.Error("write error", "error", err)
 				}
+				conn.SetWriteDeadline(time.Time{})
 			}(msg)
 		} else {
-			response := s.handleMessage(msg)
-			writeMu.Lock()
-			err := conn.WriteJSON(response)
-			writeMu.Unlock()
-			if err != nil {
-				slog.Error("write error", "error", err)
-				break
-			}
+			// Dispatch all remaining message types to a goroutine so the
+			// WebSocket read loop stays non-blocking (#9713). Previously this
+			// branch ran synchronously; a provider that takes time to respond
+			// blocked the read loop, preventing pings and cancel messages from
+			// being processed until the call returned.
+			// Goroutine count is bounded by the same semaphore as chat/kubectl.
+			sem <- struct{}{} // acquire slot
+			go func(m protocol.Message) {
+				defer func() { <-sem }() // release slot
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("[WS] recovered from panic in async handler", "panic", r, "msgType", m.Type)
+						if !closed.Load() {
+							writeMu.Lock()
+							conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+							_ = conn.WriteJSON(protocol.Message{
+								ID:   m.ID,
+								Type: protocol.TypeError,
+								Payload: protocol.ErrorPayload{Code: "panic", Message: "Internal server error"},
+							})
+							conn.SetWriteDeadline(time.Time{})
+							writeMu.Unlock()
+						}
+					}
+				}()
+				response := s.handleMessage(connCtx, m)
+				if closed.Load() {
+					return
+				}
+				writeMu.Lock()
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				err := conn.WriteJSON(response)
+				conn.SetWriteDeadline(time.Time{})
+				writeMu.Unlock()
+				if err != nil {
+					slog.Error("write error", "error", err)
+				}
+			}(msg)
 		}
 	}
 	closed.Store(true)
 	close(stopPing) // signal pinger goroutine to exit
 
+	// #9997 — Cancel all active chat sessions owned by this connection.
+	// connCancel() (deferred above) cancels the parent context, but entries
+	// remain in activeChatCtxs until the per-chat defer cleans them up. If
+	// a chat goroutine is blocked waiting for the semaphore or a slow LLM
+	// provider, the activeChatCtxs entry keeps a reference to the stale
+	// cancel function. Explicitly cancelling and removing them here ensures
+	// prompt cleanup on disconnect.
+	s.cancelAllChatsForConn(conn)
+
 	slog.Info("client disconnected", "addr", conn.RemoteAddr())
 }
 
-// handleMessage processes incoming messages (non-streaming)
-func (s *Server) handleMessage(msg protocol.Message) protocol.Message {
+// handleMessage processes incoming messages (non-streaming).
+// The ctx parameter is derived from the WebSocket connection's lifecycle context
+// (connCtx) so that in-flight handlers are cancelled promptly when the client
+// disconnects, preventing goroutine leaks (#9997).
+func (s *Server) handleMessage(ctx context.Context, msg protocol.Message) protocol.Message {
 	switch msg.Type {
 	case protocol.TypeHealth:
 		return s.handleHealthMessage(msg)
 	case protocol.TypeClusters:
 		return s.handleClustersMessage(msg)
 	case protocol.TypeKubectl:
-		return s.handleKubectlMessage(msg)
+		return s.handleKubectlMessage(ctx, msg)
 	// TypeChat and TypeClaude are handled by handleChatMessageStreaming in the WebSocket loop
 	case protocol.TypeListAgents:
 		return s.handleListAgentsMessage(msg)
@@ -235,6 +334,30 @@ func (s *Server) handleClustersMessage(msg protocol.Message) protocol.Message {
 	}
 }
 
+// readOnlyKubectlVerbs are kubectl subcommands that do not modify cluster state.
+// Used by the dry-run gate (#6442) to allow observation while blocking mutations.
+var readOnlyKubectlVerbs = map[string]bool{
+	"get":           true,
+	"describe":      true,
+	"logs":          true,
+	"top":           true,
+	"explain":       true,
+	"api-resources": true,
+	"api-versions":  true,
+	"version":       true,
+	"cluster-info":  true,
+	"auth":          true, // can-i, whoami — read-only checks
+}
+
+// isReadOnlyKubectlCommand returns true when the kubectl args represent a
+// read-only operation that is safe to execute even in dry-run mode.
+func isReadOnlyKubectlCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	return readOnlyKubectlVerbs[strings.ToLower(args[0])]
+}
+
 // destructiveKubectlVerbs are kubectl subcommands that modify or destroy resources
 // and require explicit user confirmation before execution.
 var destructiveKubectlVerbs = map[string]bool{
@@ -266,7 +389,7 @@ func isDestructiveKubectlCommand(args []string) bool {
 	return false
 }
 
-func (s *Server) handleKubectlMessage(msg protocol.Message) protocol.Message {
+func (s *Server) handleKubectlMessage(ctx context.Context, msg protocol.Message) protocol.Message {
 	// Parse payload
 	payloadBytes, err := json.Marshal(msg.Payload)
 	if err != nil {
@@ -276,6 +399,25 @@ func (s *Server) handleKubectlMessage(msg protocol.Message) protocol.Message {
 	var req protocol.KubectlRequest
 	if err := json.Unmarshal(payloadBytes, &req); err != nil {
 		return s.errorResponse(msg.ID, "invalid_payload", "Invalid kubectl request format")
+	}
+
+	// Server-enforced dry-run gate (#6442): if this kubectl request is
+	// associated with a session in dry-run mode, reject any mutating command.
+	// Read-only commands (get, describe, logs, etc.) remain allowed.
+	if req.SessionID != "" {
+		s.dryRunSessionsMu.RLock()
+		isDryRun := s.dryRunSessions[req.SessionID]
+		s.dryRunSessionsMu.RUnlock()
+		if isDryRun && !isReadOnlyKubectlCommand(req.Args) {
+			return protocol.Message{
+				ID:   msg.ID,
+				Type: protocol.TypeError,
+				Payload: protocol.ErrorPayload{
+					Code:    "dry_run_rejected",
+					Message: fmt.Sprintf("dry-run mode: mutating command %q not allowed", strings.Join(req.Args, " ")),
+				},
+			}
+		}
 	}
 
 	// Check for destructive commands that require confirmation
@@ -291,8 +433,9 @@ func (s *Server) handleKubectlMessage(msg protocol.Message) protocol.Message {
 		}
 	}
 
-	// Execute kubectl
-	result := s.kubectl.Execute(req.Context, req.Namespace, req.Args)
+	// Execute kubectl — propagate the connection context so client disconnect
+	// kills the kubectl process immediately (#9997).
+	result := s.kubectl.ExecuteWithContext(ctx, req.Context, req.Namespace, req.Args)
 	return protocol.Message{
 		ID:      msg.ID,
 		Type:    protocol.TypeResult,
@@ -303,15 +446,30 @@ func (s *Server) handleKubectlMessage(msg protocol.Message) protocol.Message {
 // handleChatMessageStreaming handles chat messages with streaming support.
 // Runs in a goroutine so the WebSocket read loop stays free to receive cancel messages.
 // writeMu/closed are shared with the read loop for safe concurrent WebSocket writes.
-func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.Message, forceAgent string, writeMu *sync.Mutex, closed *atomic.Bool) {
-	// safeWrite sends a WebSocket message only if the connection is still open and not cancelled
+//
+// #6688 — safeWrite no longer silently discards WriteJSON errors. A write
+// error means the client socket is gone; continuing to call safeWrite just
+// burns CPU encoding messages that can never be delivered. When we detect
+// a write failure we log it, mark the connection closed, and early-out of
+// future safeWrite calls. The caller's outer goroutine sees closed.Load()
+// == true and will finish its work without further WebSocket traffic.
+func (s *Server) handleChatMessageStreaming(connCtx context.Context, conn *websocket.Conn, msg protocol.Message, forceAgent string, writeMu *sync.Mutex, closed *atomic.Bool) {
 	safeWrite := func(ctx context.Context, outMsg protocol.Message) {
 		if closed.Load() || ctx.Err() != nil {
 			return
 		}
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		conn.WriteJSON(outMsg)
+		// #7429 — Set a write deadline so a hung client (TCP zero-window) cannot
+		// block this goroutine indefinitely, starving the pinger and leaking FDs.
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		err := conn.WriteJSON(outMsg)
+		conn.SetWriteDeadline(time.Time{}) // clear deadline
+		if err != nil {
+			slog.Error("[Chat] WebSocket write failed; marking connection closed",
+				"msgID", outMsg.ID, "type", outMsg.Type, "error", err)
+			closed.Store(true)
+		}
 	}
 
 	// Parse payload
@@ -338,6 +496,19 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 		return
 	}
 
+	if len(req.Prompt) > maxPromptChars {
+		safeWrite(context.Background(), s.errorResponse(msg.ID, "prompt_too_large",
+			fmt.Sprintf("Prompt exceeds maximum length of %d characters", maxPromptChars)))
+		return
+	}
+
+	// SECURITY: Reject new prompts when the session token quota is exhausted
+	// to prevent unbounded AI API spend (#9438).
+	if s.isSessionQuotaExceeded() {
+		safeWrite(context.Background(), s.errorResponse(msg.ID, "token_quota_exceeded", s.sessionTokenQuotaMessage()))
+		return
+	}
+
 	// Generate a unique session ID when the client omits one so that
 	// concurrent anonymous chats do not collide in activeChatCtxs (#4263).
 	if req.SessionID == "" {
@@ -345,21 +516,45 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 	}
 
 	// Create a context with both cancel and timeout so that:
-	//   1. cancel_chat messages can stop this session immediately, and
+	//   1. cancel_chat messages can stop this session immediately,
 	//   2. a hard deadline prevents missions from running forever when the
-	//      AI provider hangs or never responds (#2375).
-	ctx, cancel := context.WithTimeout(context.Background(), missionExecutionTimeout)
+	//      AI provider hangs or never responds (#2375), and
+	//   3. client disconnect (connCtx cancelled) stops in-progress
+	//      StreamChat calls immediately, preventing goroutine/token leaks (#9709).
+	ctx, cancel := context.WithTimeout(connCtx, missionExecutionTimeout)
 	defer cancel()
 
-	// Register cancel function so handleCancelChat can stop this session
+	// Register cancel function so handleCancelChat can stop this session.
+	// If a previous request is still running for this SessionID, cancel it
+	// first to prevent orphaned goroutines (#9619).
+	// The conn reference is stored alongside the cancel function so that
+	// handleCancelChat can verify the requester owns the session (#9712).
 	s.activeChatCtxsMu.Lock()
-	s.activeChatCtxs[req.SessionID] = cancel
+	if prev, exists := s.activeChatCtxs[req.SessionID]; exists {
+		prev.cancel()
+	}
+	s.activeChatCtxs[req.SessionID] = activeChatEntry{cancel: cancel, conn: conn}
 	s.activeChatCtxsMu.Unlock()
 	defer func() {
 		s.activeChatCtxsMu.Lock()
 		delete(s.activeChatCtxs, req.SessionID)
 		s.activeChatCtxsMu.Unlock()
 	}()
+
+	// Server-enforced dry-run gate (#6442): when the frontend sends
+	// dryRun=true, register the session so the kubectl proxy rejects
+	// mutating commands for this session regardless of what the AI decides.
+	if req.DryRun {
+		s.dryRunSessionsMu.Lock()
+		s.dryRunSessions[req.SessionID] = true
+		s.dryRunSessionsMu.Unlock()
+		defer func() {
+			s.dryRunSessionsMu.Lock()
+			delete(s.dryRunSessions, req.SessionID)
+			s.dryRunSessionsMu.Unlock()
+		}()
+		slog.Info("[Chat] dry-run mode enforced for session", "sessionID", req.SessionID)
+	}
 
 	// Determine which agent to use
 	agentName := req.Agent
@@ -432,6 +627,14 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 		History:   history,
 	}
 
+	// Thread cluster context so tool-capable agents scope kubectl to the
+	// correct cluster, preventing multi-cluster context drift (#9485).
+	if req.ClusterContext != "" {
+		chatReq.Context = map[string]string{
+			"clusterContext": req.ClusterContext,
+		}
+	}
+
 	// Send initial progress message so user sees feedback immediately
 	safeWrite(ctx, protocol.Message{
 		ID:   msg.ID,
@@ -493,7 +696,10 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 		// frontend's stream-inactivity timer from firing during long-running
 		// tool calls (e.g., `drasi init` which deploys Kubernetes components
 		// and can take several minutes with no output).
-		heartbeatDone := make(chan struct{})
+		// Use a buffered channel so close() never races with a pending
+		// send, preventing "send on closed channel" panics (#7179).
+		heartbeatDone := make(chan struct{}, 1)
+		var heartbeatOnce sync.Once
 		go func() {
 			ticker := time.NewTicker(missionHeartbeatInterval)
 			defer ticker.Stop()
@@ -514,9 +720,12 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 				}
 			}
 		}()
+		// Defer close so the heartbeat goroutine is always stopped,
+		// even if StreamChatWithProgress panics (#7001).
+		// sync.Once ensures close is called exactly once (#7179).
+		defer heartbeatOnce.Do(func() { close(heartbeatDone) })
 
 		resp, err = streamingProvider.StreamChatWithProgress(ctx, chatReq, onChunk, onProgress)
-		close(heartbeatDone)
 		if err != nil {
 			if ctx.Err() != nil {
 				// Distinguish timeout from user-initiated cancel (#2375)
@@ -531,7 +740,10 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 			}
 			slog.Error("[Chat] streaming execution error", "agent", agentName, "error", err)
 			code, msg2 := classifyProviderError(err)
-			safeWrite(ctx, s.errorResponse(msg.ID, code, msg2))
+			// Use background context so the error reaches the client even if
+			// the mission context expired between the ctx.Err() check above
+			// and this write (#6997).
+			safeWrite(context.Background(), s.errorResponse(msg.ID, code, msg2))
 			return
 		}
 
@@ -556,7 +768,9 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 			}
 			slog.Error("[Chat] execution error", "agent", agentName, "error", err)
 			code, msg2 := classifyProviderError(err)
-			safeWrite(ctx, s.errorResponse(msg.ID, code, msg2))
+			// Use background context so the error reaches the client even if
+			// the mission context expired (#6997).
+			safeWrite(context.Background(), s.errorResponse(msg.ID, code, msg2))
 			return
 		}
 	}
@@ -594,8 +808,13 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M
 		totalTokens = resp.TokenUsage.TotalTokens
 	}
 
-	// Send final result
-	safeWrite(ctx, protocol.Message{
+	// Send final result. Use context.Background() rather than the mission ctx
+	// because the mission's deadline can fire in the narrow window between the
+	// ctx.Err() check above and this write, silently dropping the final
+	// TypeResult message and leaving the client's chat bubble stuck in a
+	// "thinking" state (#7925). The error paths above already use
+	// context.Background() for the same reason — this matches that pattern.
+	safeWrite(context.Background(), protocol.Message{
 		ID:   msg.ID,
 		Type: protocol.TypeResult,
 		Payload: protocol.ChatStreamPayload{
@@ -627,32 +846,97 @@ func (s *Server) handleCancelChat(conn *websocket.Conn, msg protocol.Message, wr
 		return
 	}
 
+	// #7432 — Extract cancelFn and delete entry under the lock, but call
+	// cancelFn() AFTER releasing the mutex. Context cancellation can
+	// propagate across goroutine boundaries; if the provider's cleanup
+	// path attempts to re-lock activeChatCtxsMu, calling cancelFn inside
+	// the lock causes a deadlock.
+	//
+	// SECURITY (#9712): Only allow cancellation when the requesting connection
+	// (conn) matches the connection that originally registered the session.
+	// This prevents cross-session CSRF/bypass where User B cancels User A's
+	// mission by sending a cancel_chat message with a known sessionId.
 	s.activeChatCtxsMu.Lock()
-	cancelFn, ok := s.activeChatCtxs[req.SessionID]
+	entry, ok := s.activeChatCtxs[req.SessionID]
 	if ok {
-		// Call cancelFn inside the lock to prevent a concurrent goroutine from
-		// deleting or overwriting the entry between unlock and the call (#4717).
-		cancelFn()
+		if entry.conn != conn {
+			// Session exists but belongs to a different connection — reject.
+			s.activeChatCtxsMu.Unlock()
+			slog.Warn("[Chat] SECURITY: rejected cancel from non-owning connection",
+				"sessionID", req.SessionID, "requester", conn.RemoteAddr())
+			writeMu.Lock()
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			_ = conn.WriteJSON(protocol.Message{
+				ID:   msg.ID,
+				Type: protocol.TypeError,
+				Payload: protocol.ErrorPayload{
+					Code:    "unauthorized_cancel",
+					Message: "You do not own this session",
+				},
+			})
+			conn.SetWriteDeadline(time.Time{})
+			writeMu.Unlock()
+			return
+		}
 		delete(s.activeChatCtxs, req.SessionID)
 	}
 	s.activeChatCtxsMu.Unlock()
 
 	if ok {
+		entry.cancel()
 		slog.Info("[Chat] cancelled chat", "sessionID", req.SessionID)
 	} else {
 		slog.Info("[Chat] no active chat to cancel", "sessionID", req.SessionID)
 	}
 
 	writeMu.Lock()
-	conn.WriteJSON(protocol.Message{
+	// #6690 — Previously this WriteJSON error was discarded; now log it
+	// structurally so an operator can see when a cancel acknowledgement
+	// fails to reach the client (typically because the connection died
+	// concurrently with the cancel request).
+	// #7429 — Write deadline prevents blocking on hung clients.
+	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	if err := conn.WriteJSON(protocol.Message{
 		ID:   msg.ID,
 		Type: protocol.TypeResult,
 		Payload: map[string]interface{}{
 			"cancelled": ok,
 			"sessionId": req.SessionID,
 		},
-	})
+	}); err != nil {
+		slog.Error("[Chat] failed to write cancel ack to WebSocket",
+			"sessionID", req.SessionID, "cancelled", ok, "error", err)
+	}
+	conn.SetWriteDeadline(time.Time{}) // clear deadline
 	writeMu.Unlock()
+}
+
+// cancelAllChatsForConn cancels every active chat session that was started by
+// the given WebSocket connection. Called when the read loop exits (client
+// disconnect) to ensure AI goroutines do not outlive their connection (#9997).
+//
+// The cancel functions are collected under the lock and invoked after releasing
+// it, mirroring the deadlock-prevention pattern in handleCancelChat (#7432).
+func (s *Server) cancelAllChatsForConn(conn *websocket.Conn) {
+	var toCancel []context.CancelFunc
+
+	s.activeChatCtxsMu.Lock()
+	for sessionID, entry := range s.activeChatCtxs {
+		if entry.conn == conn {
+			toCancel = append(toCancel, entry.cancel)
+			delete(s.activeChatCtxs, sessionID)
+		}
+	}
+	s.activeChatCtxsMu.Unlock()
+
+	for _, cancel := range toCancel {
+		cancel()
+	}
+
+	if len(toCancel) > 0 {
+		slog.Info("[Chat] cancelled orphaned sessions on disconnect",
+			"count", len(toCancel), "addr", conn.RemoteAddr())
+	}
 }
 
 // handleCancelChatHTTP is the HTTP fallback for cancelling in-progress chat sessions.
@@ -663,7 +947,7 @@ func (s *Server) handleCancelChatHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 
 	if r.Method == "OPTIONS" {
@@ -689,17 +973,19 @@ func (s *Server) handleCancelChatHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #7432 — Same deadlock fix as handleCancelChat: extract cancelFn under
+	// the lock but invoke it after releasing the mutex.
+	// The HTTP path is already guarded by validateToken, so no additional
+	// ownership check is needed here (#9712).
 	s.activeChatCtxsMu.Lock()
-	cancelFn, ok := s.activeChatCtxs[req.SessionID]
+	entry, ok := s.activeChatCtxs[req.SessionID]
 	if ok {
-		// Call cancelFn inside the lock to prevent a concurrent goroutine from
-		// deleting or overwriting the entry between unlock and the call (#4717).
-		cancelFn()
 		delete(s.activeChatCtxs, req.SessionID)
 	}
 	s.activeChatCtxsMu.Unlock()
 
 	if ok {
+		entry.cancel()
 		slog.Info("[Chat] cancelled chat via HTTP", "sessionID", req.SessionID)
 	} else {
 		slog.Info("[Chat] no active chat to cancel via HTTP", "sessionID", req.SessionID)
@@ -712,9 +998,11 @@ func (s *Server) handleCancelChatHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleChatMessage handles chat messages (both legacy claude and new chat types)
-// This is the non-streaming version, kept for API compatibility
-func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string) protocol.Message {
+// handleChatMessage handles chat messages (both legacy claude and new chat types).
+// This is the non-streaming version, kept for API compatibility.
+// The parentCtx parameter allows callers to propagate connection-scoped
+// cancellation; pass context.Background() when no parent is available (#9997).
+func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string, parentCtx ...context.Context) protocol.Message {
 	// Parse payload
 	payloadBytes, err := json.Marshal(msg.Payload)
 	if err != nil {
@@ -734,6 +1022,12 @@ func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string) prot
 
 	if req.Prompt == "" {
 		return s.errorResponse(msg.ID, "empty_prompt", "Prompt cannot be empty")
+	}
+
+	// SECURITY: Reject new prompts when the session token quota is exhausted
+	// to prevent unbounded AI API spend (#9438).
+	if s.isSessionQuotaExceeded() {
+		return s.errorResponse(msg.ID, "token_quota_exceeded", s.sessionTokenQuotaMessage())
 	}
 
 	// Generate a unique session ID when the client omits one so that
@@ -782,9 +1076,34 @@ func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string) prot
 		History:   history,
 	}
 
-	resp, err := provider.Chat(context.Background(), chatReq)
+	// Thread cluster context for non-streaming path (#9485).
+	if req.ClusterContext != "" {
+		chatReq.Context = map[string]string{
+			"clusterContext": req.ClusterContext,
+		}
+	}
+
+	// #6678 — Previously this used context.Background() with no deadline,
+	// which meant a hung AI provider would block the WebSocket goroutine
+	// forever (the caller was a synchronous path from the read loop).
+	// Wrap with a 30s default timeout so a misbehaving provider cannot
+	// permanently wedge the WS reader goroutine. 30s matches the default
+	// used by InsightEnrichmentTimeout for similar short-form AI calls.
+	// #9997 — Derive from a parent context (if provided) so client
+	// disconnect cancels in-flight non-streaming AI calls.
+	parent := context.Background()
+	if len(parentCtx) > 0 && parentCtx[0] != nil {
+		parent = parentCtx[0]
+	}
+	ctx, cancel := context.WithTimeout(parent, handleChatMessageTimeout)
+	defer cancel()
+	resp, err := provider.Chat(ctx, chatReq)
 	if err != nil {
-		slog.Error("[Chat] execution error", "agent", agentName, "error", err)
+		slog.Error("[Chat] execution error", "agent", agentName, "error", err, "timeout", handleChatMessageTimeout)
+		if ctx.Err() == context.DeadlineExceeded {
+			return s.errorResponse(msg.ID, "timeout",
+				fmt.Sprintf("%s did not respond within %s", agentName, handleChatMessageTimeout))
+		}
 		return s.errorResponse(msg.ID, "execution_error", fmt.Sprintf("Failed to execute %s", agentName))
 	}
 
@@ -936,14 +1255,24 @@ func classifyProviderError(err error) (code, message string) {
 // 2. Execution agent (CLI) runs any commands
 // 3. Thinking agent analyzes the results
 func (s *Server) handleMixedModeChat(ctx context.Context, conn *websocket.Conn, msg protocol.Message, req protocol.ChatRequest, thinkingAgent, executionAgent string, sessionID string, writeMu *sync.Mutex, closed *atomic.Bool) {
-	// safeWrite sends a WebSocket message only if the connection is still open and not cancelled
+	// safeWrite mirrors handleChatMessageStreaming.safeWrite (#6688):
+	// WriteJSON errors mark the connection closed so subsequent writes
+	// short-circuit instead of silently failing.
 	safeWrite := func(outMsg protocol.Message) {
 		if closed.Load() || ctx.Err() != nil {
 			return
 		}
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		conn.WriteJSON(outMsg)
+		// #7429 — Set a write deadline so a hung client cannot block indefinitely.
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		err := conn.WriteJSON(outMsg)
+		conn.SetWriteDeadline(time.Time{}) // clear deadline
+		if err != nil {
+			slog.Error("[Chat/MixedMode] WebSocket write failed; marking connection closed",
+				"msgID", outMsg.ID, "type", outMsg.Type, "error", err)
+			closed.Store(true)
+		}
 	}
 
 	thinkingProvider, err := s.registry.Get(thinkingAgent)
@@ -982,10 +1311,28 @@ func (s *Server) handleMixedModeChat(ctx context.Context, conn *websocket.Conn, 
 
 User request: %s`, req.Prompt)
 
+	// Thread cluster context to both thinking and execution agents so
+	// kubectl commands are scoped to the user's current cluster (#9485).
+	var chatCtx map[string]string
+	if req.ClusterContext != "" {
+		chatCtx = map[string]string{
+			"clusterContext": req.ClusterContext,
+		}
+	}
+
 	thinkingReq := ChatRequest{
 		Prompt:    thinkingPrompt,
 		SessionID: sessionID,
 		History:   history,
+		Context:   chatCtx,
+	}
+
+	// #9618 — Check if WebSocket is still alive before expensive provider call.
+	// Without this, orphaned goroutines continue running AI requests for up to
+	// 5 minutes after the client disconnects.
+	if closed.Load() {
+		slog.Info("[MixedMode] connection closed before thinking call", "sessionID", sessionID)
+		return
 	}
 
 	thinkingResp, err := thinkingProvider.Chat(ctx, &thinkingReq)
@@ -1015,16 +1362,8 @@ User request: %s`, req.Prompt)
 		},
 	})
 
-	// Extract commands from thinking response (lines starting with CMD:)
-	var commands []string
-	for _, line := range strings.Split(thinkingResp.Content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "CMD: ") {
-			commands = append(commands, strings.TrimPrefix(trimmed, "CMD: "))
-		} else if strings.HasPrefix(trimmed, "CMD:") {
-			commands = append(commands, strings.TrimPrefix(trimmed, "CMD:"))
-		}
-	}
+	// Extract commands from thinking response using robust heuristics (#9440).
+	commands := extractCommandsFromResponse(thinkingResp.Content)
 
 	if len(commands) == 0 {
 		// No commands to execute - just return thinking response
@@ -1058,9 +1397,15 @@ User request: %s`, req.Prompt)
 	execReq := ChatRequest{
 		Prompt:    execPrompt,
 		SessionID: sessionID,
+		Context:   chatCtx,
 	}
 
 	var execContent string
+
+	if closed.Load() {
+		slog.Info("[MixedMode] connection closed before execution call", "sessionID", sessionID)
+		return
+	}
 
 	execResp, err := execProvider.Chat(ctx, &execReq)
 	if err != nil {
@@ -1118,6 +1463,11 @@ Command output:
 		History:   append(history, ChatMessage{Role: "assistant", Content: thinkingResp.Content}),
 	}
 
+	if closed.Load() {
+		slog.Info("[MixedMode] connection closed before analysis call", "sessionID", sessionID)
+		return
+	}
+
 	analysisResp, err := thinkingProvider.Chat(ctx, &analysisReq)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1147,11 +1497,48 @@ Command output:
 			"mode":  "mixed",
 		},
 	})
+
+	// Send TypeResult with Done:true so the UI clears the "Thinking..."
+	// spinner and unlocks the input, matching the regular streaming path (#6999).
+	safeWrite(protocol.Message{
+		ID:   msg.ID,
+		Type: protocol.TypeResult,
+		Payload: protocol.ChatStreamPayload{
+			SessionID: sessionID,
+			Done:      true,
+		},
+	})
 }
 
-// promptNeedsToolExecution checks if the prompt or history suggests command execution
+// promptNeedsToolExecution checks if the prompt or history suggests command execution.
+//
+// This is a cheap heuristic used to decide whether to route a chat message to a
+// tool-capable agent (claude-code, codex, gemini-cli) or a plain conversational
+// agent. A previous implementation relied on `strings.Contains` of a flat
+// keyword list, which misrouted declarative/interrogative prompts like
+// "How do I delete a namespace?" (contains "delete") and "yes, that is correct"
+// (retry-keyword "yes" matched via Contains). See #8074.
 func (s *Server) promptNeedsToolExecution(prompt string) bool {
 	prompt = strings.ToLower(prompt)
+	trimmed := strings.TrimSpace(prompt)
+
+	// Declarative/interrogative prefixes that indicate an explanatory question,
+	// not a tool-execution request. Return false regardless of later keywords
+	// so "How do I delete a namespace?" is not routed to a tool-capable agent
+	// just because it contains the word "delete". (#8074)
+	questionPrefixes := []string{
+		"how do", "how can", "how should", "how to",
+		"what is", "what are", "what does", "what's the",
+		"why ", "when ", "where ", "which ",
+		"explain ", "tell me ", "describe how", "describe what",
+		"can you explain", "could you explain",
+	}
+	for _, prefix := range questionPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return false
+		}
+	}
+
 	// Keywords that suggest command execution is needed
 	executionKeywords := []string{
 		"run ", "execute", "kubectl", "helm", "check ", "show me", "get ",
@@ -1165,10 +1552,28 @@ func (s *Server) promptNeedsToolExecution(prompt string) bool {
 			return true
 		}
 	}
-	// Also check for retry/continuation requests which imply tool execution
-	retryKeywords := []string{"try again", "retry", "do it", "run it", "execute it", "yes", "proceed", "go ahead", "please do"}
+
+	// Retry/continuation requests that imply tool execution. These must match
+	// as whole tokens rather than substrings so "yes" does not match
+	// "yesterday" and "do it" does not match "do itemize". We check exact-match
+	// on the trimmed prompt plus a space-bounded Contains check for phrases
+	// embedded in longer sentences ("try again please"). (#8074)
+	retryKeywords := []string{
+		"try again", "retry", "do it", "run it", "execute it",
+		"yes", "proceed", "go ahead", "please do",
+	}
+	paddedPrompt := " " + trimmed + " "
 	for _, keyword := range retryKeywords {
-		if strings.Contains(prompt, keyword) {
+		if trimmed == keyword {
+			return true
+		}
+		if strings.Contains(paddedPrompt, " "+keyword+" ") {
+			return true
+		}
+		if strings.Contains(paddedPrompt, " "+keyword+",") {
+			return true
+		}
+		if strings.Contains(paddedPrompt, " "+keyword+".") {
 			return true
 		}
 	}
@@ -1192,7 +1597,7 @@ func (s *Server) findToolCapableAgent() string {
 	// Priority order: agents that execute commands directly first,
 	// then agents that may only suggest commands.
 	preferredOrder := []string{"claude-code", "codex", "gemini-cli", "antigravity", "bob"}
-	suggestOnlyAgents := []string{"copilot-cli", "gh-copilot"}
+	suggestOnlyAgents := []string{"copilot-cli"}
 
 	allProviders := s.registry.List()
 
@@ -1268,14 +1673,43 @@ func (s *Server) getClaudeInfo() *protocol.ClaudeInfo {
 	}
 }
 
-// addTokenUsage accumulates token usage from a chat response
+// isSessionQuotaExceeded returns true when the aggregate session token count
+// (input + output) has reached or passed the configured quota. A quota of 0
+// means unlimited — the check is skipped (#9438).
+func (s *Server) isSessionQuotaExceeded() bool {
+	if s.sessionTokenQuota <= 0 {
+		return false // unlimited
+	}
+	s.tokenMux.Lock()
+	total := s.sessionTokensIn + s.sessionTokensOut
+	s.tokenMux.Unlock()
+	return total >= s.sessionTokenQuota
+}
+
+// sessionTokenQuotaMessage builds a human-readable error string returned to
+// the client when the session token quota is exceeded.
+func (s *Server) sessionTokenQuotaMessage() string {
+	return fmt.Sprintf(
+		"Session token quota exceeded (limit: %d tokens). "+
+			"Restart kc-agent to reset the session quota, or increase "+
+			"the limit via the %s environment variable.",
+		s.sessionTokenQuota, sessionTokenQuotaEnvVar)
+}
+
+// tokenUsageFlushInterval is how often accumulated in-memory token usage
+// is flushed to disk. Batching prevents high-frequency disk I/O when many
+// AI responses arrive in quick succession (#9483).
+const tokenUsageFlushInterval = 5 * time.Second
+
+// addTokenUsage accumulates token usage from a chat response.
+// Instead of writing to disk on every call, it schedules a debounced
+// flush that fires after tokenUsageFlushInterval of inactivity (#9483).
 func (s *Server) addTokenUsage(usage *ProviderTokenUsage) {
 	if usage == nil {
 		return
 	}
 
 	s.tokenMux.Lock()
-	defer s.tokenMux.Unlock()
 
 	// Check if day changed - reset daily counters
 	today := time.Now().Format("2006-01-02")
@@ -1291,8 +1725,21 @@ func (s *Server) addTokenUsage(usage *ProviderTokenUsage) {
 	s.todayTokensIn += int64(usage.InputTokens)
 	s.todayTokensOut += int64(usage.OutputTokens)
 
-	// Persist to disk (non-blocking)
-	go s.saveTokenUsage()
+	// Schedule a non-resetting flush: if no timer is pending, start one.
+	// Unlike the previous debounce that reset on every call (#9616), this
+	// guarantees the flush fires within tokenUsageFlushInterval of the FIRST
+	// token update, preventing unbounded data loss if tokens arrive faster
+	// than the interval.
+	if s.tokenFlushTimer == nil {
+		s.tokenFlushTimer = time.AfterFunc(tokenUsageFlushInterval, func() {
+			s.tokenMux.Lock()
+			s.tokenFlushTimer = nil
+			s.tokenMux.Unlock()
+			s.saveTokenUsage()
+		})
+	}
+
+	s.tokenMux.Unlock()
 }
 
 // tokenUsageData is persisted to disk
@@ -1311,9 +1758,27 @@ func getTokenUsagePath() string {
 	return home + "/.kc-agent-tokens.json"
 }
 
-// loadTokenUsage loads token usage from disk on startup
+// tokenUsageLockSuffix is appended to the token usage file path to form
+// the advisory lock file path used by flock (#9730).
+const tokenUsageLockSuffix = ".lock"
+
+// loadTokenUsage loads token usage from disk on startup.
+// An advisory file lock (flock) is held during the read to prevent
+// observing a partially-written file from a concurrent instance (#9730).
 func (s *Server) loadTokenUsage() {
 	path := getTokenUsagePath()
+	lockPath := path + tokenUsageLockSuffix
+
+	release, err := acquireFileLock(lockPath)
+	if err != nil {
+		slog.Warn("could not acquire file lock for token load", "error", err)
+		// Fall through to best-effort unlocked read so a single-instance
+		// deployment is not broken by a lock failure.
+	}
+	if release != nil {
+		defer release()
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return // File doesn't exist yet
@@ -1334,29 +1799,157 @@ func (s *Server) loadTokenUsage() {
 		s.todayTokensIn = usage.InputIn
 		s.todayTokensOut = usage.OutputOut
 		s.todayDate = today
+		// Seed lastSaved so the first saveTokenUsage computes the correct
+		// delta relative to what was already on disk (#9730).
+		s.lastSavedIn = usage.InputIn
+		s.lastSavedOut = usage.OutputOut
 		slog.Info("loaded token usage", "inputTokens", usage.InputIn, "outputTokens", usage.OutputOut)
 	}
 }
 
-// saveTokenUsage persists token usage to disk
+// saveTokenUsage persists token usage to disk.
+//
+// To prevent multi-instance data corruption (#9730), this function:
+//  1. Acquires an inter-process advisory file lock (flock / LockFileEx).
+//  2. Reads the current on-disk state (which may include writes from other
+//     instances since our last save).
+//  3. Computes the delta this instance has accumulated since its last save.
+//  4. Merges the delta into the on-disk totals.
+//  5. Writes the merged result back and releases the lock.
+//
+// tokenFileMux continues to serialize concurrent goroutines within this
+// process (#9441); flock serializes across OS processes.
 func (s *Server) saveTokenUsage() {
-	s.tokenMux.RLock()
-	usage := tokenUsageData{
-		Date:      s.todayDate,
-		InputIn:   s.todayTokensIn,
-		OutputOut: s.todayTokensOut,
-	}
-	s.tokenMux.RUnlock()
+	s.tokenFileMux.Lock()
+	defer s.tokenFileMux.Unlock()
 
-	data, err := json.Marshal(usage)
+	path := getTokenUsagePath()
+	lockPath := path + tokenUsageLockSuffix
+
+	// Acquire inter-process lock (#9730).
+	release, lockErr := acquireFileLock(lockPath)
+	if lockErr != nil {
+		slog.Warn("could not acquire file lock for token save", "error", lockErr)
+		// Fall through to best-effort unlocked write for single-instance
+		// deployments where flock is unavailable (e.g. NFS without lock
+		// daemon). The in-process tokenFileMux still prevents goroutine races.
+	}
+	if release != nil {
+		defer release()
+	}
+
+	// Snapshot current in-memory counters.
+	s.tokenMux.Lock()
+	currentDate := s.todayDate
+	currentIn := s.todayTokensIn
+	currentOut := s.todayTokensOut
+	prevSavedIn := s.lastSavedIn
+	prevSavedOut := s.lastSavedOut
+	s.tokenMux.Unlock()
+
+	// Compute the delta this instance accumulated since its last save.
+	deltaIn := currentIn - prevSavedIn
+	deltaOut := currentOut - prevSavedOut
+
+	// Read on-disk state (may contain writes from other instances).
+	var onDisk tokenUsageData
+	if diskData, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(diskData, &onDisk)
+	}
+
+	// Merge: if the on-disk date matches, add our delta to the on-disk
+	// totals. Otherwise start fresh for the new day.
+	merged := tokenUsageData{Date: currentDate}
+	if onDisk.Date == currentDate {
+		merged.InputIn = onDisk.InputIn + deltaIn
+		merged.OutputOut = onDisk.OutputOut + deltaOut
+	} else {
+		merged.InputIn = deltaIn
+		merged.OutputOut = deltaOut
+	}
+
+	data, err := json.Marshal(merged)
 	if err != nil {
 		return
 	}
 
-	path := getTokenUsagePath()
-	if err := os.WriteFile(path, data, agentFileMode); err != nil {
-		slog.Warn("could not save token usage", "error", err)
+	// Atomic write: write to a temp file then rename to avoid corruption
+	// if the process is killed mid-write (#6996).
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, agentFileMode); err != nil {
+		slog.Warn("could not write token usage temp file", "error", err)
+		return
 	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		slog.Warn("could not rename token usage temp file", "error", err)
+		return
+	}
+
+	// Update last-saved watermarks so the next save computes the correct
+	// delta. Also update in-memory counters to reflect the merged on-disk
+	// totals (includes other instances' contributions).
+	s.tokenMux.Lock()
+	s.lastSavedIn = currentIn
+	s.lastSavedOut = currentOut
+	// If another instance wrote tokens while we held the lock, our
+	// in-memory view should reflect the merged total so that getClaudeInfo
+	// reports accurate numbers.
+	if currentDate == s.todayDate {
+		s.todayTokensIn = merged.InputIn
+		s.todayTokensOut = merged.OutputOut
+		// Re-base lastSaved to merged totals so the next delta is correct.
+		s.lastSavedIn = merged.InputIn
+		s.lastSavedOut = merged.OutputOut
+	}
+	s.tokenMux.Unlock()
+}
+
+// extractCommandsFromResponse parses an LLM thinking response to find
+// executable commands. It handles multiple formats (#9440):
+//   - Lines prefixed with "CMD: ", "CMD:", "Command: ", "command:" (case-insensitive)
+//   - kubectl/helm/oc commands inside markdown fenced code blocks (```...```)
+//   - Bare kubectl/helm/oc commands on standalone lines
+func extractCommandsFromResponse(content string) []string {
+	var commands []string
+	seen := make(map[string]bool) // deduplicate commands
+	inCodeBlock := false
+
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		// Track markdown fenced code block boundaries
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
+			continue
+		}
+
+		// 1. Check for CMD:/Command: prefix (case-insensitive)
+		if m := cmdPrefixRe.FindStringSubmatch(trimmed); m != nil {
+			cmd := strings.TrimSpace(m[1])
+			if cmd != "" && !seen[cmd] {
+				seen[cmd] = true
+				commands = append(commands, cmd)
+			}
+			continue
+		}
+
+		// 2. Inside a code block, accept kubectl/helm/oc commands
+		if inCodeBlock {
+			if codeBlockCmdRe.MatchString(trimmed) && !seen[trimmed] {
+				seen[trimmed] = true
+				commands = append(commands, trimmed)
+			}
+			continue
+		}
+
+		// 3. Bare kubectl/helm/oc commands outside code blocks (standalone lines)
+		if codeBlockCmdRe.MatchString(trimmed) && !seen[trimmed] {
+			seen[trimmed] = true
+			commands = append(commands, trimmed)
+		}
+	}
+
+	return commands
 }
 
 // KeyStatus represents the status of an API key for a provider
@@ -1367,19 +1960,45 @@ type KeyStatus struct {
 	Source      string `json:"source,omitempty"` // "env" or "config"
 	Valid       *bool  `json:"valid,omitempty"`  // nil = not tested, true/false = test result
 	Error       string `json:"error,omitempty"`
+	// BaseURL is the currently-resolved base URL for this provider (env var,
+	// then ~/.kc/config.yaml, then compiled default). Empty when the provider
+	// does not support a base URL override (vendor HTTP APIs).
+	BaseURL string `json:"baseURL,omitempty"`
+	// BaseURLEnvVar is the environment variable this provider honors for
+	// base URL overrides (e.g. "OLLAMA_URL", "GROQ_BASE_URL"). Empty when
+	// the provider has no base URL override. Surfaced to the UI so the
+	// Advanced section can show the env var name as an operator hint.
+	BaseURLEnvVar string `json:"baseURLEnvVar,omitempty"`
+	// BaseURLSource is "env" when the current BaseURL value came from the
+	// env var, "config" when it came from ~/.kc/config.yaml, or empty when
+	// the resolved value is the compiled-in default.
+	BaseURLSource string `json:"baseURLSource,omitempty"`
 }
 
-// KeysStatusResponse is the response for GET /settings/keys
+// KeysStatusResponse is the response for GET /settings/keys.
+// RegisteredProviders is populated from the live agent registry so the
+// frontend settings UI can display only providers that are actually
+// registered in the backend, avoiding stale hardcoded lists (#9488).
 type KeysStatusResponse struct {
-	Keys       []KeyStatus `json:"keys"`
-	ConfigPath string      `json:"configPath"`
+	Keys                []KeyStatus    `json:"keys"`
+	ConfigPath          string         `json:"configPath"`
+	RegisteredProviders []ProviderInfo `json:"registeredProviders"`
 }
 
-// SetKeyRequest is the request body for POST /settings/keys
+// SetKeyRequest is the request body for POST /settings/keys.
+// Setting APIKey requires a valid key; setting BaseURL is independent
+// (operators can configure a base URL without an API key, which is the
+// common path for unauthenticated local LLM runners).
+//
+// To clear a previously-set base URL (reverting to the compiled-in default),
+// set ClearBaseURL=true with an empty BaseURL. This avoids the "missing
+// field" guard that rejects requests where all three fields are empty (#8259).
 type SetKeyRequest struct {
-	Provider string `json:"provider"`
-	APIKey   string `json:"apiKey"`
-	Model    string `json:"model,omitempty"`
+	Provider     string `json:"provider"`
+	APIKey       string `json:"apiKey,omitempty"`
+	Model        string `json:"model,omitempty"`
+	BaseURL      string `json:"baseURL,omitempty"`
+	ClearBaseURL bool   `json:"clearBaseURL,omitempty"`
 }
 
 // handleSettingsKeys handles GET and POST for /settings/keys

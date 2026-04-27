@@ -82,6 +82,11 @@ export function useLocalClusterTools() {
   // vCluster state
   const [vclusterInstances, setVclusterInstances] = useState<VClusterInstance[]>([])
   const [vclusterClusterStatus, setVclusterClusterStatus] = useState<VClusterClusterStatus[]>([])
+  // Dedicated loading/error state for /vcluster/list so the card can show a
+  // skeleton on initial fetch and surface agent failures instead of silently
+  // displaying stale or empty data (#7929 Copilot review on PR #7916).
+  const [isVClustersLoading, setIsVClustersLoading] = useState(false)
+  const [vclustersError, setVClustersError] = useState<string | null>(null)
   const [isConnecting, setIsConnecting] = useState<string | null>(null) // vcluster name being connected
   const [isDisconnecting, setIsDisconnecting] = useState<string | null>(null) // vcluster name being disconnected
 
@@ -174,7 +179,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/local-clusters`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ tool, name }),
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
 
@@ -212,7 +217,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/local-cluster-lifecycle`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ tool, name, action }),
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
 
@@ -258,6 +263,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/local-clusters?tool=${tool}&name=${name}`, {
         method: 'DELETE',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
         signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
 
       if (response.ok) {
@@ -283,26 +289,46 @@ export function useLocalClusterTools() {
     // In demo mode (without agent connected), show demo vcluster instances
     if (isDemoMode && !isConnected) {
       setVclusterInstances(DEMO_VCLUSTER_INSTANCES)
+      setVClustersError(null)
       setError(null)
       return
     }
 
     if (!isConnected) {
       setVclusterInstances([])
+      setVClustersError(null)
       return
     }
 
+    setIsVClustersLoading(true)
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/vcluster/list`, {
         signal: AbortSignal.timeout(VCLUSTER_LIST_TIMEOUT_MS) })
       if (response.ok) {
         const data = await response.json()
-        setVclusterInstances(data.instances || [])
+        // Backend returns `{ vclusters: [...] }` (pkg/agent/server_operations.go
+        // handleVClusterList). Historically this read `data.instances`, which
+        // was always undefined — live data silently fell back to [] (#7914).
+        setVclusterInstances(data.vclusters || [])
+        setVClustersError(null)
         setError(null)
+      } else {
+        // Non-2xx: clear stale instances and surface the failure so the card
+        // can render an error state instead of silently showing empty or
+        // stale data (#7929 Copilot review).
+        const message = `vCluster list failed: HTTP ${response.status}`
+        console.error(message)
+        setVclusterInstances([])
+        setVClustersError(message)
       }
     } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to fetch vCluster instances'
       console.error('Failed to fetch vCluster instances:', err)
+      setVclusterInstances([])
+      setVClustersError(message)
       setError('Failed to fetch vCluster instances')
+    } finally {
+      setIsVClustersLoading(false)
     }
   }, [isConnected, isDemoMode])
 
@@ -358,7 +384,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/vcluster/create`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ name, namespace }),
         signal: AbortSignal.timeout(VCLUSTER_CREATE_TIMEOUT_MS) })
 
@@ -403,7 +429,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/vcluster/connect`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ name, namespace }),
         signal: AbortSignal.timeout(VCLUSTER_CONNECT_TIMEOUT_MS) })
 
@@ -448,7 +474,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/vcluster/disconnect`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ name, namespace }),
         signal: AbortSignal.timeout(VCLUSTER_CONNECT_TIMEOUT_MS) })
 
@@ -493,7 +519,7 @@ export function useLocalClusterTools() {
     try {
       const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/vcluster/delete`, {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ name, namespace }),
         signal: AbortSignal.timeout(VCLUSTER_CONNECT_TIMEOUT_MS) })
 
@@ -575,6 +601,8 @@ export function useLocalClusterTools() {
     // vCluster state and actions
     vclusterInstances,
     vclusterClusterStatus,
+    isVClustersLoading,
+    vclustersError,
     checkVClusterOnCluster,
     isConnecting,
     isDisconnecting,

@@ -1,4 +1,5 @@
 import { Clock, AlertTriangle, AlertCircle, Settings, RefreshCw, ChevronRight } from 'lucide-react'
+import { cn } from '../../lib/cn'
 import { useClusters, OperatorSubscription } from '../../hooks/useMCP'
 import { useCachedOperatorSubscriptions } from '../../hooks/useCachedData'
 import { Skeleton } from '../ui/Skeleton'
@@ -109,7 +110,7 @@ export function OperatorSubscriptions({ config: _config }: OperatorSubscriptions
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={150} height={20} />
           <Skeleton variant="rounded" width={120} height={32} />
         </div>
@@ -134,7 +135,7 @@ export function OperatorSubscriptions({ config: _config }: OperatorSubscriptions
             onClick={() => refetch()}
             className="mt-1 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 transition-colors"
           >
-            <RefreshCw className="w-3 h-3" />
+            <RefreshCw className={cn('w-3 h-3', isRefreshing && 'animate-spin')} />
             {t('common:common.retry', 'Retry')}
           </button>
         </div>
@@ -151,7 +152,7 @@ export function OperatorSubscriptions({ config: _config }: OperatorSubscriptions
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Controls - single row */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           {pendingCount > 0 && (
             <StatusBadge color="orange">
@@ -239,7 +240,7 @@ export function OperatorSubscriptions({ config: _config }: OperatorSubscriptions
                 className={`p-3 rounded-lg cursor-pointer hover:bg-secondary/50 transition-colors group ${sub.pendingUpgrade ? 'bg-orange-500/10 border border-orange-500/20' : 'bg-secondary/30'}`}
                 title={`Click to view operator ${sub.name} details`}
               >
-                <div className="flex items-center justify-between mb-1">
+                <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                   <div className="flex items-center gap-2">
                     {sub.cluster && (
                       <ClusterBadge cluster={sub.cluster} size="sm" />
@@ -258,11 +259,11 @@ export function OperatorSubscriptions({ config: _config }: OperatorSubscriptions
                   </div>
                 </div>
                 <div className="text-xs text-muted-foreground space-y-0.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2">
                     <span>{t('operatorSubscriptions.channelLabel')}: {sub.channel}</span>
                     <span>{sub.namespace}</span>
                   </div>
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2">
                     <span className="truncate">{sub.currentCSV}</span>
                   </div>
                   {sub.pendingUpgrade && (

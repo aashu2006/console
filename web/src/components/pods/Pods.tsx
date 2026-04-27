@@ -1,10 +1,10 @@
 import { useMemo } from 'react'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, RefreshCw, Trash2, Terminal } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedPodIssues } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { useIsModeSwitching } from '../../lib/unified/demo'
 import { StatusIndicator } from '../charts/StatusIndicator'
 import { ClusterBadge } from '../ui/ClusterBadge'
@@ -15,6 +15,8 @@ import { getDefaultCards } from '../../config/dashboards'
 import { RotatingTip } from '../ui/RotatingTip'
 import { TechnicalAcronym, STATUS_TOOLTIPS } from '../shared/TechnicalAcronym'
 import { PortalTooltip } from '../cards/llmd/shared/PortalTooltip'
+import { kubectlProxy } from '../../lib/kubectlProxy'
+import { useToast } from '../ui/Toast'
 
 const PODS_CARDS_KEY = 'kubestellar-pods-cards'
 
@@ -22,6 +24,7 @@ const PODS_CARDS_KEY = 'kubestellar-pods-cards'
 const DEFAULT_POD_CARDS = getDefaultCards('pods')
 
 export function Pods() {
+  const { t } = useTranslation()
   // Use cached hooks for stale-while-revalidate pattern
   const { issues: podIssues, isLoading: podIssuesLoading, isRefreshing: podIssuesRefreshing, lastRefresh: podIssuesLastRefresh, refetch: refetchPodIssues } = useCachedPodIssues()
   const { deduplicatedClusters: clusters, isLoading: clustersLoading, refetch: refetchClusters } = useClusters()
@@ -30,7 +33,7 @@ export function Pods() {
   const lastUpdated = podIssuesLastRefresh ? new Date(podIssuesLastRefresh) : null
   const handleRefresh = () => { refetchPodIssues(); refetchClusters() }
   const { drillToPod, drillToAllPods, drillToAllClusters } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
+  const { showToast } = useToast()
 
   const {
     selectedClusters: globalSelectedClusters,
@@ -55,6 +58,36 @@ export function Pods() {
     }
   }
 
+  const handleShowLogs = (e: React.MouseEvent, cluster: string, namespace: string, name: string) => {
+    e.stopPropagation()
+    drillToPod(cluster, namespace, name, { tab: 'logs' })
+  }
+
+  const handleRestartPod = async (e: React.MouseEvent, cluster: string, namespace: string, name: string) => {
+    e.stopPropagation()
+    try {
+      showToast(t('pods.restarting', 'Restarting pod...'), 'info')
+      await kubectlProxy.exec(['delete', 'pod', name, '-n', namespace], { context: cluster })
+      showToast(t('pods.restartSuccess', 'Pod deletion triggered (it will restart if managed)'), 'success')
+      refetchPodIssues()
+    } catch (err) {
+      showToast(t('pods.restartError', 'Failed to restart pod'), 'error')
+    }
+  }
+
+  const handleDeletePod = async (e: React.MouseEvent, cluster: string, namespace: string, name: string) => {
+    e.stopPropagation()
+    if (!window.confirm(t('pods.confirmDelete', 'Are you sure you want to delete pod {{name}}?', { name }))) return
+    try {
+      showToast(t('pods.deleting', 'Deleting pod...'), 'info')
+      await kubectlProxy.exec(['delete', 'pod', name, '-n', namespace], { context: cluster })
+      showToast(t('pods.deleteSuccess', 'Pod deleted'), 'success')
+      refetchPodIssues()
+    } catch (err) {
+      showToast(t('pods.deleteError', 'Failed to delete pod'), 'error')
+    }
+  }
+
   // Filter pod issues by global cluster selection
   const filteredPodIssues = (() => {
     // Apply cluster filtering using the built-in helper
@@ -76,19 +109,26 @@ export function Pods() {
 
   // Calculate stats
   const stats = useMemo(() => {
-    const totalPods = clusters.reduce((sum, c) => sum + (c.podCount || 0), 0)
+    // Use filtered clusters matching the global selection for pod/cluster counts (#7349)
+    const visibleClusters = clusters.filter(c =>
+      isAllClustersSelected || globalSelectedClusters.includes(c.name)
+    )
+    const totalPods = visibleClusters.reduce((sum, c) => sum + (c.podCount || 0), 0)
+    // Dedup issue rows by pod name to avoid under-counting healthy pods (#7348)
+    const uniqueIssuePods = new Set(filteredPodIssues.map(p => `${p.cluster}/${p.namespace}/${p.name}`))
     const issueCount = filteredPodIssues.length
     const pendingCount = filteredPodIssues.filter(p => p.reason === 'Pending' || p.status === 'Pending').length
     const restartCount = filteredPodIssues.filter(p => (p.restarts || 0) > 5).length
-    const clusterCount = isAllClustersSelected ? clusters.length : globalSelectedClusters.length
+    const clusterCount = visibleClusters.length
 
     return {
       totalPods,
-      healthy: Math.max(0, totalPods - issueCount),
+      healthy: Math.max(0, totalPods - uniqueIssuePods.size),
       issues: issueCount,
       pending: pendingCount,
       restarts: restartCount,
-      clusters: clusterCount }
+      clusters: clusterCount
+    }
   }, [clusters, filteredPodIssues, isAllClustersSelected, globalSelectedClusters])
 
   // Dashboard-specific stats value getter
@@ -112,7 +152,7 @@ export function Pods() {
   }
 
   // Merged getter: dashboard-specific values first, then universal fallback
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   return (
     <DashboardPage
@@ -131,7 +171,8 @@ export function Pods() {
       hasData={stats.totalPods > 0}
       emptyState={{
         title: 'Pods Dashboard',
-        description: 'Add cards to monitor pod health, issues, and resource usage across your clusters.' }}
+        description: 'Add cards to monitor pod health, issues, and resource usage across your clusters.'
+      }}
     >
       {/* Pod Issues List */}
       {showSkeletons ? (
@@ -169,13 +210,11 @@ export function Pods() {
               tabIndex={issue.cluster ? 0 : -1}
               aria-disabled={!issue.cluster || undefined}
               aria-label={`View pod issue: ${issue.name} in ${issue.namespace}${issue.cluster ? ` on ${issue.cluster.split('/').pop() || issue.cluster}` : ''}`}
-              className={`glass p-4 rounded-lg transition-all border-l-4 ${
-                issue.cluster ? 'cursor-pointer hover:scale-[1.01]' : 'cursor-default'
-              } ${
-                issue.reason === 'CrashLoopBackOff' || issue.reason === 'OOMKilled' ? 'border-l-red-500' :
-                issue.reason === 'Pending' || issue.reason === 'ContainerCreating' ? 'border-l-yellow-500' :
-                'border-l-orange-500'
-              }`}
+              className={`glass p-4 rounded-lg transition-all border-l-4 ${issue.cluster ? 'cursor-pointer hover:scale-[1.01]' : 'cursor-default'
+                } ${issue.reason === 'CrashLoopBackOff' || issue.reason === 'OOMKilled' ? 'border-l-red-500' :
+                  issue.reason === 'Pending' || issue.reason === 'ContainerCreating' ? 'border-l-yellow-500' :
+                    'border-l-orange-500'
+                }`}
             >
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
@@ -218,6 +257,39 @@ export function Pods() {
                       <div className="text-xs text-muted-foreground">Restarts</div>
                     </div>
                   )}
+
+                  <div className="flex items-center gap-1">
+                    <PortalTooltip content={t('common.restart', 'Restart')}>
+                      <button
+                        onClick={(e) => issue.cluster && handleRestartPod(e, issue.cluster, issue.namespace, issue.name)}
+                        className="p-1.5 hover:bg-white/10 rounded-md text-muted-foreground hover:text-blue-400 transition-colors"
+                        aria-label="Restart pod"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                      </button>
+                    </PortalTooltip>
+
+                    <PortalTooltip content={t('common.logs', 'Logs')}>
+                      <button
+                        onClick={(e) => issue.cluster && handleShowLogs(e, issue.cluster, issue.namespace, issue.name)}
+                        className="p-1.5 hover:bg-white/10 rounded-md text-muted-foreground hover:text-purple-400 transition-colors"
+                        aria-label="View logs"
+                      >
+                        <Terminal className="w-4 h-4" />
+                      </button>
+                    </PortalTooltip>
+
+                    <PortalTooltip content={t('common.delete', 'Delete')}>
+                      <button
+                        onClick={(e) => issue.cluster && handleDeletePod(e, issue.cluster, issue.namespace, issue.name)}
+                        className="p-1.5 hover:bg-white/10 rounded-md text-muted-foreground hover:text-red-400 transition-colors"
+                        aria-label="Delete pod"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </PortalTooltip>
+                  </div>
+
                   <ChevronRight className="w-4 h-4 text-muted-foreground" />
                 </div>
               </div>

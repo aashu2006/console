@@ -12,6 +12,7 @@ import { Shield, ExternalLink, CheckCircle, XCircle, AlertTriangle, Network, Lay
 import { useTranslation } from 'react-i18next'
 import { BaseModal } from '../../../../lib/modals'
 import { StatusBadge } from '../../../ui/StatusBadge'
+import { ISOLATION_STATUS_COLORS } from '../shared'
 import type { MultiTenancyOverviewData, ComponentStatus, IsolationLevel, IsolationStatus } from './useMultiTenancyOverview'
 
 // ============================================================================
@@ -62,13 +63,6 @@ const HEALTH_BG: Record<string, string> = {
   unknown: 'bg-zinc-500/10 border-zinc-500/20',
 }
 
-/** Isolation status colors */
-const ISOLATION_STATUS_COLORS: Record<IsolationStatus, string> = {
-  ready: 'text-green-400',
-  degraded: 'text-orange-400',
-  missing: 'text-zinc-500',
-}
-
 /** Isolation status backgrounds */
 const ISOLATION_STATUS_BG: Record<IsolationStatus, string> = {
   ready: 'bg-green-500/10 border-green-500/20',
@@ -100,7 +94,7 @@ function ComponentDetailCard({ component }: { component: ComponentStatus }) {
     <div className={`p-4 rounded-lg border ${healthBg} flex items-start gap-3`}>
       <IconComponent className={`w-5 h-5 ${healthColor} shrink-0 mt-0.5`} />
       <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 gap-2">
           <span className="text-sm font-medium text-foreground">{component.name}</span>
           <div className={`w-2.5 h-2.5 rounded-full ${component.detected ? 'bg-green-400' : 'bg-zinc-500'}`} />
         </div>
@@ -122,7 +116,7 @@ function IsolationLevelCard({ level }: { level: IsolationLevel }) {
   const statusBg = ISOLATION_STATUS_BG[level.status]
 
   return (
-    <div className={`p-4 rounded-lg border ${statusBg} flex items-center justify-between`}>
+    <div className={`p-4 rounded-lg border ${statusBg} flex flex-wrap items-center justify-between gap-y-2`}>
       <div className="flex items-center gap-3">
         <IsolationStatusIcon status={level.status} />
         <div>
@@ -171,7 +165,7 @@ export function MultiTenancyDetailModal({ isOpen, onClose, data, isDemoData }: M
       <BaseModal.Content>
         <div className="space-y-6">
           {/* Score and tenant summary */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <div className="p-4 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-center">
               <div className="flex items-center justify-center gap-1.5 mb-1">
                 <Shield className="w-5 h-5 text-cyan-400" />
@@ -201,7 +195,7 @@ export function MultiTenancyDetailModal({ isOpen, onClose, data, isDemoData }: M
 
           {/* Component health section */}
           <div>
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
               <p className="text-sm font-medium text-muted-foreground">
                 {t('multiTenancy.componentHealth', 'Component Health')}
               </p>
@@ -218,7 +212,7 @@ export function MultiTenancyDetailModal({ isOpen, onClose, data, isDemoData }: M
 
           {/* Isolation levels section */}
           <div>
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
               <p className="text-sm font-medium text-muted-foreground">
                 {t('multiTenancy.isolationLevels', 'Isolation Levels')}
               </p>

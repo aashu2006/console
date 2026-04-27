@@ -5,27 +5,11 @@
  * Extracted from useCachedData.ts for maintainability.
  */
 
-import { useCache, type RefreshCategory } from '../lib/cache'
+import { useCache, type RefreshCategory, type CachedHookResult } from '../lib/cache'
 import { kubectlProxy } from '../lib/kubectlProxy'
-import { KUBECTL_EXTENDED_TIMEOUT_MS } from '../lib/constants/network'
+import { KUBECTL_DEFAULT_TIMEOUT_MS, KUBECTL_MEDIUM_TIMEOUT_MS, KUBECTL_EXTENDED_TIMEOUT_MS } from '../lib/constants/network'
 import { settledWithConcurrency } from '../lib/utils/concurrency'
 import type { LLMdServer, LLMdStatus, LLMdModel } from './useLLMd'
-
-// ============================================================================
-// Shared Types
-// ============================================================================
-
-interface CachedHookResult<T> {
-  data: T
-  isLoading: boolean
-  isRefreshing: boolean
-  isDemoFallback: boolean
-  error: string | null
-  isFailed: boolean
-  consecutiveFailures: number
-  lastRefresh: number | null
-  refetch: () => Promise<void>
-}
 
 // ============================================================================
 // Demo Data
@@ -145,7 +129,7 @@ async function fetchLLMdServersForCluster(cluster: string): Promise<LLMdServer[]
   // Query all namespaces to discover llm-d workloads regardless of namespace naming
   const allDeployments: DeploymentResource[] = []
   try {
-    const resp = await kubectlProxy.exec(['get', 'deployments', '-A', '-o', 'json'], { context: cluster, timeout: 15000 })
+    const resp = await kubectlProxy.exec(['get', 'deployments', '-A', '-o', 'json'], { context: cluster, timeout: KUBECTL_MEDIUM_TIMEOUT_MS })
     if (resp.exitCode === 0 && resp.output) {
       allDeployments.push(...(JSON.parse(resp.output).items || []))
     }
@@ -157,9 +141,9 @@ async function fetchLLMdServersForCluster(cluster: string): Promise<LLMdServer[]
   const autoscalerItems: LLMdServer[] = []
 
   const [hpaResult, vaResult, vpaResult] = await Promise.allSettled([
-    kubectlProxy.exec(['get', 'hpa', '-A', '-o', 'json'], { context: cluster, timeout: 10000 }),
-    kubectlProxy.exec(['get', 'variantautoscalings', '-A', '-o', 'json'], { context: cluster, timeout: 10000 }),
-    kubectlProxy.exec(['get', 'vpa', '-A', '-o', 'json'], { context: cluster, timeout: 10000 }),
+    kubectlProxy.exec(['get', 'hpa', '-A', '-o', 'json'], { context: cluster, timeout: KUBECTL_DEFAULT_TIMEOUT_MS }),
+    kubectlProxy.exec(['get', 'variantautoscalings', '-A', '-o', 'json'], { context: cluster, timeout: KUBECTL_DEFAULT_TIMEOUT_MS }),
+    kubectlProxy.exec(['get', 'vpa', '-A', '-o', 'json'], { context: cluster, timeout: KUBECTL_DEFAULT_TIMEOUT_MS }),
   ])
 
   // Process HPA results
@@ -313,15 +297,11 @@ export async function fetchLLMdServers(
   clusters: string[],
   onProgress?: (partial: LLMdServer[]) => void
 ): Promise<LLMdServer[]> {
-  // useCache prevents calling fetchers in demo mode via effectiveEnabled
-  const accumulated: LLMdServer[] = []
-
+  // (#6857) Each callback returns its own items; aggregation happens after
+  // all tasks settle to avoid shared-mutation hazards.
   const tasks = clusters.map((cluster) => async () => {
     try {
-      const clusterServers = await fetchLLMdServersForCluster(cluster)
-      accumulated.push(...clusterServers)
-      onProgress?.([...accumulated])
-      return clusterServers
+      return await fetchLLMdServersForCluster(cluster)
     } catch (err) {
       // Suppress demo mode errors - they're expected when agent is unavailable
       const errMsg = err instanceof Error ? err.message : String(err)
@@ -332,7 +312,14 @@ export async function fetchLLMdServers(
     }
   })
 
-  await settledWithConcurrency(tasks)
+  const accumulated: LLMdServer[] = []
+  function handleSettled(result: PromiseSettledResult<LLMdServer[]>) {
+    if (result.status === 'fulfilled') {
+      accumulated.push(...result.value)
+      onProgress?.([...accumulated])
+    }
+  }
+  await settledWithConcurrency(tasks, undefined, handleSettled)
   return accumulated
 }
 
@@ -390,8 +377,6 @@ export async function fetchLLMdModels(
   onProgress?: (partial: LLMdModel[]) => void
 ): Promise<LLMdModel[]> {
   // useCache prevents calling fetchers in demo mode via effectiveEnabled
-  const accumulated: LLMdModel[] = []
-
   const tasks = clusters.map((cluster) => async () => {
     try {
       const response = await kubectlProxy.exec(['get', 'inferencepools', '-A', '-o', 'json'], { context: cluster, timeout: KUBECTL_EXTENDED_TIMEOUT_MS })
@@ -409,8 +394,6 @@ export async function fetchLLMdModels(
           status: hasAccepted ? 'loaded' : 'stopped',
         })
       }
-      accumulated.push(...clusterModels)
-      onProgress?.([...accumulated])
       return clusterModels
     } catch (err) {
       // Suppress demo mode errors - they're expected when agent is unavailable
@@ -422,7 +405,14 @@ export async function fetchLLMdModels(
     }
   })
 
-  await settledWithConcurrency(tasks)
+  const accumulated: LLMdModel[] = []
+  function handleSettled(result: PromiseSettledResult<LLMdModel[]>) {
+    if (result.status === 'fulfilled') {
+      accumulated.push(...result.value)
+      onProgress?.([...accumulated])
+    }
+  }
+  await settledWithConcurrency(tasks, undefined, handleSettled)
   return accumulated
 }
 

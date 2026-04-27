@@ -318,7 +318,7 @@ export function NetworkUtils() {
   return (
     <div className="h-full flex flex-col">
         {/* Network status bar */}
-        <div className="flex items-center justify-between mb-3 p-2 rounded-lg bg-secondary/30">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3 p-2 rounded-lg bg-secondary/30">
           <div className="flex items-center gap-2">
             {networkInfo.online ? (
               <Wifi className="w-4 h-4 text-green-400" />
@@ -369,7 +369,7 @@ export function NetworkUtils() {
                 onChange={(e) => setHostInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && addHost('ping')}
                 placeholder={t('networkUtils.hostOrUrl')}
-                className="flex-1 px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                className="flex-1 px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
               <button
                 onClick={() => addHost('ping')}
@@ -383,11 +383,13 @@ export function NetworkUtils() {
             <div className="flex gap-2 mb-3">
               <button
                 onClick={() => setContinuousPing(!continuousPing)}
-                className={`flex-1 flex items-center justify-center gap-1 px-3 py-1.5 text-sm rounded transition-colors ${
+                disabled={!continuousPing && pingHosts.length === 0}
+                className={`flex-1 flex items-center justify-center gap-1 px-3 py-1.5 text-sm rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                   continuousPing
                     ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
                     : 'bg-green-500/20 text-green-400 hover:bg-green-500/30'
                 }`}
+                title={pingHosts.length === 0 ? t('networkUtils.noHostsWarning') : undefined}
               >
                 {continuousPing ? (
                   <>
@@ -405,7 +407,7 @@ export function NetworkUtils() {
               <select
                 value={pingInterval}
                 onChange={(e) => setPingInterval(Number(e.target.value))}
-                className="px-2 py-1.5 text-sm bg-secondary border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                className="px-2 py-1.5 text-sm bg-secondary border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
                 title={t('networkUtils.pingInterval')}
               >
                 {PING_INTERVALS.map(({ value, label }) => (
@@ -416,7 +418,7 @@ export function NetworkUtils() {
               </select>
               <button
                 onClick={pingAllHosts}
-                disabled={isPinging || continuousPing}
+                disabled={isPinging || continuousPing || pingHosts.length === 0}
                 className="flex items-center gap-1 px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 rounded disabled:opacity-50"
                 title={t('networkUtils.pingOnce')}
               >
@@ -440,7 +442,7 @@ export function NetworkUtils() {
                     key={host}
                     className="p-3 rounded-lg bg-secondary/20 border border-border/50"
                   >
-                    <div className="flex items-center justify-between mb-2">
+                    <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
                       <span className="text-sm font-medium truncate flex-1 mr-2">{host}</span>
                       <button
                         onClick={() => removeHost(host, 'ping')}
@@ -516,14 +518,14 @@ export function NetworkUtils() {
                 value={hostInput}
                 onChange={(e) => setHostInput(e.target.value)}
                 placeholder={t('networkUtils.host')}
-                className="flex-1 px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                className="flex-1 px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
               <input
                 type="number"
                 value={portInput}
                 onChange={(e) => setPortInput(e.target.value)}
                 placeholder={t('networkUtils.port')}
-                className="w-20 px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                className="w-20 px-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
               <button
                 onClick={() => addHost('port')}
@@ -548,7 +550,7 @@ export function NetworkUtils() {
                   <div className="mt-4 space-y-2">
                     <p className="text-xs text-muted-foreground">{t('networkUtils.savedPortChecks')}</p>
                     {portHosts.map(({ host, port }) => (
-                      <div key={`${host}:${port}`} className="flex items-center justify-between px-3 py-2 bg-secondary/30 rounded">
+                      <div key={`${host}:${port}`} className="flex flex-wrap items-center justify-between gap-y-2 px-3 py-2 bg-secondary/30 rounded">
                         <span className="text-sm">{host}:{port}</span>
                         <button
                           onClick={() => removeHost(host, 'port', port)}

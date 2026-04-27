@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +13,26 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 )
+
+// orbitSuffixBytes is the number of random bytes used to generate a unique
+// suffix for orbit mission IDs, producing a 4-character hex string.
+const orbitSuffixBytes = 2
+
+// orbitSuffixNanoMask masks the low 16 bits of a nanosecond timestamp so the
+// crypto/rand fallback still produces a 4-char hex suffix with variable bits.
+const orbitSuffixNanoMask = 0xffff
+
+// generateOrbitSuffix returns a short random hex string for mission ID uniqueness.
+func generateOrbitSuffix() string {
+	b := make([]byte, orbitSuffixBytes)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: derive from nanosecond timestamp if crypto/rand fails.
+		// time.Format("0000") would return the literal string "0000" because
+		// "0" is not a reference layout token — use Sprintf to get real bits.
+		return fmt.Sprintf("%04x", time.Now().UnixNano()&orbitSuffixNanoMask)
+	}
+	return hex.EncodeToString(b)
+}
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -28,6 +51,9 @@ var orbitCadenceHours = map[string]float64{
 // orbitDefaultDataFile is the filename used to persist orbit missions
 // inside the console data directory.
 const orbitDefaultDataFile = "orbit_missions.json"
+
+// orbitMaxHistoryEntries is the maximum number of run records kept per orbit mission.
+const orbitMaxHistoryEntries = 50
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -134,7 +160,9 @@ func (h *OrbitHandler) CreateMission(c *fiber.Ctx) error {
 	}
 
 	if m.ID == "" {
-		m.ID = "orbit-" + time.Now().Format("20060102150405")
+		// Use millisecond-precision timestamp plus a random suffix to avoid
+		// collisions when two missions are created in the same second (#7800).
+		m.ID = "orbit-" + time.Now().Format("20060102150405.000") + "-" + generateOrbitSuffix()
 	}
 	if m.CreatedAt == "" {
 		m.CreatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -176,9 +204,8 @@ func (h *OrbitHandler) RunMission(c *fiber.Ctx) error {
 	})
 
 	// Cap history length
-	const maxHistoryEntries = 50
-	if len(m.History) > maxHistoryEntries {
-		m.History = m.History[len(m.History)-maxHistoryEntries:]
+	if len(m.History) > orbitMaxHistoryEntries {
+		m.History = m.History[len(m.History)-orbitMaxHistoryEntries:]
 	}
 	h.mu.Unlock()
 	h.saveToDisk()
@@ -297,9 +324,8 @@ func (h *OrbitHandler) checkDueMissions() {
 				Result:    result,
 				Summary:   "Auto-run by backend scheduler",
 			})
-			const maxHistoryEntries = 50
-			if len(m.History) > maxHistoryEntries {
-				m.History = m.History[len(m.History)-maxHistoryEntries:]
+			if len(m.History) > orbitMaxHistoryEntries {
+				m.History = m.History[len(m.History)-orbitMaxHistoryEntries:]
 			}
 			changed = true
 			slog.Info("orbit auto-run triggered", "mission", m.ID, "type", m.OrbitType)
@@ -338,13 +364,19 @@ func (h *OrbitHandler) loadFromDisk() {
 }
 
 // saveToDisk persists all missions to the JSON data file.
+//
+// Takes an exclusive write lock so only one goroutine writes at a time.
+// Previously this used RLock(), which allowed the background scheduler
+// (checkDueMissions) and concurrent HTTP handlers to enter os.WriteFile
+// simultaneously and corrupt the orbit_missions.json file (issue 8003).
 func (h *OrbitHandler) saveToDisk() {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.saveToDiskLocked()
 }
 
-// saveToDiskLocked persists missions; caller must hold at least a read lock.
+// saveToDiskLocked persists missions. The caller must hold the write lock
+// (h.mu.Lock, not RLock) — concurrent entries would race on the file write.
 func (h *OrbitHandler) saveToDiskLocked() {
 	missions := make([]*OrbitMission, 0, len(h.missions))
 	for _, m := range h.missions {
@@ -364,7 +396,45 @@ func (h *OrbitHandler) saveToDiskLocked() {
 		return
 	}
 
-	if err := os.WriteFile(h.dataFile, data, 0o644); err != nil {
-		slog.Error("orbit: failed to write data file", "path", h.dataFile, "error", err)
+	// Atomic write: write to a temp file in the same directory and then
+	// rename over the target. Rename is atomic on the same filesystem, so
+	// a concurrent reader (or a crash mid-write) either sees the old
+	// complete file or the new complete file — never a partial one.
+	// Belt-and-braces alongside the write-lock switch above — if a future
+	// caller accidentally holds only a read lock, an interrupted write
+	// still can't leave behind a corrupted target file.
+	tmp, err := os.CreateTemp(dir, ".orbit_missions-*.json.tmp")
+	if err != nil {
+		slog.Error("orbit: failed to create temp data file", "dir", dir, "error", err)
+		return
+	}
+	tmpPath := tmp.Name()
+	// Best-effort cleanup if we bail out before the rename.
+	defer func() {
+		if _, err := os.Stat(tmpPath); err == nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		slog.Error("orbit: failed to write temp data file", "path", tmpPath, "error", err)
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		slog.Error("orbit: failed to fsync temp data file", "path", tmpPath, "error", err)
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		slog.Error("orbit: failed to close temp data file", "path", tmpPath, "error", err)
+		return
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		slog.Warn("orbit: failed to chmod temp data file", "path", tmpPath, "error", err)
+		// Non-fatal — proceed with rename; the file is still ours.
+	}
+	if err := os.Rename(tmpPath, h.dataFile); err != nil {
+		slog.Error("orbit: failed to rename temp data file", "from", tmpPath, "to", h.dataFile, "error", err)
+		return
 	}
 }

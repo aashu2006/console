@@ -47,10 +47,12 @@ const CHECK_LABELS: Record<string, string> = {
   gpu_events: 'GPU Events' }
 
 function StatusBadge({ status }: { status: string }) {
+  // #9881 — Normalize status colors to the design-system pattern
+  // (text-*-400 with bg-*-500/10) used across cilium_status and other cards.
   const config = {
-    healthy: { icon: CheckCircle, bg: 'bg-green-500/15', text: 'text-green-400', label: 'Healthy' },
-    degraded: { icon: AlertTriangle, bg: 'bg-yellow-500/15', text: 'text-yellow-400', label: 'Degraded' },
-    unhealthy: { icon: XCircle, bg: 'bg-red-500/15', text: 'text-red-400', label: 'Unhealthy' } }[status] || { icon: AlertTriangle, bg: 'bg-gray-500/15 dark:bg-gray-400/15', text: 'text-muted-foreground', label: status }
+    healthy: { icon: CheckCircle, bg: 'bg-green-500/10', text: 'text-green-400', label: 'Healthy' },
+    degraded: { icon: AlertTriangle, bg: 'bg-yellow-500/10', text: 'text-yellow-400', label: 'Degraded' },
+    unhealthy: { icon: XCircle, bg: 'bg-red-500/10', text: 'text-red-400', label: 'Unhealthy' } }[status] || { icon: AlertTriangle, bg: 'bg-gray-500/10 dark:bg-gray-400/10', text: 'text-muted-foreground', label: status }
 
   const Icon = config.icon
   return (
@@ -64,7 +66,7 @@ function StatusBadge({ status }: { status: string }) {
 function CheckRow({ check }: { check: GPUNodeHealthCheck }) {
   const label = CHECK_LABELS[check.name] || check.name
   return (
-    <div className="flex items-center justify-between py-1 text-xs">
+    <div className="flex flex-wrap items-center justify-between gap-y-2 py-1 text-xs">
       <span className="text-white/60">{label}</span>
       <div className="flex items-center gap-1.5">
         {check.passed ? (
@@ -230,7 +232,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
 
       {/* Install dialog */}
       {showInstallDialog && (
-        <div className="border-t border-border px-3 py-2 bg-foreground/[0.01] space-y-2">
+        <div className="border-t border-border px-3 py-2 bg-foreground/1 space-y-2">
           <div className="text-2xs text-white/50 uppercase tracking-wider">{t('cards:gpuNodeHealth.installCronJob')}</div>
           <div className="grid grid-cols-2 gap-2">
             <div>
@@ -239,7 +241,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
                 type="text"
                 value={namespace}
                 onChange={e => setNamespace(e.target.value)}
-                className="w-full px-2 py-1 text-xs rounded border border-white/10 bg-secondary text-white/80 focus:outline-none focus:border-white/20"
+                className="w-full px-2 py-1 text-xs rounded border border-white/10 bg-secondary text-white/80 focus:outline-hidden focus:border-white/20"
               />
             </div>
             <div>
@@ -248,7 +250,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
                 type="text"
                 value={schedule}
                 onChange={e => setSchedule(e.target.value)}
-                className="w-full px-2 py-1 text-xs rounded border border-white/10 bg-secondary text-white/80 focus:outline-none focus:border-white/20"
+                className="w-full px-2 py-1 text-xs rounded border border-white/10 bg-secondary text-white/80 focus:outline-hidden focus:border-white/20"
               />
             </div>
           </div>
@@ -258,7 +260,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
             <select
               value={tier}
               onChange={e => setTier(Number(e.target.value))}
-              className="w-full px-2 py-1 text-xs rounded border border-white/10 bg-secondary text-white/80 focus:outline-none focus:border-white/20"
+              className="w-full px-2 py-1 text-xs rounded border border-white/10 bg-secondary text-white/80 focus:outline-hidden focus:border-white/20"
             >
               {TIER_OPTIONS.map(t => (
                 <option key={t.value} value={t.value}>{t.label}</option>
@@ -304,7 +306,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
           <select
             value={tier}
             onChange={e => setTier(Number(e.target.value))}
-            className="px-1.5 py-0.5 text-2xs rounded border border-white/10 bg-secondary text-white/60 focus:outline-none focus:border-white/20"
+            className="px-1.5 py-0.5 text-2xs rounded border border-white/10 bg-secondary text-white/60 focus:outline-hidden focus:border-white/20"
           >
             {TIER_OPTIONS.map(t => (
               <option key={t.value} value={t.value}>{t.label}</option>
@@ -342,7 +344,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
 
       {/* CronJob Results (expandable) */}
       {showResults && status?.lastResults && status.lastResults.length > 0 && (
-        <div className="border-t border-border px-3 py-2 bg-foreground/[0.01] space-y-1.5">
+        <div className="border-t border-border px-3 py-2 bg-foreground/1 space-y-1.5">
           <div className="text-2xs text-white/50 uppercase tracking-wider">{t('cards:gpuNodeHealth.latestResults')}</div>
           {status.lastResults.map(result => (
             <div key={result.nodeName} className="rounded border border-border bg-secondary p-2">
@@ -359,7 +361,7 @@ function CronJobClusterPanel({ cluster }: { cluster: string }) {
                 ))}
               </div>
               {result.issues && result.issues.length > 0 && (
-                <div className="mt-1 pt-1 border-t border-white/[0.04]">
+                <div className="mt-1 pt-1 border-t border-white/4">
                   {result.issues.map((issue, i) => (
                     <div key={i} className="flex items-start gap-1 text-2xs text-red-300/80">
                       <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0 text-red-400/60" />
@@ -525,11 +527,12 @@ function ProactiveGPUNodeHealthMonitorInternal() {
     <div className="flex flex-col gap-2 h-full">
       {/* Summary row */}
       <div className="flex gap-2">
-        <div className={cn('flex-1 rounded-lg px-3 py-2 text-center', summary.unhealthy > 0 ? 'bg-red-500/15 ring-1 ring-red-500/30' : 'bg-secondary')}>
+        {/* #9881 — Normalize summary backgrounds to the /10 bg + /20 ring pattern used by cilium_status. */}
+        <div className={cn('flex-1 rounded-lg px-3 py-2 text-center', summary.unhealthy > 0 ? 'bg-red-500/10 ring-1 ring-red-500/20' : 'bg-secondary')}>
           <div className={cn('text-lg font-bold', summary.unhealthy > 0 ? 'text-red-400' : 'text-white/30')}>{summary.unhealthy}</div>
           <div className="text-2xs text-white/40 uppercase tracking-wider">{t('cards:gpuNodeHealth.unhealthy')}</div>
         </div>
-        <div className={cn('flex-1 rounded-lg px-3 py-2 text-center', summary.degraded > 0 ? 'bg-yellow-500/15 ring-1 ring-yellow-500/30' : 'bg-secondary')}>
+        <div className={cn('flex-1 rounded-lg px-3 py-2 text-center', summary.degraded > 0 ? 'bg-yellow-500/10 ring-1 ring-yellow-500/20' : 'bg-secondary')}>
           <div className={cn('text-lg font-bold', summary.degraded > 0 ? 'text-yellow-400' : 'text-white/30')}>{summary.degraded}</div>
           <div className="text-2xs text-white/40 uppercase tracking-wider">{t('cards:gpuNodeHealth.degraded')}</div>
         </div>
@@ -592,13 +595,13 @@ function ProactiveGPUNodeHealthMonitorInternal() {
           value={search}
           onChange={e => setSearch(e.target.value)}
           placeholder={t('cards:gpuNodeHealth.searchPlaceholder')}
-          className="w-full px-3 py-1.5 text-xs rounded border border-white/10 bg-secondary text-white/80 placeholder:text-white/30 focus:outline-none focus:border-white/20"
+          className="w-full px-3 py-1.5 text-xs rounded border border-white/10 bg-secondary text-white/80 placeholder:text-white/30 focus:outline-hidden focus:border-white/20"
         />
       </div>
 
       {/* CronJob Management Panel */}
       {showCronJobPanel && (
-        <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.03] p-2 space-y-2">
+        <div className="rounded-lg border border-blue-500/20 bg-blue-500/3 p-2 space-y-2">
           <div className="flex items-center gap-2">
             <Clock className="w-3.5 h-3.5 text-blue-400" />
             <span className="text-xs font-medium text-blue-300">{t('cards:gpuNodeHealth.cronJobTitle')}</span>
@@ -617,17 +620,48 @@ function ProactiveGPUNodeHealthMonitorInternal() {
         </div>
       )}
 
-      {/* Node list */}
-      <div className="flex-1 overflow-auto space-y-1">
-        {paginatedNodes.map(node => {
+      {/* Node list.
+        * Issue 8883: roving-tabindex keynav on each node row — Enter/Space
+        * toggles expand; ArrowUp/Down move focus between sibling rows;
+        * Home/End jump to ends. Container gets role="list".
+        */}
+      <div role="list" className="flex-1 overflow-auto space-y-1">
+        {paginatedNodes.map((node, idx, arr) => {
           const isExpanded = expandedNode === `${node.cluster}/${node.nodeName}`
           const nodeKey = `${node.cluster}/${node.nodeName}`
+          const toggleExpand = () => setExpandedNode(isExpanded ? null : nodeKey)
+          const handleRowKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+            const list = e.currentTarget.closest('[role="list"]')
+            const items = list ? Array.from(list.querySelectorAll<HTMLDivElement>('[data-keynav-item="gpu-node"]')) : []
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              toggleExpand()
+            } else if (e.key === 'ArrowDown' && idx < arr.length - 1) {
+              e.preventDefault()
+              items[idx + 1]?.focus()
+            } else if (e.key === 'ArrowUp' && idx > 0) {
+              e.preventDefault()
+              items[idx - 1]?.focus()
+            } else if (e.key === 'Home') {
+              e.preventDefault()
+              items[0]?.focus()
+            } else if (e.key === 'End') {
+              e.preventDefault()
+              items[items.length - 1]?.focus()
+            }
+          }
           return (
             <div key={nodeKey} className="rounded-lg border border-border bg-secondary overflow-hidden">
               {/* Node row */}
               <div
-                className="group flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary transition-colors"
-                onClick={() => setExpandedNode(isExpanded ? null : nodeKey)}
+                data-keynav-item="gpu-node"
+                role="button"
+                tabIndex={0}
+                aria-expanded={isExpanded}
+                aria-label={t('common:actions.toggleGPUNodeAria', { node: node.nodeName })}
+                className="group flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400"
+                onClick={toggleExpand}
+                onKeyDown={handleRowKeyDown}
               >
                 {isExpanded ? (
                   <ChevronDown className="w-3.5 h-3.5 text-white/30 shrink-0" />
@@ -659,7 +693,7 @@ function ProactiveGPUNodeHealthMonitorInternal() {
 
               {/* Expanded detail */}
               {isExpanded && (
-                <div className="border-t border-border px-4 py-2 bg-foreground/[0.01]">
+                <div className="border-t border-border px-4 py-2 bg-foreground/1">
                   {/* GPU type */}
                   <div className="text-xs text-white/50 mb-2">{node.gpuType}</div>
 

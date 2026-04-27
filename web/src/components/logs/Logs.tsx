@@ -3,10 +3,10 @@ import { useClusters } from '../../hooks/useMCP'
 import { useCachedEvents } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
-import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { StatBlockValue } from '../ui/StatsOverview'
 import { DashboardPage } from '../../lib/dashboards/DashboardPage'
 import { RotatingTip } from '../ui/RotatingTip'
+import { MS_PER_HOUR } from '../../lib/constants/time'
 
 const LOGS_CARDS_KEY = 'kubestellar-logs-cards'
 
@@ -14,7 +14,7 @@ const LOGS_CARDS_KEY = 'kubestellar-logs-cards'
 //
 // Fixes #6045: the Logs dashboard historically only surfaced Kubernetes
 // Events (via `useCachedEvents()`).  The new `pod_logs` card wires the
-// existing `/api/mcp/pods/logs` backend endpoint to the dashboard so users
+// existing `${LOCAL_AGENT_HTTP_URL}/pods/logs` backend endpoint to the dashboard so users
 // can actually tail container logs — not just events — from this page.
 const DEFAULT_LOGS_CARDS = [
   { type: 'pod_logs', title: 'Pod Logs', position: { w: 12, h: 4 } },
@@ -32,7 +32,6 @@ export function Logs() {
   const isRefreshing = clustersRefreshing || eventsRefreshing
 
   const { drillToAllEvents, drillToAllClusters } = useDrillDownActions()
-  const { getStatValue: getUniversalStatValue } = useUniversalStats()
   const { selectedClusters: globalSelectedClusters, isAllClustersSelected } = useGlobalFilters()
 
   const handleRefresh = () => {
@@ -62,7 +61,7 @@ export function Logs() {
     e.type === 'Error' ||
     (e.type === 'Warning' && (e.reason?.toLowerCase().includes('error') || e.reason?.toLowerCase().includes('failed')))
   ).length
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
+  const oneHourAgo = new Date(Date.now() - MS_PER_HOUR)
   const currentRecentCount = filteredEvents.filter(e => {
     if (!e.lastSeen) return false
     const eventTime = new Date(e.lastSeen)
@@ -110,7 +109,7 @@ export function Logs() {
     }
   }
 
-  const getStatValue = (blockId: string) => createMergedStatValueGetter(getDashboardStatValue, getUniversalStatValue)(blockId)
+  const getStatValue = getDashboardStatValue
 
   return (
     <DashboardPage

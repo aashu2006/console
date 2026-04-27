@@ -1,6 +1,7 @@
-import { useMemo } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Cpu, Server, ChevronRight } from 'lucide-react'
 import { useCachedGPUNodes } from '../../hooks/useCachedData'
+import { useGPUTaintFilter, GPUTaintFilterControl } from './GPUTaintFilter'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { ClusterBadge } from '../ui/ClusterBadge'
 import { CardClusterFilter } from '../../lib/cards/CardComponents'
@@ -28,8 +29,12 @@ const SORT_OPTIONS = [
 
 type GPUNode = ReturnType<typeof useCachedGPUNodes>['nodes'][number]
 
+/** Safe GPU utilization ratio — returns 0 when gpuCount is zero to avoid NaN. */
+const safeGpuUtilization = (node: GPUNode): number =>
+  node.gpuCount > 0 ? (node.gpuAllocated / node.gpuCount) * 100 : 0
+
 const GPU_SORT_COMPARATORS: Record<SortByOption, (a: GPUNode, b: GPUNode) => number> = {
-  utilization: (a, b) => (a.gpuAllocated / a.gpuCount) - (b.gpuAllocated / b.gpuCount),
+  utilization: (a, b) => safeGpuUtilization(a) - safeGpuUtilization(b),
   name: commonComparators.string<GPUNode>('name'),
   cluster: commonComparators.string<GPUNode>('cluster'),
   gpuType: commonComparators.string<GPUNode>('gpuType'),
@@ -61,6 +66,20 @@ export function GPUInventory({ config }: GPUInventoryProps) {
     isDemoData: isDemoFallback,
   })
 
+  // Taint-aware filtering (taint-filter). Derived from the full raw list so the
+  // set of distinct taints shown in the UI is stable and the user can drill
+  // down/up through search/cluster filters without tainted nodes vanishing
+  // from the toleration picker.
+  const {
+    distinctTaints,
+    toleratedKeys: toleratedTaintKeys,
+    toggle: toggleTaintTolerance,
+    clear: clearTaintTolerance,
+    visibleNodes: taintFilteredRawNodes,
+  } = useGPUTaintFilter(rawNodes)
+  const [showTaintFilter, setShowTaintFilter] = useState(false)
+  const taintFilterRef = useRef<HTMLDivElement>(null)
+
   // Use unified card data hook for filtering, sorting, and pagination
   const {
     items: nodes,
@@ -75,7 +94,7 @@ export function GPUInventory({ config }: GPUInventoryProps) {
     sorting,
     containerRef,
     containerStyle,
-  } = useCardData<GPUNode, SortByOption>(rawNodes, {
+  } = useCardData<GPUNode, SortByOption>(taintFilteredRawNodes, {
     filter: {
       searchFields: ['name', 'cluster', 'gpuType'] as (keyof GPUNode)[],
       clusterField: 'cluster' as keyof GPUNode,
@@ -94,34 +113,25 @@ export function GPUInventory({ config }: GPUInventoryProps) {
   // using the same filter criteria that useCardData applies internally.
   // Since useCardData returns totalItems = filtered+sorted count, we can
   // use a lightweight useMemo that mirrors the filter logic for aggregation.
+  // Stats must reflect the taint-filtered view so the "Available" number on
+  // the card matches what's actually schedulable under the current toleration
+  // set (taint-filter). Using `taintFilteredRawNodes` rather than `rawNodes` makes
+  // toggling a tolerance checkbox visibly recompute the totals.
   const stats = useMemo(() => {
-    // The hook's totalItems reflects the filtered count, but we need
-    // per-field aggregation. We'll filter rawNodes the same way the hook does
-    // by leveraging the hook's internal filter state exposed through `filters`.
-    // This avoids duplicating the global filter logic by just summing from
-    // the items visible in the hook's filtered view.
-    //
-    // totalItems is the count of all items after filtering (before pagination).
-    // We need to compute GPU stats from those same items. The simplest approach:
-    // use the paginated `nodes` if showing all, otherwise we need the full filtered set.
-    // Since useCardData doesn't expose the full filtered set directly, we'll
-    // approximate by summing from rawNodes with the same search/cluster filter.
-    // However, the cleanest approach from the GPUWorkloads pattern is to compute
-    // from the source data (rawNodes), since stats should reflect overall totals.
-    const totalGPUs = rawNodes.reduce((sum, n) => sum + n.gpuCount, 0)
-    const allocatedGPUs = rawNodes.reduce((sum, n) => sum + n.gpuAllocated, 0)
+    const totalGPUs = taintFilteredRawNodes.reduce((sum, n) => sum + n.gpuCount, 0)
+    const allocatedGPUs = taintFilteredRawNodes.reduce((sum, n) => sum + n.gpuAllocated, 0)
     const availableGPUs = totalGPUs - allocatedGPUs
     return { totalGPUs, allocatedGPUs, availableGPUs }
-  }, [rawNodes])
+  }, [taintFilteredRawNodes])
 
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <Skeleton variant="text" width={100} height={16} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
-        <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-4">
           {[1, 2, 3].map(i => (
             <Skeleton key={i} variant="rounded" height={50} />
           ))}
@@ -154,7 +164,7 @@ export function GPUInventory({ config }: GPUInventoryProps) {
   return (
     <div className="h-full flex flex-col content-loaded overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <StatusBadge color="green">
             {t('gpuInventory.gpuCount', { count: stats.totalGPUs })}
@@ -181,6 +191,17 @@ export function GPUInventory({ config }: GPUInventoryProps) {
             minClusters={1}
           />
 
+          {/* Taint toleration picker (taint-filter) */}
+          <GPUTaintFilterControl
+            distinctTaints={distinctTaints}
+            toleratedKeys={toleratedTaintKeys}
+            onToggle={toggleTaintTolerance}
+            onClear={clearTaintTolerance}
+            isOpen={showTaintFilter}
+            setIsOpen={setShowTaintFilter}
+            containerRef={taintFilterRef}
+          />
+
           <CardControls
             limit={itemsPerPage}
             onLimitChange={setItemsPerPage}
@@ -202,7 +223,7 @@ export function GPUInventory({ config }: GPUInventoryProps) {
       />
 
       {/* Summary */}
-      <div className="grid grid-cols-3 gap-2 mb-4">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-4">
         <div className="p-2 rounded-lg bg-secondary/30 text-center">
           <p className="text-lg font-bold text-foreground">{stats.totalGPUs}</p>
           <p className="text-xs text-muted-foreground">{t('common:common.total')}</p>
@@ -226,7 +247,7 @@ export function GPUInventory({ config }: GPUInventoryProps) {
               gpuType: node.gpuType,
               gpuCount: node.gpuCount,
               gpuAllocated: node.gpuAllocated,
-              utilization: (node.gpuAllocated / node.gpuCount) * 100,
+              utilization: safeGpuUtilization(node),
             })}
             className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group"
           >
@@ -235,7 +256,7 @@ export function GPUInventory({ config }: GPUInventoryProps) {
               <span className="text-sm font-medium text-foreground truncate min-w-0 flex-1 group-hover:text-purple-400">{node.name}</span>
               <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
             </div>
-            <div className="flex items-center justify-between text-xs gap-2 min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs gap-2 min-w-0">
               <div className="min-w-0 flex-1">
                 <ClusterBadge cluster={node.cluster} size="sm" />
               </div>
@@ -246,12 +267,18 @@ export function GPUInventory({ config }: GPUInventoryProps) {
                 </span>
               </div>
             </div>
-            <div className="mt-2 h-1.5 bg-secondary rounded-full overflow-hidden">
-              <div
-                className="h-full bg-purple-500 transition-all"
-                style={{ width: `${(node.gpuAllocated / node.gpuCount) * 100}%` }}
-              />
-            </div>
+            {node.gpuCount > 0 ? (
+              <div className="mt-2 h-1.5 bg-secondary rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-purple-500 transition-all"
+                  style={{ width: `${safeGpuUtilization(node)}%` }}
+                />
+              </div>
+            ) : (
+              <p className="mt-2 text-xs text-muted-foreground italic">
+                {t('gpuInventory.noGPUsAvailable')}
+              </p>
+            )}
           </div>
         ))}
       </div>

@@ -18,8 +18,9 @@ function MetricTile({ icon: Icon, label, value, sub, accent }: {
   sub?: string
   accent: string
 }) {
+  // Semantic muted tint — adapts to both light and dark themes.
   return (
-    <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 border border-white/5">
+    <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/50">
       <div className={`p-1.5 rounded-md ${accent}`}>
         <Icon className="w-3.5 h-3.5" />
       </div>
@@ -100,7 +101,7 @@ export function KagentStatusCard({ config }: KagentStatusCardProps) {
   if (showSkeleton) {
     return (
       <div className="space-y-3 p-1">
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 @md:grid-cols-3 gap-2">
           {[1, 2, 3].map(i => <Skeleton key={i} className="h-16 rounded-lg" />)}
         </div>
         <Skeleton className="h-24 rounded-lg" />
@@ -126,7 +127,7 @@ export function KagentStatusCard({ config }: KagentStatusCardProps) {
   return (
     <div className="space-y-3 p-1">
       {/* Metric tiles */}
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2">
         <MetricTile
           icon={Bot}
           label="Agents"
@@ -158,7 +159,8 @@ export function KagentStatusCard({ config }: KagentStatusCardProps) {
             {runtimeEntries.map(([rt, count]) => (
               <div key={rt} className="flex items-center gap-2">
                 <div className="text-sm text-muted-foreground w-20 truncate">{rt}</div>
-                <div className="flex-1 h-1.5 rounded-full bg-white/5 overflow-hidden">
+                {/* Semantic muted tint on progress track — adapts to both themes. */}
+                <div className="flex-1 h-1.5 rounded-full bg-muted/30 overflow-hidden">
                   <div
                     className="h-full rounded-full bg-blue-500/60"
                     style={{ width: `${(count / agents.length) * 100}%` }}

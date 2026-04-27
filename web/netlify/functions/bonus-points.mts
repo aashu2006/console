@@ -17,6 +17,9 @@ const BONUS_TITLE_REGEX = /^\[bonus\]\s+@(\S+)\s+\+(\d+)\s*(.*)/i;
 /** Cache TTL — 15 minutes */
 const CACHE_TTL_MS = 15 * 60 * 1000;
 
+/** Timeout for GitHub API requests */
+const GITHUB_API_TIMEOUT_MS = 10_000;
+
 interface BonusEntry {
   issue_number: number;
   points: number;
@@ -38,10 +41,22 @@ const ALLOWED_ORIGINS = [
   "https://kubestellar.io",
 ];
 
+/**
+ * Returns a CORS origin header value for the given request origin.
+ * Uses exact match or parsed-hostname suffix check — not raw string endsWith —
+ * to prevent bypass via crafted origins like "evil.kubestellar.io.evil.com"
+ * (CodeQL js/incomplete-url-substring-sanitization, #9119).
+ */
 function corsOrigin(origin: string | null): string {
   if (!origin) return ALLOWED_ORIGINS[0];
-  if (ALLOWED_ORIGINS.some((o) => origin === o) || origin.endsWith(".kubestellar.io")) {
-    return origin;
+  if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    if (host === "kubestellar.io" || host.endsWith(".kubestellar.io")) {
+      return origin;
+    }
+  } catch {
+    // Malformed origin — fall through to default
   }
   return ALLOWED_ORIGINS[0];
 }
@@ -60,7 +75,14 @@ async function fetchAllBonusIssues(): Promise<Record<string, BonusEntry[]>> {
   }
 
   const url = `https://api.github.com/repos/${BONUS_REPO}/issues?labels=${BONUS_LABEL}&state=all&per_page=100&creator=${BONUS_AUTHORIZED_USER}`;
-  const res = await fetch(url, { headers });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, { headers, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (!res.ok) {
     throw new Error(`GitHub API ${res.status}`);
   }
@@ -134,8 +156,9 @@ export default async (req: Request) => {
       { status: 200, headers }
     );
   } catch (err) {
+    console.error("Failed to fetch bonus points:", err);
     return new Response(
-      JSON.stringify({ error: "Failed to fetch bonus points", detail: String(err) }),
+      JSON.stringify({ error: "Internal server error" }),
       { status: 502, headers }
     );
   }

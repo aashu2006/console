@@ -47,7 +47,7 @@ function ServerPodRow({ pod }: { pod: K3sServerPodInfo }) {
   const statusColor = POD_STATUS_COLORS[pod.status] || POD_STATUS_COLORS.failed
 
   return (
-    <div className="flex items-center justify-between text-sm gap-3 px-3 py-2.5 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
+    <div className="flex flex-wrap items-center justify-between gap-y-2 text-sm gap-3 px-3 py-2.5 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
       <div className="flex items-center gap-2 min-w-0 flex-1">
         <Server className="w-4 h-4 text-purple-400 shrink-0" />
         <div className="min-w-0 flex-1">
@@ -200,7 +200,7 @@ export function K3sDetailModal({ isOpen, onClose, data, isDemoData }: K3sDetailM
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t('k3sStatus.searchPods', 'Search pods...')}
-              className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500"
+              className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500"
             />
           </div>
 

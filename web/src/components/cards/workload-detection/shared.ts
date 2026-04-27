@@ -1,15 +1,19 @@
 import { useState, useMemo } from 'react'
 import type { ClusterInfo } from '../../../hooks/mcp/types'
+import { useDemoMode } from '../../../hooks/useDemoMode'
 
 export interface DemoState {
   isLoading: boolean
+  isRefreshing: boolean
+  isDemoData: boolean
   lastUpdated: Date | null
 }
 
 export function useDemoData<T>(data: T): DemoState & { data: T } {
   const [isLoading] = useState(false)
   const [lastUpdated] = useState<Date | null>(new Date())
-  return { data, isLoading, lastUpdated }
+  const { isDemoMode } = useDemoMode()
+  return { data, isLoading, isRefreshing: false, isDemoData: isDemoMode, lastUpdated }
 }
 
 // Keywords that indicate a cluster may have LLM-d or AI/ML workloads

@@ -73,8 +73,9 @@ export function MatchGame(_props: CardComponentProps) {
     if (stored) {
       try {
         setHighScores(JSON.parse(stored))
-      } catch (e) {
-        console.error('Failed to load high scores:', e)
+      } catch {
+        // User-visible toast already communicates the failure; no console
+        // noise needed (#8816).
         showToast(t('matchGame.errors.highScoresFailed', 'Could not load high scores.'), 'warning')
       }
     }
@@ -133,7 +134,11 @@ export function MatchGame(_props: CardComponentProps) {
           [difficulty]: { difficulty, moves, time, date: new Date().toISOString() }
         }
         setHighScores(newHighScores)
-        localStorage.setItem('matchGameHighScores', JSON.stringify(newHighScores))
+        try {
+          localStorage.setItem('matchGameHighScores', JSON.stringify(newHighScores))
+        } catch {
+          // Ignore storage errors (e.g. private browsing, quota exceeded)
+        }
       }
       
       emitGameEnded('match', 'win', moves)
@@ -291,7 +296,7 @@ export function MatchGame(_props: CardComponentProps) {
       />
 
       {/* Header with controls */}
-      <div className="flex items-center justify-between gap-2 flex-wrap">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         {/* Difficulty selector */}
         <div className="flex gap-1">
           {(['easy', 'medium', 'hard'] as Difficulty[]).map(d => (
@@ -301,7 +306,7 @@ export function MatchGame(_props: CardComponentProps) {
               className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
                 difficulty === d
                   ? 'bg-purple-500 text-white'
-                  : 'bg-white/5 hover:bg-white/10 text-muted-foreground'
+                  : 'bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 text-muted-foreground'
               }`}
             >
               {d.charAt(0).toUpperCase() + d.slice(1)}
@@ -312,7 +317,7 @@ export function MatchGame(_props: CardComponentProps) {
 
       {/* Game stats */}
       {isPlaying && (
-        <div className="flex items-center justify-between gap-2 text-xs">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="flex items-center gap-1.5">
             <Hash className="w-3.5 h-3.5 text-blue-400" />
             <span>Moves: <span className="font-bold">{moves}</span></span>
@@ -324,14 +329,14 @@ export function MatchGame(_props: CardComponentProps) {
           <div className="flex gap-1">
             <button
               onClick={togglePause}
-              className="p-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors"
+              className="p-0.5 rounded bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
               title={isPaused ? 'Resume' : 'Pause'}
             >
               {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
             </button>
             <button
               onClick={resetGame}
-              className="p-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors"
+              className="p-0.5 rounded bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
               title={t('common.reset')}
             >
               <RotateCcw className="w-3.5 h-3.5" />
@@ -353,7 +358,7 @@ export function MatchGame(_props: CardComponentProps) {
         <div className="flex-1 flex items-center justify-center min-h-[120px]">
           <button
             onClick={initGame}
-            className="px-4 py-2 bg-gradient-to-r from-purple-500 to-blue-500 rounded-lg text-sm font-semibold hover:from-purple-600 hover:to-blue-600 transition-all transform hover:scale-105 flex items-center gap-2"
+            className="px-4 py-2 bg-linear-to-r from-purple-500 to-blue-500 rounded-lg text-sm font-semibold hover:from-purple-600 hover:to-blue-600 transition-all transform hover:scale-105 flex items-center gap-2"
           >
             <Play className="w-4 h-4" />
             Start Game
@@ -372,7 +377,7 @@ export function MatchGame(_props: CardComponentProps) {
           </div>
           <button
             onClick={resetGame}
-            className="px-4 py-1.5 bg-gradient-to-r from-green-500 to-green-500 rounded-lg text-sm font-semibold hover:from-green-600 hover:to-green-600 transition-all transform hover:scale-105 flex items-center gap-2"
+            className="px-4 py-1.5 bg-linear-to-r from-green-500 to-green-500 rounded-lg text-sm font-semibold hover:from-green-600 hover:to-green-600 transition-all transform hover:scale-105 flex items-center gap-2"
           >
             <RotateCcw className="w-4 h-4" />
             Play Again
@@ -407,13 +412,13 @@ export function MatchGame(_props: CardComponentProps) {
                   }`}
                 >
                   {/* Card back */}
-                  <div className="card-face absolute inset-0 backface-hidden bg-gradient-to-br from-purple-500/20 to-blue-500/20 border-2 border-purple-500/30 rounded flex items-center justify-center">
+                  <div className="card-face absolute inset-0 backface-hidden bg-linear-to-br from-purple-500/20 to-blue-500/20 border-2 border-purple-500/30 rounded flex items-center justify-center">
                     <Terminal className="w-5 h-5 text-purple-400" />
                   </div>
                   
                   {/* Card front */}
                   <div className={`card-face absolute inset-0 backface-hidden rotate-y-180 ${
-                    card.matched ? 'bg-green-500/20 border-green-500/30' : 'bg-white/10 border-white/20'
+                    card.matched ? 'bg-green-500/20 border-green-500/30' : 'bg-black/10 dark:bg-white/10 border-black/20 dark:border-white/20'
                   } border-2 rounded flex items-center justify-center`}>
                     <Icon className={`w-6 h-6 ${icon?.color || 'text-blue-400'}`} />
                   </div>
@@ -426,13 +431,13 @@ export function MatchGame(_props: CardComponentProps) {
 
       {/* Pause overlay */}
       {isPaused && (
-        <div className="absolute inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-10 rounded-xl">
+        <div className="absolute inset-0 bg-black/50 backdrop-blur-xs flex items-center justify-center z-10 rounded-xl">
           <div className="text-center">
             <Pause className="w-8 h-8 mx-auto mb-2 text-white" />
             <div className="text-base font-bold">Paused</div>
             <button
               onClick={togglePause}
-              className="mt-2 px-3 py-1.5 text-sm bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+              className="mt-2 px-3 py-1.5 text-sm bg-black/10 dark:bg-white/10 hover:bg-black/20 dark:hover:bg-white/20 rounded-lg transition-colors"
             >
               Resume
             </button>

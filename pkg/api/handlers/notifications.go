@@ -4,6 +4,7 @@ import (
 	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/notifications"
@@ -40,7 +41,7 @@ type SendAlertNotificationRequest struct {
 // Returns a 403 Forbidden response if not, or nil on success.
 func (h *NotificationHandler) requireAdmin(c *fiber.Ctx) error {
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
 		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
 	}
@@ -119,13 +120,9 @@ func (h *NotificationHandler) SendAlertNotification(c *fiber.Ctx) error {
 // GetNotificationConfig gets the notification configuration for a user
 // GET /api/notifications/config
 func (h *NotificationHandler) GetNotificationConfig(c *fiber.Ctx) error {
-	// Get user from context (set by auth middleware)
-	userID := c.Locals("userID")
-	if userID == nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Unauthorized",
-		})
-	}
+	// Use middleware.GetUserID for consistency with other handlers (#7799).
+	userID := middleware.GetUserID(c)
+	_ = userID // reserved for future server-side config lookup
 
 	// Return empty config - actual config is stored client-side
 	// This endpoint exists for future server-side config storage
@@ -135,13 +132,9 @@ func (h *NotificationHandler) GetNotificationConfig(c *fiber.Ctx) error {
 // SaveNotificationConfig saves the notification configuration for a user
 // POST /api/notifications/config
 func (h *NotificationHandler) SaveNotificationConfig(c *fiber.Ctx) error {
-	// Get user from context (set by auth middleware)
-	userID := c.Locals("userID")
-	if userID == nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Unauthorized",
-		})
-	}
+	// Use middleware.GetUserID for consistency with other handlers (#7799).
+	userID := middleware.GetUserID(c)
+	_ = userID // reserved for future server-side config storage
 
 	var config notifications.NotificationConfig
 	if err := c.BodyParser(&config); err != nil {
@@ -149,6 +142,8 @@ func (h *NotificationHandler) SaveNotificationConfig(c *fiber.Ctx) error {
 			"error": "Invalid request body",
 		})
 	}
+
+	audit.Log(c, audit.ActionSaveNotificationConfig, "notification_config", userID.String())
 
 	// Config validation only - actual storage is client-side
 	// This endpoint exists for future server-side config storage

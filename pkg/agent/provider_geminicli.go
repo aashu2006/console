@@ -101,6 +101,7 @@ func (g *GeminiCLIProvider) StreamChat(ctx context.Context, req *ChatRequest, on
 
 	cmd := exec.CommandContext(execCtx, g.cliPath, "-p", prompt)
 	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	configureProcessGroup(cmd) // #9442: kill entire process tree on timeout
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -131,9 +132,17 @@ func (g *GeminiCLIProvider) StreamChat(ctx context.Context, req *ChatRequest, on
 		slog.Error("[GeminiCLI] command finished with error", "error", err)
 	}
 
+	content := fullResponse.String()
 	return &ChatResponse{
-		Content: fullResponse.String(),
+		Content: content,
 		Agent:   g.Name(),
 		Done:    true,
+		// Gemini CLI does not emit token usage in its stdout, so we estimate
+		// from the input prompt and the captured output. Without this the
+		// navbar token-usage indicator stays at 0 for the entire session
+		// (#9160), which breaks budget visibility for Gemini CLI users.
+		// (The HTTP-API GeminiProvider already returns exact counts via
+		// `usageMetadata` and is unaffected.)
+		TokenUsage: estimateChatTokenUsage(req, content),
 	}, nil
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { Key, Check, AlertCircle, Loader2, Trash2, Eye, EyeOff, ExternalLink, Copy, Plug } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import { AgentIcon } from './AgentIcon'
@@ -14,6 +14,20 @@ const INSTALL_COMMAND = KC_AGENT.installCommand
 
 const KC_AGENT_URL = KC_AGENT.url
 
+/** Body shape for POST /settings/keys when saving a Base URL override.
+ *
+ *  Empty draft = "Leave blank to use the compiled-in default" — send
+ *  clearBaseURL:true so the backend removes the persisted override (and
+ *  bypasses the missing_field guard that rejects all-empty requests).
+ *  Non-empty draft sends the override value. See #8277. */
+export function buildBaseURLPayload(provider: string, draft: string):
+  | { provider: string; clearBaseURL: true }
+  | { provider: string; baseURL: string } {
+  return draft === ''
+    ? { provider, clearBaseURL: true }
+    : { provider, baseURL: draft }
+}
+
 interface KeyStatus {
   provider: string
   displayName: string
@@ -21,11 +35,32 @@ interface KeyStatus {
   source?: 'env' | 'config'
   valid?: boolean
   error?: string
+  // Base URL metadata populated by the backend for providers that support
+  // an endpoint override (local LLM runners + OpenAI-compatible gateways).
+  // `baseURLEnvVar` is the name of the env var the operator would set to
+  // override this value from the shell; used as a hint in the UI. Empty
+  // string means the provider has no base URL override path.
+  baseURL?: string
+  baseURLEnvVar?: string
+  baseURLSource?: 'env' | 'config'
+}
+
+/** Provider info from the backend agent registry (mirrors Go ProviderInfo). */
+interface RegisteredProvider {
+  name: string
+  displayName: string
+  description: string
+  provider: string
+  available: boolean
+  capabilities: number
 }
 
 interface KeysStatusResponse {
   keys: KeyStatus[]
   configPath: string
+  /** Live provider registry from the backend — used to filter the settings
+   *  UI so it only displays providers that are actually registered (#9488). */
+  registeredProviders?: RegisteredProvider[]
 }
 
 interface APIKeySettingsProps {
@@ -33,72 +68,71 @@ interface APIKeySettingsProps {
   onClose: () => void
 }
 
+// PROVIDER_INFO is a fallback lookup table for providers whose docs URL
+// and key placeholder cannot be derived from the backend registry.
+// The settings UI now sources its display list from the backend's
+// registeredProviders field (#9488) — entries here are only consulted
+// when the backend does not supply metadata for a given provider key.
 const PROVIDER_INFO: Record<string, { docsUrl: string; placeholder: string }> = {
-  claude: {
-    docsUrl: AI_PROVIDER_DOCS.claude,
-    placeholder: 'sk-ant-api03-...',
-  },
-  openai: {
-    docsUrl: AI_PROVIDER_DOCS.openai,
-    placeholder: 'sk-...',
-  },
-  gemini: {
-    docsUrl: AI_PROVIDER_DOCS.gemini,
-    placeholder: 'AIza...',
-  },
-  cursor: {
-    docsUrl: AI_PROVIDER_DOCS.cursor,
-    placeholder: 'cursor-...',
-  },
-  vscode: {
-    docsUrl: AI_PROVIDER_DOCS.vscode,
-    placeholder: 'vscode-...',
-  },
-  windsurf: {
-    docsUrl: AI_PROVIDER_DOCS.windsurf,
-    placeholder: 'codeium-...',
-  },
-  cline: {
-    docsUrl: AI_PROVIDER_DOCS.cline,
-    placeholder: 'cline-...',
-  },
-  jetbrains: {
-    docsUrl: AI_PROVIDER_DOCS.jetbrains,
-    placeholder: 'jb-...',
-  },
-  zed: {
-    docsUrl: AI_PROVIDER_DOCS.zed,
-    placeholder: 'zed-...',
-  },
-  continue: {
-    docsUrl: AI_PROVIDER_DOCS.continue,
-    placeholder: 'continue-...',
-  },
-  raycast: {
-    docsUrl: AI_PROVIDER_DOCS.raycast,
-    placeholder: 'raycast-...',
-  },
   'open-webui': {
     docsUrl: AI_PROVIDER_DOCS['open-webui'],
     placeholder: 'owui-...',
   },
+  openrouter: {
+    docsUrl: AI_PROVIDER_DOCS.openrouter,
+    placeholder: 'sk-or-...',
+  },
+  groq: {
+    docsUrl: AI_PROVIDER_DOCS.groq,
+    placeholder: 'gsk_...',
+  },
+  // Local LLM runners. Most do not require an API key — set the
+  // corresponding URL env var instead (see SECURITY-MODEL.md §3). The
+  // placeholder advises the operator how to configure the runner today;
+  // full UI support for base URL overrides is tracked as a follow-up.
+  ollama: {
+    docsUrl: 'https://ollama.com',
+    placeholder: 'Set OLLAMA_URL env var (no key needed)',
+  },
+  llamacpp: {
+    docsUrl: 'https://github.com/ggml-org/llama.cpp',
+    placeholder: 'Set LLAMACPP_URL env var (no key needed)',
+  },
+  localai: {
+    docsUrl: 'https://localai.io',
+    placeholder: 'Set LOCALAI_URL env var (no key needed)',
+  },
+  vllm: {
+    docsUrl: 'https://docs.vllm.ai',
+    placeholder: 'Set VLLM_URL env var (no key needed)',
+  },
+  'lm-studio': {
+    docsUrl: 'https://lmstudio.ai',
+    placeholder: 'Set LM_STUDIO_URL env var (no key needed)',
+  },
+  rhaiis: {
+    docsUrl: 'https://docs.redhat.com/en/documentation/red_hat_ai_inference_server/',
+    placeholder: 'Set RHAIIS_URL env var (no key needed)',
+  },
 }
 
-// Map backend provider key names to AgentIcon provider values
+// Map backend provider key names to AgentIcon provider values.
+// Only includes providers that are actually registered in the backend
+// registry (see InitializeProviders in pkg/agent/registry.go). Stale
+// entries for unregistered API-only / IDE providers were removed in
+// #9488 to keep this in sync with the backend.
 function providerToIconMap(provider: string): string {
   const map: Record<string, string> = {
-    claude: 'anthropic',
-    openai: 'openai',
-    gemini: 'google',
-    cursor: 'anysphere',
-    vscode: 'microsoft',
-    windsurf: 'codeium',
-    cline: 'cline',
-    jetbrains: 'jetbrains',
-    zed: 'zed',
-    continue: 'continue',
-    raycast: 'raycast',
     'open-webui': 'open-webui',
+    openrouter: 'openrouter',
+    groq: 'groq',
+    // Local LLM runners — provider key matches the icon key 1:1
+    ollama: 'ollama',
+    llamacpp: 'llamacpp',
+    localai: 'localai',
+    vllm: 'vllm',
+    'lm-studio': 'lm-studio',
+    rhaiis: 'rhaiis',
   }
   return map[provider] || provider
 }
@@ -106,6 +140,7 @@ function providerToIconMap(provider: string): string {
 export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
   const { t } = useTranslation(['common', 'cards'])
   const [keysStatus, setKeysStatus] = useState<KeyStatus[]>([])
+  const [registeredProviders, setRegisteredProviders] = useState<RegisteredProvider[]>([])
   const [configPath, setConfigPath] = useState<string>('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -116,6 +151,85 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
   const [saving, setSaving] = useState(false)
   const [copied, setCopied] = useState(false)
   const timeoutRef = useRef<number>(undefined)
+  // Advanced-section state: which provider rows are expanded, the draft
+  // base URL value per expanded row, and a transient "saved, restart kc-agent"
+  // flag so the user sees feedback after a successful POST.
+  const [expandedAdvanced, setExpandedAdvanced] = useState<Set<string>>(new Set())
+  const [baseURLDraft, setBaseURLDraft] = useState<Record<string, string>>({})
+  const [baseURLSaved, setBaseURLSaved] = useState<Set<string>>(new Set())
+  const [baseURLError, setBaseURLError] = useState<Record<string, string>>({})
+
+  const toggleAdvanced = useCallback((provider: string, initialValue: string) => {
+    setExpandedAdvanced(prev => {
+      const next = new Set(prev)
+      if (next.has(provider)) {
+        next.delete(provider)
+      } else {
+        next.add(provider)
+        setBaseURLDraft(d => ({ ...d, [provider]: initialValue }))
+      }
+      return next
+    })
+  }, [])
+
+  const fetchKeysStatus = useCallback(async () => {
+    try {
+      setLoading(true)
+      setError(null)
+      const response = await fetch(`${KC_AGENT_URL}/settings/keys`, {
+        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+      })
+      if (!response.ok) {
+        throw new Error(t('agent.failedToFetchKeyStatus'))
+      }
+      const data: KeysStatusResponse = await response.json()
+      setKeysStatus(data.keys)
+      setRegisteredProviders(data.registeredProviders || [])
+      setConfigPath(data.configPath)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('agent.failedToConnect'))
+    } finally {
+      setLoading(false)
+    }
+  }, [t])
+
+  useEffect(() => {
+    if (isOpen) {
+      fetchKeysStatus()
+    }
+  }, [isOpen, fetchKeysStatus])
+
+  const handleSaveBaseURL = useCallback(async (provider: string) => {
+    const draft = (baseURLDraft[provider] ?? '').trim()
+    setBaseURLError(e => ({ ...e, [provider]: '' }))
+    try {
+      setSaving(true)
+      const body = buildBaseURLPayload(provider, draft)
+      const response = await fetch(`${KC_AGENT_URL}/settings/keys`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+      })
+      if (!response.ok) {
+        let message = t('agent.failedToSaveKey')
+        try {
+          const data = await response.json()
+          message = data.message || message
+        } catch {
+          // Response body was not JSON — use default message
+        }
+        throw new Error(message)
+      }
+      setBaseURLSaved(prev => new Set(prev).add(provider))
+      // Refresh status so the row reflects the new resolved value.
+      await fetchKeysStatus()
+    } catch (err) {
+      setBaseURLError(e => ({ ...e, [provider]: err instanceof Error ? err.message : t('agent.failedToSaveKey') }))
+    } finally {
+      setSaving(false)
+    }
+  }, [baseURLDraft, t, fetchKeysStatus])
 
   const copyInstallCommand = async () => {
     await copyToClipboard(INSTALL_COMMAND)
@@ -132,32 +246,6 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
     }
   }, [])
 
-  const fetchKeysStatus = useCallback(async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      const response = await fetch(`${KC_AGENT_URL}/settings/keys`, {
-        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
-      })
-      if (!response.ok) {
-        throw new Error(t('agent.failedToFetchKeyStatus'))
-      }
-      const data: KeysStatusResponse = await response.json()
-      setKeysStatus(data.keys)
-      setConfigPath(data.configPath)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t('agent.failedToConnect'))
-    } finally {
-      setLoading(false)
-    }
-  }, [t])
-
-  useEffect(() => {
-    if (isOpen) {
-      fetchKeysStatus()
-    }
-  }, [isOpen, fetchKeysStatus])
-
   const handleSaveKey = async (provider: string) => {
     if (!newKeyValue.trim()) return
 
@@ -171,8 +259,14 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.message || t('agent.failedToSaveKey'))
+        let message = t('agent.failedToSaveKey')
+        try {
+          const data = await response.json()
+          message = data.message || message
+        } catch {
+          // Response body was not JSON — use default message
+        }
+        throw new Error(message)
       }
 
       // Success - refresh status and close edit mode
@@ -198,8 +292,14 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.message || t('agent.failedToDeleteKey'))
+        let message = t('agent.failedToDeleteKey')
+        try {
+          const data = await response.json()
+          message = data.message || message
+        } catch {
+          // Response body was not JSON — use default message
+        }
+        throw new Error(message)
       }
 
       await fetchKeysStatus()
@@ -224,6 +324,18 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
     setShowKey(false)
   }
 
+  // Filter displayed keys to only show providers that are actually
+  // registered in the backend's provider registry. When the registry
+  // data is unavailable (older kc-agent, network error), fall back to
+  // showing all keys returned by the backend (#9488).
+  const filteredKeys = useMemo(() => {
+    if (registeredProviders.length === 0) return keysStatus
+    const registeredNames = new Set(
+      (registeredProviders || []).map(p => p.name),
+    )
+    return keysStatus.filter(k => registeredNames.has(k.provider))
+  }, [keysStatus, registeredProviders])
+
   return (
     <BaseModal isOpen={isOpen} onClose={onClose} size="md" closeOnBackdrop={false}>
       <BaseModal.Header
@@ -238,7 +350,7 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
             <div className="flex items-center justify-center py-8">
               <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
             </div>
-          ) : error && keysStatus.length === 0 ? (
+          ) : error && filteredKeys.length === 0 ? (
             <div className="text-center py-6">
               <div className="p-3 rounded-full bg-orange-500/20 w-fit mx-auto mb-4">
                 <Plug className="w-8 h-8 text-orange-400" />
@@ -288,7 +400,7 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
                 </div>
               )}
 
-              {keysStatus.map((key) => (
+              {filteredKeys.map((key) => (
                 <div
                   key={key.provider}
                   className="p-4 bg-secondary/30 border border-border rounded-lg"
@@ -342,15 +454,17 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
                           <Trash2 className="w-4 h-4" />
                         </button>
                       )}
-                      <a
-                        href={PROVIDER_INFO[key.provider]?.docsUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="p-1.5 hover:bg-secondary rounded transition-colors text-muted-foreground hover:text-foreground"
-                        title={t('agent.getApiKey')}
-                      >
-                        <ExternalLink className="w-4 h-4" />
-                      </a>
+                      {PROVIDER_INFO[key.provider]?.docsUrl && (
+                        <a
+                          href={PROVIDER_INFO[key.provider].docsUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="p-1.5 hover:bg-secondary rounded transition-colors text-muted-foreground hover:text-foreground"
+                          title={t('agent.getApiKey')}
+                        >
+                          <ExternalLink className="w-4 h-4" />
+                        </a>
+                      )}
                     </div>
                   </div>
 
@@ -363,7 +477,7 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
                           value={newKeyValue}
                           onChange={(e) => setNewKeyValue(e.target.value)}
                           placeholder={PROVIDER_INFO[key.provider]?.placeholder || t('agent.enterApiKey')}
-                          className="w-full px-3 py-2 pr-10 text-sm bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                          className="w-full px-3 py-2 pr-10 text-sm bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
                           autoFocus
                         />
                         <button
@@ -414,6 +528,80 @@ export function APIKeySettings({ isOpen, onClose }: APIKeySettingsProps) {
                     <p className="mt-2 text-xs text-muted-foreground">
                       {t('agent.envVariableNote')}
                     </p>
+                  )}
+
+                  {/* Advanced section — per-provider Base URL override.
+                      Only shown for providers that actually support a base
+                      URL override (the backend populates baseURLEnvVar for
+                      those). Env-var source wins over the config file, so
+                      the form is read-only when the env var is set. */}
+                  {key.baseURLEnvVar && (
+                    <div className="mt-3 pt-3 border-t border-border">
+                      <button
+                        type="button"
+                        onClick={() => toggleAdvanced(key.provider, key.baseURL ?? '')}
+                        className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        <span className={cn('transition-transform', expandedAdvanced.has(key.provider) ? 'rotate-90' : '')}>
+                          ▸
+                        </span>
+                        {t('agent.advanced', 'Advanced')}
+                        {key.baseURL && (
+                          <span className="text-xs text-muted-foreground/70">
+                            — {key.baseURL}
+                            {key.baseURLSource === 'env' && ' (env)'}
+                          </span>
+                        )}
+                      </button>
+                      {expandedAdvanced.has(key.provider) && (
+                        <div className="mt-2 space-y-2">
+                          <label className="block text-xs font-medium text-foreground">
+                            {t('agent.baseUrlLabel', 'Base URL')}
+                          </label>
+                          <p className="text-xs text-muted-foreground">
+                            {t('agent.baseUrlHint', 'Override the endpoint this provider talks to. Leave blank to use the compiled-in default. The {{env}} environment variable takes precedence when set.', { env: key.baseURLEnvVar })}
+                          </p>
+                          <input
+                            type="text"
+                            value={baseURLDraft[key.provider] ?? ''}
+                            onChange={(e) => setBaseURLDraft(d => ({ ...d, [key.provider]: e.target.value }))}
+                            placeholder={`http://<service>.<namespace>.svc.cluster.local:8080`}
+                            disabled={key.baseURLSource === 'env'}
+                            className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary disabled:opacity-50"
+                          />
+                          {baseURLError[key.provider] && (
+                            <p className="text-xs text-destructive flex items-center gap-1">
+                              <AlertCircle className="w-3 h-3" />
+                              {baseURLError[key.provider]}
+                            </p>
+                          )}
+                          {baseURLSaved.has(key.provider) && (
+                            <p className="text-xs text-yellow-500 flex items-center gap-1">
+                              <AlertCircle className="w-3 h-3" />
+                              {t('agent.baseUrlRestartHint', 'Saved. Restart kc-agent for the change to take effect.')}
+                            </p>
+                          )}
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => handleSaveBaseURL(key.provider)}
+                              disabled={saving || key.baseURLSource === 'env'}
+                              className="flex-1 px-3 py-1.5 bg-primary text-primary-foreground text-sm rounded-lg hover:bg-primary/80 disabled:opacity-50"
+                            >
+                              {saving ? (
+                                <Loader2 className="w-4 h-4 animate-spin mx-auto" />
+                              ) : (
+                                t('agent.saveBaseUrl', 'Save Base URL')
+                              )}
+                            </button>
+                          </div>
+                          {key.baseURLSource === 'env' && (
+                            <p className="text-xs text-muted-foreground">
+                              {t('agent.baseUrlFromEnv', '{{env}} is currently set. Unset it to edit this value from the UI.', { env: key.baseURLEnvVar })}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
               ))}

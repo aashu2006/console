@@ -19,6 +19,7 @@ import { useKubeFlexStatus } from './useKubeflexStatus'
 import { KUBEFLEX_INSTALL_PROMPT } from '../shared'
 import { loadMissionPrompt } from '../missionLoader'
 import { KubeFlexDetailModal } from './KubeFlexDetailModal'
+import { createCardSyncFormatter } from '../../../../lib/formatters'
 
 // ============================================================================
 // Constants
@@ -31,25 +32,6 @@ const SKELETON_CP_ROWS = 3
 // Relative time formatting
 // ============================================================================
 
-function useFormatRelativeTime() {
-  const { t } = useTranslation('cards')
-  return (isoString: string): string => {
-    const diff = Date.now() - new Date(isoString).getTime()
-    if (isNaN(diff) || diff < 0) return t('kubeFlexStatus.syncedJustNow')
-
-    /** Milliseconds in one minute */
-    const MINUTE_MS = 60_000
-    /** Milliseconds in one hour */
-    const HOUR_MS = 60 * MINUTE_MS
-    /** Milliseconds in one day */
-    const DAY_MS = 24 * HOUR_MS
-
-    if (diff < MINUTE_MS) return t('kubeFlexStatus.syncedJustNow')
-    if (diff < HOUR_MS) return t('kubeFlexStatus.syncedMinutesAgo', { count: Math.floor(diff / MINUTE_MS) })
-    if (diff < DAY_MS) return t('kubeFlexStatus.syncedHoursAgo', { count: Math.floor(diff / HOUR_MS) })
-    return t('kubeFlexStatus.syncedDaysAgo', { count: Math.floor(diff / DAY_MS) })
-  }
-}
 
 // ============================================================================
 // Component
@@ -57,7 +39,7 @@ function useFormatRelativeTime() {
 
 export function KubeFlexStatus() {
   const { t } = useTranslation('cards')
-  const formatRelativeTime = useFormatRelativeTime()
+  const formatRelativeTime = createCardSyncFormatter(t, 'kubeFlexStatus')
   const { data, error, showSkeleton, showEmptyState, isRefreshing, isDemoData } = useKubeFlexStatus()
   const { startMission } = useMissions()
   const { showKeyPrompt, checkKeyAndRun, goToSettings, dismissPrompt } = useApiKeyCheck()
@@ -150,7 +132,7 @@ export function KubeFlexStatus() {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded gap-4">
       {/* Health badge + last check */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div
           role="button"
           tabIndex={0}
@@ -218,7 +200,7 @@ export function KubeFlexStatus() {
                 onClick={openDetailModal}
                 onKeyDown={handleDetailKeyDown}
                 aria-label={`${cp.name}: ${cp.healthy ? t('kubeFlexStatus.cpHealthy') : t('kubeFlexStatus.cpUnhealthy')}`}
-                className="flex items-center justify-between text-xs gap-2 px-2 py-1.5 rounded bg-secondary/30 cursor-pointer hover:bg-secondary/50 transition-colors"
+                className="flex flex-wrap items-center justify-between gap-y-2 text-xs gap-2 px-2 py-1.5 rounded bg-secondary/30 cursor-pointer hover:bg-secondary/50 transition-colors"
               >
                 <span className="text-foreground truncate flex-1" title={cp.name}>
                   {cp.name}

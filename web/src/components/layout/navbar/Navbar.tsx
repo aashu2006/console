@@ -9,6 +9,7 @@ import { useMobile } from '../../../hooks/useMobile'
 import { useBranding } from '../../../hooks/useBranding'
 import { LearnDropdown } from './LearnDropdown'
 import { LogoWithStar } from '../../ui/LogoWithStar'
+import { Tooltip } from '../../ui/Tooltip'
 import { UserProfileDropdown } from '../UserProfileDropdown'
 import { AlertBadge } from '../../ui/AlertBadge'
 import { FeatureRequestButton } from '../../feedback'
@@ -27,6 +28,7 @@ import { useMissions } from '../../../hooks/useMissions'
 import { TokenUsageWidget } from './TokenUsageWidget'
 import { ClusterFilterPanel } from './ClusterFilterPanel'
 import { AgentStatusIndicator } from './AgentStatusIndicator'
+import { RotatingTagline } from './RotatingTagline'
 import { UpdateIndicator } from './UpdateIndicator'
 import { StreakBadge } from './StreakBadge'
 import { ROUTES } from '../../../config/routes'
@@ -58,13 +60,13 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
   }, [location.pathname])
 
   return (
-    <nav data-tour="navbar" style={{ top: topOffset }} className="fixed left-0 right-0 h-16 glass z-50 px-3 md:px-6 flex items-center justify-between">
+    <nav data-tour="navbar" style={{ top: topOffset }} className="fixed left-0 right-0 h-16 glass z-sticky px-3 md:px-6 flex items-center justify-between overflow-x-clip">
       {/* Left side: Hamburger + Logo — shrink-0 so logo is never compressed */}
       <div className="flex items-center gap-2 md:gap-3 shrink-0">
         {/* Hamburger menu - mobile only */}
         <button
           onClick={toggleMobileSidebar}
-          className="p-2 md:hidden rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/10"
+          className="p-2 min-w-[44px] min-h-[44px] flex md:hidden items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/10"
           aria-label={config.isMobileOpen ? t('navbar.closeMenu') : t('navbar.openMenu')}
         >
           {config.isMobileOpen ? (
@@ -78,7 +80,7 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
         <button
           type="button"
           onClick={() => navigate(ROUTES.HOME)}
-          className="flex items-center gap-2 md:gap-3 p-2 -m-2 min-w-[44px] min-h-[44px] hover:opacity-80 transition-opacity"
+          className="flex items-center gap-2 md:gap-3 p-2 -m-2 min-w-[44px] min-h-[44px] hover:opacity-80 transition-opacity cursor-pointer"
           aria-label={t('navbar.goHome')}
         >
           <LogoWithStar className="w-8 h-8 md:w-9 md:h-9" showStar={false} />
@@ -86,27 +88,28 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
         <button
           type="button"
           onClick={() => navigate(ROUTES.HOME)}
-          className="hidden lg:flex flex-col leading-tight hover:opacity-80 transition-opacity text-left"
+          className="hidden lg:flex flex-col leading-tight justify-center min-h-[44px] hover:opacity-80 transition-opacity text-left cursor-pointer"
           aria-label={t('navbar.goHome')}
         >
           <span className="text-base md:text-lg font-semibold text-foreground">{branding.appName}</span>
-          <span className="text-[10px] text-muted-foreground tracking-wide">{branding.tagline}</span>
+          <RotatingTagline />
         </button>
         {__DEV_MODE__ && (
           <span className="hidden sm:inline-flex items-center justify-center px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider bg-green-500/20 text-green-400 border border-green-500/30 rounded-full" title={t('layout.navbar.devModeTitle')}>
             DEV
           </span>
         )}
-        <a
-          href={branding.docsUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="hidden lg:flex items-center p-1.5 hover:bg-secondary rounded-md transition-colors"
-          aria-label={t('navbar.viewDocs')}
-          title={t('navbar.viewDocs')}
-        >
-          <ExternalLink className="w-3.5 h-3.5 text-muted-foreground" />
-        </a>
+        <Tooltip content={t('help.viewDocs')} side="bottom">
+          <a
+            href={branding.docsUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hidden lg:flex items-center p-1.5 hover:bg-secondary rounded-md transition-colors"
+            aria-label={t('navbar.viewDocs')}
+          >
+            <ExternalLink className="w-3.5 h-3.5 text-muted-foreground" />
+          </a>
+        </Tooltip>
       </div>
 
       {/* Search - hidden on small mobile; min-w-0 prevents layout overflow
@@ -119,7 +122,7 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
       {/* Right side — no shrink-0 here so the container participates in flex
            negotiation with the search bar, preventing overlap when the AI Mission
            button is visible (#4409). Individual critical items use shrink-0. */}
-      <div className="flex items-center gap-1 md:gap-3">
+      <div className="flex items-center gap-1 md:gap-3 min-w-0">
         {/* Core desktop items: md+ (768px) */}
         <div className="hidden md:flex items-center gap-2">
           {/* Unified Filter */}
@@ -130,27 +133,29 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
           <Suspense fallback={null}><AgentSelector compact /></Suspense>
         </div>
 
-        {/* Extended desktop items: lg+ (1024px) */}
-        <div className="hidden lg:flex items-center gap-2">
+        {/* Extended desktop items: xl+ (1280px) — moved from lg to xl to
+             prevent button overflow at the 1024px breakpoint (#10001). */}
+        <div className="hidden xl:flex items-center gap-2">
           {/* Update Indicator */}
           <UpdateIndicator />
 
           {/* AI Missions — opens the mission sidebar */}
           {!isSidebarOpen && (
-            <button
-              onClick={openSidebar}
-              className="relative flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg transition-colors bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 border border-purple-500/20"
-              aria-label={t('missionSidebar.openAIMissions')}
-              title={t('missionSidebar.openAIMissions')}
-            >
-              <Sparkles className="w-4 h-4" />
-              <span>{t('missionSidebar.aiMissions')}</span>
-              {missionsNeedingAttention > 0 && (
-                <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-5 h-5 text-[10px] font-bold bg-purple-500 text-white rounded-full animate-pulse">
-                  {missionsNeedingAttention}
-                </span>
-              )}
-            </button>
+            <Tooltip content={t('help.aiMissions')} side="bottom">
+              <button
+                onClick={openSidebar}
+                className="relative flex items-center gap-1.5 px-3 py-1.5 h-9 text-sm font-medium rounded-lg transition-colors bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 border border-purple-500/20"
+                aria-label={t('missionSidebar.openAIMissions')}
+              >
+                <Sparkles className="w-4 h-4" />
+                <span>{t('missionSidebar.aiMissions')}</span>
+                {missionsNeedingAttention > 0 && (
+                  <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-5 h-5 text-[10px] font-bold bg-purple-500 text-white rounded-full animate-pulse">
+                    {missionsNeedingAttention}
+                  </span>
+                )}
+              </button>
+            </Tooltip>
           )}
 
           {/* Visit Streak */}
@@ -170,26 +175,28 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
           <LearnDropdown />
 
           {/* Theme toggle */}
-          <button
-            onClick={toggleTheme}
-            className="p-2 shrink-0 hover:bg-secondary rounded-lg transition-colors"
-            title={t('navbar.themeToggle', { theme })}
-          >
-            {theme === 'dark' ? (
-              <Moon className="w-5 h-5 text-muted-foreground" />
-            ) : theme === 'light' ? (
-              <Sun className="w-5 h-5 text-amber-600 dark:text-yellow-400" />
-            ) : (
-              <Monitor className="w-5 h-5 text-muted-foreground" />
-            )}
-          </button>
+          <Tooltip content={t('help.themeToggle')} side="bottom">
+            <button
+              onClick={toggleTheme}
+              className="p-2 w-9 h-9 flex items-center justify-center shrink-0 hover:bg-secondary rounded-lg transition-colors"
+              aria-label={t('navbar.themeToggle', { theme })}
+            >
+              {theme === 'dark' ? (
+                <Moon className="w-5 h-5 text-muted-foreground" />
+              ) : theme === 'light' ? (
+                <Sun className="w-5 h-5 text-amber-600 dark:text-yellow-400" />
+              ) : (
+                <Monitor className="w-5 h-5 text-muted-foreground" />
+              )}
+            </button>
+          </Tooltip>
 
           {/* Alerts */}
           <AlertBadge />
         </div>
 
-        {/* Overflow menu — visible below lg for items hidden at narrow widths */}
-        <div className="relative lg:hidden shrink-0">
+        {/* Overflow menu — visible below xl for items hidden at narrow widths */}
+        <div className="relative xl:hidden shrink-0">
           <button
             onClick={() => setShowMobileMore(!showMobileMore)}
             className="p-2 min-w-[44px] min-h-[44px] hover:bg-secondary rounded-lg transition-colors"
@@ -201,18 +208,18 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
             <>
               {/* Backdrop */}
               <div
-                className="fixed inset-0 bg-black/60 backdrop-blur-sm z-overlay"
+                className="fixed inset-0 bg-black/60 backdrop-blur-xs z-overlay"
                 onClick={() => setShowMobileMore(false)}
               />
               {/* Bottom sheet menu on mobile */}
-              <div className={`fixed ${isMobile ? 'inset-x-0 bottom-0 rounded-t-2xl max-h-[60dvh]' : 'right-4 w-64 rounded-lg'} bg-card border border-border shadow-xl z-modal overflow-hidden`} style={isMobile ? undefined : { top: topOffset + NAVBAR_HEIGHT_PX }}>
+              <div className={`fixed ${isMobile ? 'inset-x-0 bottom-0 rounded-t-2xl max-h-[60vh] max-h-[60dvh]' : 'right-4 w-64 rounded-lg'} bg-card border border-border shadow-xl z-modal overflow-hidden`} style={isMobile ? undefined : { top: topOffset + NAVBAR_HEIGHT_PX }}>
                 {/* Drag handle for mobile */}
                 {isMobile && (
                   <div className="flex justify-center py-2">
                     <div className="w-10 h-1 bg-muted-foreground/30 rounded-full" />
                   </div>
                 )}
-                <div className={`${isMobile ? 'max-h-[calc(60dvh-24px)]' : ''} overflow-y-auto py-2`}>
+                <div className={`${isMobile ? 'max-h-[calc(60vh-24px)] max-h-[calc(60dvh-24px)]' : ''} overflow-y-auto py-2`}>
                   {/* Search on mobile */}
                   <div className="px-3 py-2 sm:hidden">
                     <Suspense fallback={null}><SearchDropdown /></Suspense>
@@ -233,7 +240,7 @@ export function Navbar({ topOffset = 0 }: NavbarProps) {
                     <div className="border-t border-border mx-3 my-1" />
                   </div>
 
-                  {/* Items hidden at <lg (1024px): AI missions, update, token usage, feature request, tour */}
+                  {/* Items hidden at <xl (1280px): AI missions, update, token usage, feature request, tour */}
                   {!isSidebarOpen && (
                     <div className="px-3 py-2">
                       <button

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { isBackendUnavailable } from '../lib/api'
 import { STORAGE_KEY_TOKEN } from '../lib/constants'
+import { LOCAL_AGENT_HTTP_URL } from '../lib/constants/network'
 
 export interface ClusterPermissions {
   isClusterAdmin: boolean
@@ -34,7 +35,8 @@ export interface CanIResponse {
 
 /** Cache TTL: 1 minute */
 const CACHE_TTL_MS = 60_000
-const API_BASE = import.meta.env.VITE_API_URL || ''
+/** Per-request timeout for permission checks (ms) */
+const PERMISSION_REQUEST_TIMEOUT_MS = 5000
 
 // Cache for permissions to avoid repeated API calls
 let permissionsCache: PermissionsSummary | null = null
@@ -69,11 +71,14 @@ export function usePermissions() {
     setError(null)
 
     try {
-      const response = await fetch(`${API_BASE}/api/permissions/summary`, {
+      // #7993 Phase 6: route permissions summary through kc-agent so the
+      // SelfSubjectAccessReviews run under the user's kubeconfig rather than
+      // the backend pod ServiceAccount when console is deployed in-cluster.
+      const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/permissions/summary`, {
         headers: {
           'Authorization': token ? `Bearer ${token}` : '',
           'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(5000) })
+        signal: AbortSignal.timeout(PERMISSION_REQUEST_TIMEOUT_MS) })
 
       if (!response.ok) {
         // Don't throw on 500 - just silently fail
@@ -99,9 +104,11 @@ export function usePermissions() {
   }, [fetchPermissions])
 
   // Check if user is cluster admin for a specific cluster
-  // If permissions data is not available for a cluster, assume admin (don't show warning)
+  // SECURITY: If permissions data is not available (fetch failed, network error),
+  // deny access (fail-closed). Only assume admin when backend is explicitly
+  // unavailable (demo mode) or no token is present.
   const isClusterAdmin = (cluster: string): boolean => {
-    if (!permissions?.clusters?.[cluster]) return true // Assume admin if no data
+    if (!permissions?.clusters?.[cluster]) return false // Fail-closed: deny when no data
     return permissions.clusters[cluster].isClusterAdmin
   }
 
@@ -170,7 +177,7 @@ export function useCanI() {
   const [error, setError] = useState<string | null>(null)
 
   const checkPermission = async (request: CanIRequest): Promise<CanIResponse> => {
-    // Skip if backend is known to be unavailable
+    // Skip if backend is known to be unavailable (demo mode)
     if (isBackendUnavailable()) {
       return { allowed: true } // Assume allowed in demo mode
     }
@@ -181,25 +188,33 @@ export function useCanI() {
 
     try {
       const token = localStorage.getItem(STORAGE_KEY_TOKEN)
-      const response = await fetch(`${API_BASE}/api/rbac/can-i`, {
+      // #7993 Phase 6: SelfSubjectAccessReview must run under the caller's
+      // kubeconfig, not the backend pod ServiceAccount — otherwise in-cluster
+      // it answers "can the pod SA do X?" instead of "can the user do X?".
+      const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/rbac/can-i`, {
         method: 'POST',
         headers: {
           'Authorization': token ? `Bearer ${token}` : '',
-          'Content-Type': 'application/json' },
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify(request),
-        signal: AbortSignal.timeout(5000) })
+        signal: AbortSignal.timeout(PERMISSION_REQUEST_TIMEOUT_MS) })
 
       if (!response.ok) {
-        // Silently fail on error - assume allowed in demo mode
-        return { allowed: true }
+        // SECURITY: fail-closed — deny permission when API returns error
+        const denied: CanIResponse = { allowed: false, reason: 'Permission check failed (API error)' }
+        setResult(denied)
+        return denied
       }
 
       const data: CanIResponse = await response.json()
       setResult(data)
       return data
     } catch {
-      // Silently fail - backend may be unavailable in demo mode
-      return { allowed: true }
+      // SECURITY: fail-closed — deny permission on network/timeout error
+      const denied: CanIResponse = { allowed: false, reason: 'Permission check failed (network error)' }
+      setResult(denied)
+      return denied
     } finally {
       setChecking(false)
     }

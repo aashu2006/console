@@ -57,7 +57,7 @@ export function KubecostOverview({ config: _config }: KubecostOverviewProps) {
 
       {/* Integration notice */}
       <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-green-500/10 border border-green-500/20 text-xs">
-        <AlertCircle className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
+        <AlertCircle className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
         <div>
           <p className="text-green-400 font-medium">Kubecost Integration</p>
           <p className="text-muted-foreground">
@@ -71,11 +71,11 @@ export function KubecostOverview({ config: _config }: KubecostOverviewProps) {
 
       {/* Cost overview */}
       <div className="grid grid-cols-2 gap-2 mb-3">
-        <div className="p-3 rounded-lg bg-gradient-to-r from-green-500/20 to-green-500/20 border border-green-500/30">
+        <div className="p-3 rounded-lg bg-linear-to-r from-green-500/20 to-green-500/20 border border-green-500/30">
           <p className="text-xs text-green-400 mb-1">{t('kubecostOverview.monthlyCost')}</p>
           <p className="text-xl font-bold text-foreground">${DEMO_COST_SUMMARY.totalMonthly.toLocaleString()}</p>
         </div>
-        <div className="p-3 rounded-lg bg-gradient-to-r from-purple-500/20 to-purple-500/20 border border-purple-500/30">
+        <div className="p-3 rounded-lg bg-linear-to-r from-purple-500/20 to-purple-500/20 border border-purple-500/30">
           <div className="flex items-center gap-1 mb-1">
             <p className="text-xs text-purple-400">Efficiency</p>
             <PieChart className="w-3 h-3 text-purple-400" />
@@ -109,7 +109,7 @@ export function KubecostOverview({ config: _config }: KubecostOverviewProps) {
 
       {/* Savings recommendations */}
       <div className="flex-1 overflow-y-auto">
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
           <p className="text-xs text-muted-foreground font-medium">{t('kubecostOverview.savingsRecommendations')}</p>
           <span className="flex items-center gap-1 text-xs text-green-400">
             <TrendingDown className="w-3 h-3" aria-hidden="true" />
@@ -128,7 +128,7 @@ export function KubecostOverview({ config: _config }: KubecostOverviewProps) {
               })}
               className="p-2 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-y-2">
                 <div className="flex items-center gap-2">
                   <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />
                   <span className="text-xs text-foreground group-hover:text-green-400">{rec.description}</span>
@@ -144,7 +144,7 @@ export function KubecostOverview({ config: _config }: KubecostOverviewProps) {
       </div>
 
       {/* Footer */}
-      <div className="mt-3 pt-2 border-t border-border/50 flex items-center justify-between text-xs text-muted-foreground">
+      <div className="mt-3 pt-2 border-t border-border/50 flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
         <span>{t('kubecostOverview.poweredBy')}</span>
         <a
           href="https://docs.kubecost.com/"

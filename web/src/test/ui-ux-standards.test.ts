@@ -67,15 +67,48 @@ const COMPONENTS_DIR = path.resolve(
 //   301 → 302: #6308 MissionBrowser close button on right issue ref
 //   302 → 303: #6309 upgrade confirm dialog issue ref
 //   303 → 304: #6366 ratchet drift — pre-existing unaccounted-for raw hex from before 303 bump, not introduced by #6365
+//   304 → 306: issue #6774 loading/error states — reverted to 304 in issue #6778 (false positives from issue-ref comments)
+//   304 → 307: PR #6854 introduced 3 new hex refs (not real color violations)
+//   307 → 309: issue #6882 ratchet drift — pre-existing false positives from issue-ref comments
+//   309 → 313: PR #6977 introduced 4 new hex refs (terminal theme colors, widget export)
 //
 // When you bump this number, append a one-line entry above so future
 // bumps stay grep-able and reviewers can tell at a glance whether a
 // change is a real new violation or just a comment-level reference.
-const EXPECTED_RAW_HEX_COUNT = 304
+//   313 → 319: PR #7085 mission state fixes — issue-ref comments misclassified as hex colors
+//   319 → 320: PR #7376 batch resolve — one new hex color reference
+//   320 → 265: issue #8000 — detector now skips comment lines outright,
+//              eliminating all issue-ref false positives like "issue #7865"
+//              that incremented the ratchet over many previous bumps. The
+//              new baseline is the count of real `#RRGGBB` literals only.
+//   270 → 271: PR #8550 ratchet drift — pre-existing hex literal not introduced by this PR
+//   271 → 269: PR #8546 — fixed comment continuation lines in Login.tsx
+//              that tripped false-positive hex detection (#6338, #3761 refs)
+//   269 → 273: PR #8635 — widget export modal card preview thumbnails
+//   273 → 274: PR #9841 — DashboardHeader compliance pages added one new hex fallback
+//   274 → 275: PR #9941 — Flatcar card added one hex color
+//   275 → 282: PR #10047 — ChangeTimeline card ECharts event type palette (7 hex colors)
+//   282 → 262: PR #10260 — replaced 20 raw hex colors in chart files with shared constants
+//   262 → 256: PR #10266 — extracted Gauge status colors and ChangeTimeline fallback to constants
+const EXPECTED_RAW_HEX_COUNT = 256
 const EXPECTED_RAW_RGBA_COUNT = 104
-const EXPECTED_ARBITRARY_TW_COLOR_COUNT = 22
-const EXPECTED_INLINE_STYLE_COLOR_COUNT = 213
-const EXPECTED_RAW_FONT_SIZE_COUNT = 80
+//   22 → 19: PR #8547 — replaced 3 arbitrary Tailwind hex colors in Login.tsx
+//            (bg-[#0a0a0a], from-[#0a0f1c]) with semantic bg-background/from-background
+//   19 →  0: PR #10271 — added linkedin/terminal/glass-overlay to Tailwind config,
+//            replaced all 9 remaining arbitrary hex colors across 6 files
+const EXPECTED_ARBITRARY_TW_COLOR_COUNT = 0
+// Inline style color ratchet — bump history:
+//   213 → 215: Drasi reactive graph (PRs #7832, #7857) — two new
+//              echarts/flow-node inline colors not covered by theming utils.
+//   215 → 229: PR #8635 — widget export modal card preview thumbnails
+const EXPECTED_INLINE_STYLE_COLOR_COUNT = 229
+// 80 → 96: PR #8635 — widget export modal card preview thumbnails use inline
+//           fontSize for pixel-accurate static SVG-like renderings (not DOM text).
+//  96 → 3: PR #10260 — replaced 93 raw fontSize values in chart/card files with
+//          shared constants (CHART_AXIS_FONT_SIZE, CHART_BODY_FONT_SIZE, etc.)
+//   3 → 0: PR #10266 — extracted last 3 raw fontSize (CHART_LEGEND_FONT_SIZE,
+//          CLUSTER_MARKER_FONT_SIZE) to shared constants
+const EXPECTED_RAW_FONT_SIZE_COUNT = 0
 
 /** Max snippet length for readable output */
 const MAX_SNIPPET_LENGTH = 120
@@ -161,8 +194,16 @@ function shouldSkipLine(line: string): boolean {
   // Skip empty lines
   if (stripped.length === 0) return true
 
-  // Skip comments
-  if (stripped.startsWith('//') || stripped.startsWith('/*') || stripped.startsWith('*')) return true
+  // Skip comments (line, block, block-continuation, and JSX `{/* ... */}`).
+  // Issue-ref tokens like `#7865` otherwise trip the raw-hex detector.
+  if (
+    stripped.startsWith('//') ||
+    stripped.startsWith('/*') ||
+    stripped.startsWith('*') ||
+    stripped.startsWith('{/*')
+  ) {
+    return true
+  }
 
   // Skip import statements
   if (stripped.startsWith('import ')) return true
@@ -215,8 +256,9 @@ function isInCanvasContext(line: string): boolean {
 
 /**
  * Detect raw hex color values (#xxx, #xxxxxx, #xxxxxxxx).
- * Skips SVG contexts, canvas contexts, CSS var declarations, and string
- * template expressions.
+ * Skips SVG contexts, canvas contexts, CSS var declarations, string
+ * template expressions, and comments (which commonly contain issue
+ * refs like "#7865" that look like 4-digit hex colors — issue 8000).
  */
 function detectRawHex(line: string): ViolationCategory | null {
   const stripped = line.trim()
@@ -224,6 +266,9 @@ function detectRawHex(line: string): ViolationCategory | null {
   // Skip SVG and canvas contexts
   if (isInSvgContext(stripped)) return null
   if (isInCanvasContext(stripped)) return null
+
+  // Comment lines (including JSX `{/* ... */}`) are already filtered upstream
+  // by shouldSkipLine — duplicated here previously, removed to avoid drift.
 
   // Skip className attributes (Tailwind classes may contain color names, not hex)
   if (/className\s*=/.test(stripped) && !/#[0-9a-fA-F]{3,8}/.test(stripped)) return null

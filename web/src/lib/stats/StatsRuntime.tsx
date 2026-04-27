@@ -44,6 +44,7 @@ import {
   COLOR_CLASSES,
   VALUE_COLORS,
   formatValue } from './types'
+import { getResponsiveGridCols } from './gridUtils'
 
 // ============================================================================
 // Stats Registry
@@ -168,12 +169,23 @@ export function StatsRuntime({
   // Get visible blocks (respect visible flag)
   const visibleBlocks = blocks.filter((b) => b.visible !== false)
 
-  // Manage collapsed state with localStorage persistence
+  // Manage collapsed state with localStorage persistence.
+  // The storage key says "collapsed", so the stored value represents
+  // collapsed state (true = collapsed). Previously this file stored
+  // `isExpanded` under the "-stats-collapsed" key, which meant the toggle
+  // read back inverted after a reload and sibling components
+  // (UnifiedStatsSection) that DID store the collapsed sense disagreed on
+  // the same key. Read and write both now use the collapsed sense.
   const storageKey = collapsedStorageKey || `kubestellar-${type}-stats-collapsed`
   const [isExpanded, setIsExpanded] = useState(() => {
     try {
       const saved = localStorage.getItem(storageKey)
-      return saved !== null ? JSON.parse(saved) : (defaultCollapsed ? false : defaultExpanded)
+      if (saved !== null) {
+        const parsed = JSON.parse(saved) as boolean
+        // parsed represents COLLAPSED state
+        return !parsed
+      }
+      return defaultCollapsed ? false : defaultExpanded
     } catch {
       return defaultCollapsed ? false : defaultExpanded
     }
@@ -183,7 +195,8 @@ export function StatsRuntime({
     const newValue = !isExpanded
     setIsExpanded(newValue)
     try {
-      localStorage.setItem(storageKey, JSON.stringify(newValue))
+      // Store COLLAPSED state to match the storage-key semantics.
+      localStorage.setItem(storageKey, JSON.stringify(!newValue))
     } catch {
       // Ignore storage errors
     }
@@ -233,12 +246,7 @@ export function StatsRuntime({
       return `grid-cols-2 md:grid-cols-${grid.columns}`
     }
 
-    const count = visibleBlocks.length
-    if (count <= 4) return 'grid-cols-2 md:grid-cols-4'
-    if (count <= 5) return 'grid-cols-2 md:grid-cols-5'
-    if (count <= 6) return 'grid-cols-2 md:grid-cols-3 lg:grid-cols-6'
-    if (count <= 8) return 'grid-cols-2 md:grid-cols-4 lg:grid-cols-8'
-    return 'grid-cols-2 md:grid-cols-5 lg:grid-cols-10'
+    return getResponsiveGridCols(visibleBlocks.length)
   })()
 
   return (

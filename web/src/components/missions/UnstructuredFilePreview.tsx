@@ -1,3 +1,5 @@
+import { COPY_FEEDBACK_TIMEOUT_MS } from '../../lib/constants'
+
 /**
  * Unstructured File Preview
  *
@@ -17,8 +19,10 @@ import {
   CheckCircle,
   AlertTriangle,
   Terminal,
-  Copy } from 'lucide-react'
+  Copy,
+  Rocket } from 'lucide-react'
 import { cn } from '../../lib/cn'
+import { useTranslation } from 'react-i18next'
 import type { MissionExport } from '../../lib/missions/types'
 import type { UnstructuredPreview } from '../../lib/missions/fileParser'
 import type { ApiGroupMapping } from '../../lib/missions/apiGroupMapping'
@@ -43,6 +47,10 @@ interface UnstructuredFilePreviewProps {
   fileName: string
   onConvert: (mission: MissionExport) => void
   onBack: () => void
+  /** When set, this file is from a Kubara chart — enables the "Use in Mission Control" CTA */
+  kubaraChartName?: string
+  /** Callback to add the Kubara chart to Mission Control and open Phase 1 */
+  onUseInMissionControl?: (chartName: string) => void
 }
 
 // ============================================================================
@@ -56,7 +64,10 @@ export function UnstructuredFilePreview({
   detectedProjects,
   fileName,
   onConvert,
-  onBack }: UnstructuredFilePreviewProps) {
+  onBack,
+  kubaraChartName,
+  onUseInMissionControl }: UnstructuredFilePreviewProps) {
+  const { t } = useTranslation()
   const [showFullContent, setShowFullContent] = useState(false)
   const [copied, setCopied] = useState(false)
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -80,8 +91,7 @@ export function UnstructuredFilePreview({
     await copyToClipboard(content)
     setCopied(true)
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
-    const COPY_FEEDBACK_MS = 2_000
-    copyTimerRef.current = setTimeout(() => setCopied(false), COPY_FEEDBACK_MS)
+    copyTimerRef.current = setTimeout(() => setCopied(false), COPY_FEEDBACK_TIMEOUT_MS)
   }
 
   return (
@@ -95,7 +105,7 @@ export function UnstructuredFilePreview({
         >
           <ArrowLeft className="w-4 h-4" />
         </button>
-        <FormatIcon className="w-5 h-5 text-blue-400 flex-shrink-0" />
+        <FormatIcon className="w-5 h-5 text-blue-400 shrink-0" />
         <div className="min-w-0">
           <h3 className="font-medium text-sm truncate">{fileName}</h3>
           <p className="text-xs text-muted-foreground">
@@ -138,9 +148,9 @@ export function UnstructuredFilePreview({
             {preview.detectedApiGroups.map((d, i) => (
               <div key={`${d.apiVersion}-${d.kind}-${i}`} className="flex items-center gap-2 text-xs">
                 {d.project ? (
-                  <CheckCircle className="w-3 h-3 text-green-400 flex-shrink-0" />
+                  <CheckCircle className="w-3 h-3 text-green-400 shrink-0" />
                 ) : (
-                  <AlertTriangle className="w-3 h-3 text-yellow-400 flex-shrink-0" />
+                  <AlertTriangle className="w-3 h-3 text-yellow-400 shrink-0" />
                 )}
                 <span className="font-mono text-muted-foreground">{d.kind}</span>
                 <span className="text-muted-foreground/60">({d.apiVersion})</span>
@@ -199,6 +209,29 @@ export function UnstructuredFilePreview({
         </div>
       )}
 
+      {/* Kubara CTA: Use in Mission Control (#8483) */}
+      {kubaraChartName && onUseInMissionControl && (
+        <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 space-y-2">
+          <div className="flex items-center gap-2 text-sm font-medium text-emerald-300">
+            <Rocket className="w-4 h-4" />
+            {t('layout.missionSidebar.kubaraBadge')} — {kubaraChartName}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t('layout.missionSidebar.useInMissionControlDescription')}
+          </p>
+          <button
+            onClick={() => onUseInMissionControl(kubaraChartName)}
+            className={cn(
+              'flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-colors',
+              'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 hover:bg-emerald-500/20'
+            )}
+          >
+            <Rocket className="w-3.5 h-3.5" />
+            {t('layout.missionSidebar.useInMissionControl')}
+          </button>
+        </div>
+      )}
+
       {/* Action: Convert with AI */}
       <div className="flex items-center gap-2">
         <button
@@ -252,7 +285,7 @@ export function UnstructuredFilePreview({
             </button>
           )}
         </div>
-        <pre className="p-3 text-xs font-mono text-muted-foreground overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap break-words">
+        <pre className="p-3 text-xs font-mono text-muted-foreground overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap wrap-break-word">
           {displayContent}
           {isTruncated && (
             <span className="text-muted-foreground/40">

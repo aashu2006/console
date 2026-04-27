@@ -180,7 +180,7 @@ function DeploymentIssuesInternal({ config }: DeploymentIssuesProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <StatusBadge color="red" title={t('deploymentIssues.issuesTitle', { count: rawIssues.length })}>
             {t('deploymentIssues.nIssues', { count: rawIssues.length })}
@@ -240,13 +240,13 @@ function DeploymentIssuesInternal({ config }: DeploymentIssuesProps) {
               title={t('deploymentIssues.clickToView', { name: issue.name })}
             >
               <div className="flex items-start gap-3 group">
-                <div className="p-2 rounded-lg bg-red-500/20 flex-shrink-0" title={iconTooltip}>
+                <div className="p-2 rounded-lg bg-red-500/20 shrink-0" title={iconTooltip}>
                   <Icon className="w-4 h-4 text-red-400" />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <ClusterBadge cluster={issue.cluster || 'unknown'} />
-                    <span className="text-xs text-muted-foreground" title={`Namespace: ${issue.namespace}`}>{issue.namespace}</span>
+                  <div className="flex items-center gap-2 mb-1 min-w-0">
+                    <ClusterBadge cluster={issue.cluster || 'unknown'} className="shrink min-w-0" />
+                    <span className="text-xs text-muted-foreground truncate" title={`Namespace: ${issue.namespace}`}>{issue.namespace}</span>
                   </div>
                   <p className="text-sm font-medium text-foreground truncate" title={issue.name}>{issue.name}</p>
                   <div className="flex items-center gap-2 mt-2 flex-wrap">

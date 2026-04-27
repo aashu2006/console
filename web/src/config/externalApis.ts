@@ -46,6 +46,8 @@ export const AI_PROVIDER_DOCS = {
   continue: 'https://continue.dev',
   raycast: 'https://raycast.com',
   'open-webui': 'https://github.com/open-webui/open-webui',
+  openrouter: 'https://openrouter.ai/keys',
+  groq: 'https://console.groq.com/keys',
 } as const
 
 /**

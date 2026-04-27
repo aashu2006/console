@@ -50,9 +50,8 @@ permissions: read-all
 jobs:
   auto-qa:
     permissions:
-      contents: write
+      contents: read
       issues: write
-      pull-requests: write
       actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -61,19 +60,19 @@ jobs:
       # ── Setup ──────────────────────────────────────────────────────
 
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -261,19 +260,39 @@ jobs:
           # Get all dependencies from package.json
           DEPS=$(jq -r '.dependencies // {} | keys[]' package.json)
 
+          # Packages used via dynamic import(), web workers, Netlify Functions,
+          # peer dependencies, or build tooling — not discoverable by grepping
+          # src/ for static import statements. Maintain this list when adding
+          # new indirect deps to avoid false-positive auto-QA issues.
+          INDIRECT_DEPS="@netlify/blobs @sqlite.org/sqlite-wasm fflate googleapis react-is sucrase"
+
           for dep in $DEPS; do
             # Skip known framework deps that won't appear as direct imports
             case "$dep" in
               react|react-dom|react-scripts|vite|@vitejs/*|@types/*|typescript) continue ;;
             esac
 
-            # Search for import/require of this dep in src/
-            COUNT=$(grep -rl "from ['\"]${dep}" src/ 2>/dev/null | wc -l || echo "0")
-            COUNT2=$(grep -rl "require(['\"]${dep}" src/ 2>/dev/null | wc -l || echo "0")
-            TOTAL=$((COUNT + COUNT2))
+            # Skip packages on the indirect-dependency allowlist
+            SKIP=false
+            for indirect in $INDIRECT_DEPS; do
+              if [ "$dep" = "$indirect" ]; then
+                SKIP=true
+                break
+              fi
+            done
+            if [ "$SKIP" = "true" ]; then
+              continue
+            fi
+
+            # Search for import/require in src/ AND netlify/functions/
+            COUNT=$(grep -rl "from ['\"]${dep}" src/ netlify/functions/ 2>/dev/null | wc -l || echo "0")
+            COUNT2=$(grep -rl "require(['\"]${dep}" src/ netlify/functions/ 2>/dev/null | wc -l || echo "0")
+            # Also check for dynamic import() calls
+            COUNT3=$(grep -rl "import(['\"]${dep}" src/ netlify/functions/ 2>/dev/null | wc -l || echo "0")
+            TOTAL=$((COUNT + COUNT2 + COUNT3))
 
             if [ "$TOTAL" -eq 0 ]; then
-              ISSUES="${ISSUES}  - \`${dep}\` — no direct imports found in src/\n"
+              ISSUES="${ISSUES}  - \`${dep}\` — no direct imports found in src/ or netlify/functions/\n"
             fi
           done
 
@@ -665,19 +684,25 @@ jobs:
         working-directory: web
         continue-on-error: true
         run: |
-          echo "Checking for UI elements that could benefit from tooltips..."
+          echo "Checking for technical abbreviations rendered as JSX text without a wrapping acronym/tooltip..."
           ISSUES=""
 
-          # Find abbreviated or technical text without tooltips
-          ABBREV=$(grep -rn "CPU\|RAM\|OOM\|CRD\|RBAC\|PVC\|PV\b\|HPA\|VPA\|SLO\|SLI\|SLA\|MTTR\|MTTF" src/ --include="*.tsx" 2>/dev/null | grep -v "tooltip\|Tooltip\|title=" | grep -v node_modules | grep -v "\.test\." | head -15 || true)
+          # Issue 8970: the previous grep matched abbreviations anywhere
+          # (identifiers, state-machine strings, comparisons, type names),
+          # producing ~92% false positives (30-day Copilot acceptance 8%).
+          # Constrain to JSX text — an abbreviation appearing directly between
+          # > and < — which is what the user actually sees and what a tooltip
+          # would annotate. Skip matches already wrapped in <TechnicalAcronym>
+          # (the project's established affordance for acronym explanation).
+          ABBREV_PATTERN='CPU|RAM|OOM|CRD|RBAC|PVC|PV|HPA|VPA|SLO|SLI|SLA|MTTR|MTTF'
+          ABBREV=$(grep -rnP ">\s*(${ABBREV_PATTERN})\b[^<]{0,60}<" src/ --include="*.tsx" 2>/dev/null \
+            | grep -v node_modules \
+            | grep -v "\.test\." \
+            | grep -v "\.stories\." \
+            | grep -v "TechnicalAcronym" \
+            | head -15 || true)
           if [ -n "$ABBREV" ]; then
-            ISSUES="${ISSUES}### Technical abbreviations without tooltips\n\`\`\`\n${ABBREV}\n\`\`\`\n\n"
-          fi
-
-          # Find status indicators without explanation
-          STATUS=$(grep -rn "status\|Status" src/ --include="*.tsx" 2>/dev/null | grep -i "badge\|chip\|indicator\|dot" | grep -v "tooltip\|Tooltip\|title=" | grep -v node_modules | head -10 || true)
-          if [ -n "$STATUS" ]; then
-            ISSUES="${ISSUES}### Status indicators without tooltips\n\`\`\`\n${STATUS}\n\`\`\`\n\n"
+            ISSUES="${ISSUES}### Technical abbreviations rendered as JSX text without a wrapping acronym/tooltip\nWrap each in \`<TechnicalAcronym term=\"...\">\` (see \`web/src/components/ui/TechnicalAcronym.tsx\`) so hovering explains the term.\n\`\`\`\n${ABBREV}\n\`\`\`\n\n"
           fi
 
           if [ -n "$ISSUES" ]; then
@@ -696,19 +721,35 @@ jobs:
         working-directory: web
         continue-on-error: true
         run: |
-          echo "Checking for single-cluster assumptions..."
+          echo "Checking for single-cluster-assumption red flags..."
           ISSUES=""
 
-          # Find hardcoded cluster references
-          SINGLE=$(grep -rn "cluster\b" src/ --include="*.ts" --include="*.tsx" 2>/dev/null | grep -v "clusters\|Clusters\|multi\|Multi\|clusterName\|clusterId\|ClusterList\|ClusterCard" | grep -vi "type\|interface\|import" | grep -v node_modules | grep -v "\.test\." | head -15 || true)
-          if [ -n "$SINGLE" ]; then
-            ISSUES="${ISSUES}### References that may assume single cluster\n\`\`\`\n${SINGLE}\n\`\`\`\n\n"
+          # Issue 8970: the previous heuristics flagged legitimate per-cluster
+          # code (any .map(cluster => ...) rendering a list, any occurrence of
+          # the word "cluster" not followed by "s") as bugs, producing ~91%
+          # false positives (30-day Copilot acceptance 9%). Narrow to concrete
+          # red flags that reliably indicate assuming exactly one cluster:
+          #   1) Indexing [0] on a clusters-array variable (picking the first
+          #      cluster silently — the known failure mode, see GitOps.tsx).
+          #   2) Hardcoded cluster-name comparisons against literal strings.
+
+          FIRST_CLUSTER=$(grep -rnP '\b(clusters|deduplicatedClusters|reachableClusters|activeClusters)\s*\[\s*0\s*\]' src/ --include="*.ts" --include="*.tsx" 2>/dev/null \
+            | grep -v node_modules \
+            | grep -v "\.test\." \
+            | grep -v "\.spec\." \
+            | grep -vE ":[0-9]+:\s*(//|\*)" \
+            | head -10 || true)
+          if [ -n "$FIRST_CLUSTER" ]; then
+            ISSUES="${ISSUES}### Picking the first cluster with \`[0]\`\nThese silently ignore all but the first cluster. Either iterate all clusters or make the choice explicit (e.g., a user-selected cluster prop).\n\`\`\`\n${FIRST_CLUSTER}\n\`\`\`\n\n"
           fi
 
-          # Find missing aggregation (forEach without reduce/map across clusters)
-          NO_AGG=$(grep -rn "\.forEach\|\.map\|\.filter" src/ --include="*.ts" --include="*.tsx" 2>/dev/null | grep -i "cluster\|namespace" | grep -v "\.reduce\|aggregate\|total\|sum" | grep -v node_modules | head -10 || true)
-          if [ -n "$NO_AGG" ]; then
-            ISSUES="${ISSUES}### Cluster iterations without aggregation\n\`\`\`\n${NO_AGG}\n\`\`\`\n\n"
+          HARDCODED_CLUSTER=$(grep -rnP "clusterName\s*(===|==|!==|!=)\s*['\"][a-z][a-z0-9_-]{1,}['\"]" src/ --include="*.ts" --include="*.tsx" 2>/dev/null \
+            | grep -v node_modules \
+            | grep -v "\.test\." \
+            | grep -v "\.spec\." \
+            | head -10 || true)
+          if [ -n "$HARDCODED_CLUSTER" ]; then
+            ISSUES="${ISSUES}### Hardcoded cluster-name comparisons\nMatching against a literal cluster name breaks when the same code runs in clusters with different names.\n\`\`\`\n${HARDCODED_CLUSTER}\n\`\`\`\n\n"
           fi
 
           if [ -n "$ISSUES" ]; then
@@ -2049,8 +2090,11 @@ jobs:
             ISSUES="${ISSUES}### API calls without error handling\nThese may cause console errors on network failure:\n${FETCH_NO_ERROR}\n\n"
           fi
 
-          # Find components without ErrorBoundary wrapping
-          COMPLEX_NO_BOUNDARY=$(for f in $(find src/components/cards -name "*.tsx" 2>/dev/null | head -30); do
+          # Find components without ErrorBoundary wrapping.
+          # Skip src/components/cards/ — all dynamic cards are wrapped by
+          # DynamicCardErrorBoundary in DynamicCard.tsx, so the per-file grep
+          # for "ErrorBoundary" produces false positives for registered cards.
+          COMPLEX_NO_BOUNDARY=$(for f in $(find src/components -name "*.tsx" -not -path "*/cards/*" 2>/dev/null | head -30); do
             LINES=$(wc -l < "$f" 2>/dev/null || echo "0")
             if [ "$LINES" -gt 100 ]; then
               HAS_BOUNDARY=$(grep -l "ErrorBoundary\|error.*boundary\|componentDidCatch" "$f" 2>/dev/null || true)
@@ -2064,10 +2108,28 @@ jobs:
             ISSUES="${ISSUES}### Complex components without ErrorBoundary\nWrap in ErrorBoundary to prevent full-page crashes:\n${COMPLEX_NO_BOUNDARY}\n\n"
           fi
 
-          # Find console.error usage without proper error handling
-          CONSOLE_ERROR_ONLY=$(grep -rn "console\.error" src/ --include="*.tsx" --include="*.ts" 2>/dev/null | \
+          # Find console.error usage without proper error handling.
+          # Check a 4-line window (the match line + 3 following) for user-visible
+          # handlers — the handler (showToast, setXxxError, fallback) is almost
+          # always on the next line, not the same one, so a line-only grep -v
+          # misses them. Patterns excluded: showToast, set<Name>Error,
+          # setYamlContent, generateMock* fallbacks, fallback/Fallback.
+          HANDLER_PATTERN='showToast|set[A-Z][a-zA-Z_]*Error|setYamlContent|generateMock|[Ff]allback'
+          CONSOLE_ERROR_CANDIDATES=$(grep -rn "console\.error" src/ --include="*.tsx" --include="*.ts" 2>/dev/null | \
             grep -v "node_modules\|test\|spec" | \
-            grep -v "setError\|onError\|ErrorBoundary\|throw" | head -15 || true)
+            grep -v "setError\|onError\|ErrorBoundary\|throw" || true)
+          CONSOLE_ERROR_ONLY=""
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            file="${entry%%:*}"
+            rest="${entry#*:}"
+            lineno="${rest%%:*}"
+            ctx=$(sed -n "${lineno},$((lineno + 3))p" "$file" 2>/dev/null)
+            if ! echo "$ctx" | grep -qE "$HANDLER_PATTERN"; then
+              CONSOLE_ERROR_ONLY="${CONSOLE_ERROR_ONLY}${entry}"$'\n'
+            fi
+          done <<< "$CONSOLE_ERROR_CANDIDATES"
+          CONSOLE_ERROR_ONLY=$(echo "$CONSOLE_ERROR_ONLY" | sed '/^$/d' | head -15)
 
           if [ -n "$CONSOLE_ERROR_ONLY" ]; then
             COUNT=$(echo "$CONSOLE_ERROR_ONLY" | wc -l | tr -d ' ')
@@ -3106,12 +3168,24 @@ jobs:
           echo "Checking for ARIA gaps..."
           ISSUES=""
 
-          # Find role="button" without aria-label
-          ROLE_NO_LABEL=$(grep -rn 'role="button"' src/ --include="*.tsx" 2>/dev/null | while read line; do
+          # Number of lines after the attribute to scan for aria-label/title.
+          # JSX props commonly span multiple lines; a 10-line window catches the
+          # common pattern of role="button" followed by aria-label and handlers.
+          ARIA_WINDOW_LINES=10
+          # Find role="button" without aria-label within the JSX element window.
+          # Exclude test files — they may construct synthetic role=button mocks.
+          ROLE_NO_LABEL=$(grep -rn 'role="button"' src/ --include="*.tsx" 2>/dev/null | \
+            grep -v "__tests__" | grep -v "\.test\.tsx:" | \
+            while read line; do
             FILE=$(echo "$line" | cut -d: -f1)
             LINE_NO=$(echo "$line" | cut -d: -f2)
-            LINE_CONTENT=$(sed -n "${LINE_NO}p" "$FILE" 2>/dev/null)
-            HAS_LABEL=$(echo "$LINE_CONTENT" | grep -E "aria-label|aria-labelledby|title=" || true)
+            # Look at a window around the match: 3 lines before (for aria-label
+            # listed above role) and ARIA_WINDOW_LINES after.
+            START=$((LINE_NO - 3))
+            if [ $START -lt 1 ]; then START=1; fi
+            END=$((LINE_NO + ARIA_WINDOW_LINES))
+            CONTEXT=$(sed -n "${START},${END}p" "$FILE" 2>/dev/null)
+            HAS_LABEL=$(echo "$CONTEXT" | grep -E "aria-label|aria-labelledby|title=" || true)
             if [ -z "$HAS_LABEL" ]; then
               RELATIVE=$(echo "$FILE" | sed 's|^src/||')
               echo "  - \`${RELATIVE}:${LINE_NO}\`"
@@ -3123,15 +3197,21 @@ jobs:
           fi
 
           # Find icon-only buttons without labels
-          ICON_BUTTON_NO_LABEL=$(grep -rn "<button" src/ --include="*.tsx" 2>/dev/null | while read line; do
+          # Window for scanning inside a <button ...> element for aria-label,
+          # title, or visible text. Wider than the role check because buttons
+          # with long className expressions push the content further down.
+          ICON_BUTTON_WINDOW_LINES=12
+          ICON_BUTTON_NO_LABEL=$(grep -rn "<button" src/ --include="*.tsx" 2>/dev/null | \
+            grep -v "__tests__" | grep -v "\.test\.tsx:" | \
+            while read line; do
             FILE=$(echo "$line" | cut -d: -f1)
             LINE_NO=$(echo "$line" | cut -d: -f2)
-            # Get button content (next 3 lines)
-            CONTEXT=$(sed -n "${LINE_NO},$((LINE_NO + 3))p" "$FILE" 2>/dev/null)
+            # Get button content (next N lines)
+            CONTEXT=$(sed -n "${LINE_NO},$((LINE_NO + ICON_BUTTON_WINDOW_LINES))p" "$FILE" 2>/dev/null)
             # Check if it only contains an icon
             HAS_ICON=$(echo "$CONTEXT" | grep -E "Icon|<[A-Z][a-z]+.*className.*w-[0-9]" || true)
             HAS_TEXT=$(echo "$CONTEXT" | grep -E ">[A-Za-z]|{['\"]" || true)
-            HAS_LABEL=$(echo "$CONTEXT" | grep -E "aria-label|title=" || true)
+            HAS_LABEL=$(echo "$CONTEXT" | grep -E "aria-label|aria-labelledby|title=" || true)
             if [ -n "$HAS_ICON" ] && [ -z "$HAS_TEXT" ] && [ -z "$HAS_LABEL" ]; then
               RELATIVE=$(echo "$FILE" | sed 's|^src/||')
               echo "  - \`${RELATIVE}:${LINE_NO}\`"
@@ -3142,13 +3222,21 @@ jobs:
             ISSUES="${ISSUES}### Icon-only buttons without aria-label\n${ICON_BUTTON_NO_LABEL}\n\n"
           fi
 
-          # Find modals/dialogs without proper ARIA
-          MODAL_NO_ARIA=$(grep -rln "Modal\|Dialog\|isOpen\|isVisible" src/ --include="*.tsx" 2>/dev/null | while read f; do
-            HAS_ROLE=$(grep -l 'role="dialog"\|role="alertdialog"\|aria-modal' "$f" 2>/dev/null || true)
+          # Find modals/dialogs without proper ARIA.
+          # Exclude test files, tooltip/popover components, and files that only
+          # re-export a dialog from a child component. True modals typically
+          # contain both a portal/overlay pattern AND an "isOpen" prop.
+          MODAL_NO_ARIA=$(grep -rln "Modal\|Dialog" src/ --include="*.tsx" 2>/dev/null | \
+            grep -v "__tests__" | grep -v "\.test\.tsx$" | \
+            grep -v "Tooltip" | grep -v "Popover" | grep -v "Dropdown" | \
+            while read f; do
+            HAS_ROLE=$(grep -l 'role="dialog"\|role="alertdialog"\|role="menu"\|role="listbox"\|role="tooltip"\|aria-modal' "$f" 2>/dev/null || true)
             if [ -z "$HAS_ROLE" ]; then
-              # Only flag if it looks like a modal component
-              IS_MODAL=$(grep -l "portal\|Portal\|overlay\|Overlay\|backdrop" "$f" 2>/dev/null || true)
-              if [ -n "$IS_MODAL" ]; then
+              # Require BOTH a portal/overlay indicator AND an isOpen-style prop
+              # to reduce false positives against non-modal panels.
+              HAS_PORTAL=$(grep -l "createPortal\|backdrop\|overlay\|Overlay" "$f" 2>/dev/null || true)
+              HAS_OPEN_PROP=$(grep -E "isOpen[ :=]|open[ :=][ ]*\{|onClose" "$f" 2>/dev/null || true)
+              if [ -n "$HAS_PORTAL" ] && [ -n "$HAS_OPEN_PROP" ]; then
                 RELATIVE=$(echo "$f" | sed 's|^src/||')
                 echo "  - \`${RELATIVE}\`"
               fi
@@ -3438,7 +3526,7 @@ jobs:
       # ── Issue Creation ──────────────────────────────────────────────
 
       - name: Create issues for failures
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           BUILD_OUTCOME: ${{ steps.build_check.outcome }}
           LINT_OUTCOME: ${{ steps.lint_check.outcome }}
@@ -4571,16 +4659,46 @@ jobs:
 
             core.info(`${checks.length} finding(s) to process (focus: ${focusArea}). Creating issues...`);
 
+            // Rate-limit-aware retry helper for GitHub API calls.
+            // Waits for x-ratelimit-reset on 403/429, with exponential backoff fallback.
+            const MAX_RETRIES = 3;
+            const INITIAL_BACKOFF_MS = 5000;
+            async function withRetry(fn, label = 'API call') {
+              for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                  return await fn();
+                } catch (err) {
+                  const isRateLimit = (err.status === 403 || err.status === 429) &&
+                    (err.message || '').toLowerCase().includes('rate limit');
+                  if (!isRateLimit || attempt === MAX_RETRIES) throw err;
+
+                  // Calculate wait time from reset header or use exponential backoff
+                  const resetEpoch = err.response?.headers?.['x-ratelimit-reset'];
+                  const backoffMs = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+                  let waitMs = backoffMs;
+                  if (resetEpoch) {
+                    const resetMs = parseInt(resetEpoch, 10) * 1000 - Date.now();
+                    const RATE_LIMIT_BUFFER_MS = 1000;
+                    waitMs = Math.max(resetMs + RATE_LIMIT_BUFFER_MS, backoffMs);
+                  }
+                  const MAX_WAIT_MS = 120000;
+                  waitMs = Math.min(waitMs, MAX_WAIT_MS);
+                  core.warning(`${label}: rate limited (attempt ${attempt + 1}/${MAX_RETRIES}), waiting ${Math.round(waitMs / 1000)}s...`);
+                  await new Promise(resolve => setTimeout(resolve, waitMs));
+                }
+              }
+            }
+
             // Fetch both open AND recently closed issues to prevent duplicates after PR merges
             const [{ data: openIssues }, { data: closedIssues }] = await Promise.all([
-              github.rest.issues.listForRepo({
+              withRetry(() => github.rest.issues.listForRepo({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 state: 'open',
                 labels: 'auto-qa',
                 per_page: 100,
-              }),
-              github.rest.issues.listForRepo({
+              }), 'list open issues'),
+              withRetry(() => github.rest.issues.listForRepo({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 state: 'closed',
@@ -4588,7 +4706,7 @@ jobs:
                 per_page: 50,
                 sort: 'updated',
                 direction: 'desc',
-              }),
+              }), 'list closed issues'),
             ]);
 
             // Filter closed issues to only those closed in the last 7 days
@@ -4635,13 +4753,13 @@ jobs:
                 continue;
               }
 
-              const { data: issue } = await github.rest.issues.create({
+              const { data: issue } = await withRetry(() => github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: check.title,
                 body: check.body,
                 labels: check.labels,
-              });
+              }), `create issue "${check.title}"`);
 
               core.info(`Created issue #${issue.number}: ${check.title}`);
               createdTotal++;
@@ -4702,20 +4820,20 @@ jobs:
             if (rejections.length > 0) {
               const diagTitle = '[Auto-QA] Copilot assignment rejected — review rate limit config';
               try {
-                const existingDiag = await github.rest.issues.listForRepo({
+                const existingDiag = await withRetry(() => github.rest.issues.listForRepo({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   state: 'open',
                   labels: 'auto-qa,auto-qa:rate-limit',
                   per_page: 10,
-                });
+                }), 'list diagnostic issues');
                 const hasDiag = existingDiag.data.some(i => i.title.includes('Copilot assignment rejected'));
                 if (!hasDiag) {
                   const currentDelay = process.env.COPILOT_ASSIGNMENT_DELAY_S || '120';
                   const rejectionList = rejections.map(r =>
                     `- Issue #${r.issueNumber}: HTTP ${r.status} — ${r.message}`
                   ).join('\n');
-                  await github.rest.issues.create({
+                  await withRetry(() => github.rest.issues.create({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     title: diagTitle,
@@ -4739,7 +4857,7 @@ jobs:
                       '*Auto-created by the auto-qa workflow when Copilot assignments fail.*',
                     ].join('\n'),
                     labels: ['auto-qa', 'auto-qa:rate-limit', 'triage/needed'],
-                  });
+                  }), 'create diagnostic issue');
                   core.warning(`Created diagnostic issue: ${rejections.length} Copilot assignment(s) rejected`);
                 } else {
                   core.info('Diagnostic issue for Copilot rejections already exists — skipping');

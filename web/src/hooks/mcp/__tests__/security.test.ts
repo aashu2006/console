@@ -64,6 +64,9 @@ vi.mock('../../../lib/constants', async (importOriginal) => {
 // ---------------------------------------------------------------------------
 
 import { useSecurityIssues, useGitOpsDrifts } from '../security'
+// Import the same constant the source hooks use so URL assertions track
+// kc-agent migration automatically (phase 4.5b, #7993 / #8173).
+import { LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 
 // ---------------------------------------------------------------------------
 // Helpers

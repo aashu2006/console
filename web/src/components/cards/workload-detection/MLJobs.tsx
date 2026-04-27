@@ -16,26 +16,32 @@ import { useTranslation } from 'react-i18next'
 type MLJob = typeof DEMO_ML_JOBS[number]
 type SortByOption = 'name' | 'status' | 'framework' | 'gpus'
 
-const SORT_OPTIONS = [
-  { value: 'name' as const, label: 'Name' },
-  { value: 'status' as const, label: 'Status' },
-  { value: 'framework' as const, label: 'Framework' },
-  { value: 'gpus' as const, label: 'GPUs' },
-]
+const SORT_OPTION_KEYS = [
+  { value: 'name' as const, labelKey: 'mlJobs.sortName' },
+  { value: 'status' as const, labelKey: 'mlJobs.sortStatus' },
+  { value: 'framework' as const, labelKey: 'mlJobs.sortFramework' },
+  { value: 'gpus' as const, labelKey: 'mlJobs.sortGpus' },
+] as const
 
 interface MLJobsProps {
   config?: Record<string, unknown>
 }
 
 export function MLJobs({ config: _config }: MLJobsProps) {
-  const { t } = useTranslation()
-  const { data: jobs, isLoading } = useDemoData(DEMO_ML_JOBS)
+  const { t } = useTranslation(['cards', 'common'])
+  const { data: jobs, isLoading, isRefreshing, isDemoData } = useDemoData(DEMO_ML_JOBS)
+
+  const sortOptions = SORT_OPTION_KEYS.map(opt => ({
+    value: opt.value,
+    label: t(opt.labelKey),
+  }))
 
   const hasData = jobs.length > 0
   useCardLoadingState({
     isLoading: isLoading && !hasData,
+    isRefreshing,
     hasAnyData: hasData,
-    isDemoData: true,
+    isDemoData,
   })
 
   const statusOrder: Record<string, number> = { running: 0, queued: 1, completed: 2, failed: 3 }
@@ -65,13 +71,13 @@ export function MLJobs({ config: _config }: MLJobsProps) {
   const getStatusBadge = (status: string) => {
     switch (status) {
       case 'running':
-        return <StatusBadge color="green" icon={<Play className="w-2.5 h-2.5" />}>Running</StatusBadge>
+        return <StatusBadge color="green" icon={<Play className="w-2.5 h-2.5" />}>{t('mlJobs.statusRunning')}</StatusBadge>
       case 'queued':
-        return <StatusBadge color="yellow" icon={<Clock className="w-2.5 h-2.5" />}>Queued</StatusBadge>
+        return <StatusBadge color="yellow" icon={<Clock className="w-2.5 h-2.5" />}>{t('mlJobs.statusQueued')}</StatusBadge>
       case 'completed':
-        return <StatusBadge color="blue" icon={<CheckCircle className="w-2.5 h-2.5" />}>Done</StatusBadge>
+        return <StatusBadge color="blue" icon={<CheckCircle className="w-2.5 h-2.5" />}>{t('mlJobs.statusCompleted')}</StatusBadge>
       case 'failed':
-        return <StatusBadge color="red" icon={<XCircle className="w-2.5 h-2.5" />}>Failed</StatusBadge>
+        return <StatusBadge color="red" icon={<XCircle className="w-2.5 h-2.5" />}>{t('mlJobs.statusFailed')}</StatusBadge>
       default:
         return <StatusBadge color="gray">{status}</StatusBadge>
     }
@@ -90,7 +96,7 @@ export function MLJobs({ config: _config }: MLJobsProps) {
   return (
     <div className="h-full flex flex-col min-h-card">
       {/* Header controls */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           {filters.localClusterFilter.length > 0 && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">
@@ -98,7 +104,7 @@ export function MLJobs({ config: _config }: MLJobsProps) {
               {filters.localClusterFilter.length}/{filters.availableClusters.length}
             </span>
           )}
-          <StatusBadge color="yellow">
+          <StatusBadge color="green">
             {jobs.filter(j => j.status === 'running').length} running
           </StatusBadge>
         </div>
@@ -117,7 +123,7 @@ export function MLJobs({ config: _config }: MLJobsProps) {
             limit={itemsPerPage}
             onLimitChange={setItemsPerPage}
             sortBy={sorting.sortBy}
-            sortOptions={SORT_OPTIONS}
+            sortOptions={sortOptions}
             onSortChange={(v) => sorting.setSortBy(v as SortByOption)}
             sortDirection={sorting.sortDirection}
             onSortDirectionChange={sorting.setSortDirection}
@@ -129,18 +135,18 @@ export function MLJobs({ config: _config }: MLJobsProps) {
       <CardSearchInput
         value={filters.search}
         onChange={filters.setSearch}
-        placeholder={t('common.searchJobs')}
+        placeholder={t('mlJobs.searchJobs', 'Search jobs...')}
         className="mb-2"
       />
 
       {/* Integration notice */}
       <div className="flex items-start gap-2 p-2 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-xs mb-4">
-        <AlertCircle className="w-4 h-4 text-yellow-400 flex-shrink-0 mt-0.5" />
+        <AlertCircle className="w-4 h-4 text-yellow-400 shrink-0 mt-0.5" />
         <div>
           <p className="text-yellow-400 font-medium">ML Job Detection</p>
           <p className="text-muted-foreground">
             Auto-detects Kubeflow, Ray, and custom ML training jobs.{' '}
-            <a href="https://www.kubeflow.org/docs/started/installing-kubeflow/" target="_blank" rel="noopener noreferrer" className="text-yellow-400 hover:underline inline-block py-2">
+            <a href="https://www.kubeflow.org/docs/started/installing-kubeflow/" target="_blank" rel="noopener noreferrer" className="text-yellow-400 hover:underline inline">
               Kubeflow docs <ExternalLink className="w-3 h-3 inline" />
             </a>
           </p>
@@ -151,7 +157,7 @@ export function MLJobs({ config: _config }: MLJobsProps) {
       <div ref={containerRef} className="flex-1 overflow-y-auto space-y-2" style={containerStyle}>
         {items.map((job, idx) => (
           <div key={idx} className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
-            <div className="flex items-center justify-between mb-2">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-medium text-foreground">{job.name}</span>
                 <span className="text-xs px-1.5 py-0.5 rounded bg-secondary text-muted-foreground">
@@ -167,7 +173,7 @@ export function MLJobs({ config: _config }: MLJobsProps) {
             {job.status === 'running' && (
               <div className="w-full bg-secondary rounded-full h-1.5">
                 <div
-                  className="bg-gradient-to-r from-yellow-500 to-green-500 h-1.5 rounded-full transition-all"
+                  className="bg-linear-to-r from-yellow-500 to-green-500 h-1.5 rounded-full transition-all"
                   style={{ width: `${job.progress}%` }}
                 />
               </div>

@@ -5,15 +5,41 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+// isCRDNotInstalledErr reports whether err indicates that the requested
+// custom resource definition is not installed on the target cluster.
+// This is the only "not an error" condition the kagenti handlers should
+// suppress — every other failure (RBAC denied, timeout, etc.) must be
+// surfaced to the caller.
+func isCRDNotInstalledErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*meta.NoKindMatchError); ok {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "the server could not find the requested resource") ||
+		strings.Contains(msg, "no matches for kind")
+}
+
 const (
 	kagentiTimeout = 30 * time.Second
+	// kagentiSummaryPerCallTimeout is the per-call timeout used when the
+	// summary handler fans out its CRD queries concurrently. It mirrors
+	// kagentCRDPerCallTimeout so a single slow CRD cannot starve the
+	// others inside one shared 30-second budget (#7915).
+	kagentiSummaryPerCallTimeout = 15 * time.Second
 )
 
 // Kagenti CRD Group/Version/Resource definitions
@@ -134,6 +160,7 @@ func (s *Server) handleKagentiAgents(w http.ResponseWriter, r *http.Request) {
 	cluster := r.URL.Query().Get("cluster")
 	namespace := r.URL.Query().Get("namespace")
 	if cluster == "" {
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"agents": []any{}, "error": "cluster parameter required"})
 		return
 	}
@@ -143,7 +170,8 @@ func (s *Server) handleKagentiAgents(w http.ResponseWriter, r *http.Request) {
 
 	dynClient, err := s.k8sClient.GetDynamicClient(cluster)
 	if err != nil {
-		slog.Info("error fetching agents", "error", err)
+		slog.Warn("error fetching agents", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]any{"agents": []any{}, "error": "internal server error"})
 		return
 	}
@@ -155,8 +183,13 @@ func (s *Server) handleKagentiAgents(w http.ResponseWriter, r *http.Request) {
 		list, err = dynClient.Resource(kagentiAgentGVR).List(ctx, metav1.ListOptions{})
 	}
 	if err != nil {
-		// CRD not installed is expected — return empty list, not error
-		json.NewEncoder(w).Encode(map[string]any{"agents": []any{}})
+		if apierrors.IsNotFound(err) || isCRDNotInstalledErr(err) {
+			json.NewEncoder(w).Encode(map[string]any{"agents": []any{}})
+			return
+		}
+		slog.Warn("error listing kagenti agents", "cluster", cluster, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"agents": []any{}, "error": err.Error()})
 		return
 	}
 
@@ -176,8 +209,13 @@ func (s *Server) handleKagentiAgents(w http.ResponseWriter, r *http.Request) {
 			a.Framework = nestedString(specMap, "framework")
 			a.Protocol = nestedString(specMap, "protocol")
 			a.Image = nestedString(specMap, "image")
-			a.Replicas = nestedInt64(specMap, "replicas")
-			if a.Replicas == 0 {
+			// Distinguish "field absent" (operator defaults to 1) from
+			// "field explicitly set to 0" (agent intentionally paused).
+			// nestedInt64 collapses both into 0, so call the underlying
+			// helper directly and respect the found flag. See issue #7943.
+			if replicas, found, err := unstructured.NestedInt64(specMap, "replicas"); err == nil && found {
+				a.Replicas = replicas
+			} else {
 				a.Replicas = 1
 			}
 		}
@@ -216,6 +254,7 @@ func (s *Server) handleKagentiBuilds(w http.ResponseWriter, r *http.Request) {
 	cluster := r.URL.Query().Get("cluster")
 	namespace := r.URL.Query().Get("namespace")
 	if cluster == "" {
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"builds": []any{}, "error": "cluster parameter required"})
 		return
 	}
@@ -225,7 +264,8 @@ func (s *Server) handleKagentiBuilds(w http.ResponseWriter, r *http.Request) {
 
 	dynClient, err := s.k8sClient.GetDynamicClient(cluster)
 	if err != nil {
-		slog.Info("error fetching builds", "error", err)
+		slog.Warn("error fetching builds", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]any{"builds": []any{}, "error": "internal server error"})
 		return
 	}
@@ -237,7 +277,13 @@ func (s *Server) handleKagentiBuilds(w http.ResponseWriter, r *http.Request) {
 		list, err = dynClient.Resource(kagentiBuildGVR).List(ctx, metav1.ListOptions{})
 	}
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]any{"builds": []any{}})
+		if apierrors.IsNotFound(err) || isCRDNotInstalledErr(err) {
+			json.NewEncoder(w).Encode(map[string]any{"builds": []any{}})
+			return
+		}
+		slog.Warn("error listing kagenti builds", "cluster", cluster, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"builds": []any{}, "error": err.Error()})
 		return
 	}
 
@@ -293,6 +339,7 @@ func (s *Server) handleKagentiCards(w http.ResponseWriter, r *http.Request) {
 	cluster := r.URL.Query().Get("cluster")
 	namespace := r.URL.Query().Get("namespace")
 	if cluster == "" {
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"cards": []any{}, "error": "cluster parameter required"})
 		return
 	}
@@ -302,7 +349,8 @@ func (s *Server) handleKagentiCards(w http.ResponseWriter, r *http.Request) {
 
 	dynClient, err := s.k8sClient.GetDynamicClient(cluster)
 	if err != nil {
-		slog.Info("error fetching cards", "error", err)
+		slog.Warn("error fetching cards", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]any{"cards": []any{}, "error": "internal server error"})
 		return
 	}
@@ -314,7 +362,13 @@ func (s *Server) handleKagentiCards(w http.ResponseWriter, r *http.Request) {
 		list, err = dynClient.Resource(kagentiCardGVR).List(ctx, metav1.ListOptions{})
 	}
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]any{"cards": []any{}})
+		if apierrors.IsNotFound(err) || isCRDNotInstalledErr(err) {
+			json.NewEncoder(w).Encode(map[string]any{"cards": []any{}})
+			return
+		}
+		slog.Warn("error listing kagenti cards", "cluster", cluster, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"cards": []any{}, "error": err.Error()})
 		return
 	}
 
@@ -368,6 +422,7 @@ func (s *Server) handleKagentiTools(w http.ResponseWriter, r *http.Request) {
 	cluster := r.URL.Query().Get("cluster")
 	namespace := r.URL.Query().Get("namespace")
 	if cluster == "" {
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"tools": []any{}, "error": "cluster parameter required"})
 		return
 	}
@@ -377,7 +432,8 @@ func (s *Server) handleKagentiTools(w http.ResponseWriter, r *http.Request) {
 
 	dynClient, err := s.k8sClient.GetDynamicClient(cluster)
 	if err != nil {
-		slog.Info("error fetching tools", "error", err)
+		slog.Warn("error fetching tools", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]any{"tools": []any{}, "error": "internal server error"})
 		return
 	}
@@ -389,7 +445,13 @@ func (s *Server) handleKagentiTools(w http.ResponseWriter, r *http.Request) {
 		list, err = dynClient.Resource(kagentiToolGVR).List(ctx, metav1.ListOptions{})
 	}
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]any{"tools": []any{}})
+		if apierrors.IsNotFound(err) || isCRDNotInstalledErr(err) {
+			json.NewEncoder(w).Encode(map[string]any{"tools": []any{}})
+			return
+		}
+		slog.Warn("error listing kagenti tools", "cluster", cluster, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"tools": []any{}, "error": err.Error()})
 		return
 	}
 
@@ -440,16 +502,15 @@ func (s *Server) handleKagentiSummary(w http.ResponseWriter, r *http.Request) {
 
 	cluster := r.URL.Query().Get("cluster")
 	if cluster == "" {
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"error": "cluster parameter required"})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), kagentiTimeout)
-	defer cancel()
-
 	dynClient, err := s.k8sClient.GetDynamicClient(cluster)
 	if err != nil {
-		slog.Info("error fetching kagenti summary", "error", err)
+		slog.Warn("error fetching kagenti summary", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]any{
 			"agentCount": 0, "readyAgents": 0, "buildCount": 0,
 			"activeBuilds": 0, "toolCount": 0, "cardCount": 0,
@@ -458,11 +519,32 @@ func (s *Server) handleKagentiSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var agentCount, readyAgents, buildCount, activeBuilds, toolCount, cardCount int
-	frameworks := map[string]int{}
+	// Fan the 4 CRD list calls out concurrently, each with its own
+	// per-call timeout, so a slow/unavailable CRD cannot starve the
+	// others within one shared 30-second context budget. This matches
+	// handleKagentCRDSummary's pattern (#7915).
+	var (
+		mu                                                       sync.Mutex
+		agentCount, readyAgents, buildCount, activeBuilds        int
+		toolCount, cardCount                                     int
+		frameworks                                               = map[string]int{}
+		wg                                                       sync.WaitGroup
+	)
+	const numKagentiCRDQueries = 4
+	wg.Add(numKagentiCRDQueries)
 
-	// Count agents
-	if agentList, err := dynClient.Resource(kagentiAgentGVR).List(ctx, metav1.ListOptions{}); err == nil {
+	// Count agents + collect frameworks
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(r.Context(), kagentiSummaryPerCallTimeout)
+		defer cancel()
+		agentList, listErr := dynClient.Resource(kagentiAgentGVR).List(ctx, metav1.ListOptions{})
+		if listErr != nil {
+			slog.Warn("kagenti summary: agents query failed", "error", listErr)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
 		agentCount = len(agentList.Items)
 		for _, item := range agentList.Items {
 			statusMap, _ := item.Object["status"].(map[string]any)
@@ -480,10 +562,20 @@ func (s *Server) handleKagentiSummary(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	}
+	}()
 
 	// Count builds
-	if buildList, err := dynClient.Resource(kagentiBuildGVR).List(ctx, metav1.ListOptions{}); err == nil {
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(r.Context(), kagentiSummaryPerCallTimeout)
+		defer cancel()
+		buildList, listErr := dynClient.Resource(kagentiBuildGVR).List(ctx, metav1.ListOptions{})
+		if listErr != nil {
+			slog.Warn("kagenti summary: builds query failed", "error", listErr)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
 		buildCount = len(buildList.Items)
 		for _, item := range buildList.Items {
 			statusMap, _ := item.Object["status"].(map[string]any)
@@ -494,17 +586,39 @@ func (s *Server) handleKagentiSummary(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	}
+	}()
 
 	// Count tools
-	if toolList, err := dynClient.Resource(kagentiToolGVR).List(ctx, metav1.ListOptions{}); err == nil {
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(r.Context(), kagentiSummaryPerCallTimeout)
+		defer cancel()
+		toolList, listErr := dynClient.Resource(kagentiToolGVR).List(ctx, metav1.ListOptions{})
+		if listErr != nil {
+			slog.Warn("kagenti summary: tools query failed", "error", listErr)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
 		toolCount = len(toolList.Items)
-	}
+	}()
 
 	// Count cards
-	if cardList, err := dynClient.Resource(kagentiCardGVR).List(ctx, metav1.ListOptions{}); err == nil {
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(r.Context(), kagentiSummaryPerCallTimeout)
+		defer cancel()
+		cardList, listErr := dynClient.Resource(kagentiCardGVR).List(ctx, metav1.ListOptions{})
+		if listErr != nil {
+			slog.Warn("kagenti summary: cards query failed", "error", listErr)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
 		cardCount = len(cardList.Items)
-	}
+	}()
+
+	wg.Wait()
 
 	json.NewEncoder(w).Encode(map[string]any{
 		"agentCount":   agentCount,

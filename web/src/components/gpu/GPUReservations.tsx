@@ -197,6 +197,10 @@ export function GPUReservations() {
         (r.cluster ?? '').toLowerCase().includes(term) ||
         (r.status ?? '').toLowerCase().includes(term) ||
         (r.gpu_type && r.gpu_type.toLowerCase().includes(term)) ||
+        // Match against any accepted GPU type so searching
+        // for "H100" finds multi-type reservations that list H100
+        // among their acceptable alternatives.
+        (r.gpu_types && r.gpu_types.some(t => t.toLowerCase().includes(term))) ||
         (r.description && r.description.toLowerCase().includes(term)) ||
         (r.notes && r.notes.toLowerCase().includes(term))
       )
@@ -230,6 +234,30 @@ export function GPUReservations() {
     }
     return Object.values(clusterMap).filter(c => c.totalGPUs > 0)
   })()
+
+  // Namespaces known to have existing reservations, grouped by cluster.
+  // Fallback source for the Create Reservation dropdown when useNamespaces()
+  // can't surface a namespace (e.g. user lacks cluster-wide list RBAC AND
+  // the namespace has no running pods, so neither health-check discovery
+  // nor the /api/mcp/pods-based REST fallback sees it).
+  const knownNamespacesByCluster = useMemo(() => {
+    // Use a Map<string, Set<string>> to dedupe in O(1) per entry.
+    const byCluster = new Map<string, Set<string>>()
+    for (const r of (allReservations || [])) {
+      if (!r.cluster || !r.namespace) continue
+      let set = byCluster.get(r.cluster)
+      if (!set) {
+        set = new Set<string>()
+        byCluster.set(r.cluster, set)
+      }
+      set.add(r.namespace)
+    }
+    const out: Record<string, string[]> = {}
+    byCluster.forEach((set, cluster) => {
+      out[cluster] = Array.from(set)
+    })
+    return out
+  }, [allReservations])
 
   // GPU stats
   const stats = useMemo(() => {
@@ -508,7 +536,7 @@ export function GPUReservations() {
               tabIndex={activeTab === tab.id ? 0 : -1}
               onClick={() => setActiveTab(tab.id)}
               className={cn(
-                'flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 -mb-[2px] transition-colors',
+                'flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 mb-[-2px] transition-colors',
                 activeTab === tab.id
                   ? 'border-purple-500 text-purple-400'
                   : 'border-transparent text-muted-foreground hover:text-foreground'
@@ -652,6 +680,7 @@ export function GPUReservations() {
         user={user}
         prefillDate={prefillDate}
         forceLive={gpuLiveMode}
+        knownNamespacesByCluster={knownNamespacesByCluster}
         onSave={async (input) => {
           if (editingReservation) {
             await apiUpdateReservation(editingReservation.id, input as UpdateGPUReservationInput)

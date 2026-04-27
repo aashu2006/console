@@ -208,14 +208,16 @@ describe('useNodes', () => {
     expect(result.current.error).toBeNull()
   })
 
-  it('falls back to cluster-cache placeholder node data when available', async () => {
+  it('returns empty nodes on SSE failure even when cluster cache has data (#7351)', async () => {
+    // #7396 — After #7351, SSE failure returns empty state instead of
+    // fabricating placeholder nodes from cluster cache.
     mockFetchSSE.mockRejectedValue(new Error('SSE failed'))
     mockClusterCacheRef.clusters = [{ name: 'test-cluster', nodeCount: 3, cpuCores: 12, memoryGB: 48 }]
 
     const { result } = renderHook(() => useNodes('test-cluster'))
 
     await waitFor(() => expect(result.current.isLoading).toBe(false))
-    expect(result.current.nodes.length).toBeGreaterThan(0)
+    expect(result.current.nodes).toEqual([])
     expect(result.current.error).toBeNull()
   })
 
@@ -239,6 +241,49 @@ describe('useNodes', () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false))
     expect(result.current.nodes.length).toBeGreaterThan(0)
     expect(result.current.error).toBeNull()
+  })
+
+  // Issue 9355 — per-cluster error surfacing.  The backend emits a
+  // `cluster_error` SSE event when an individual cluster's nodes list
+  // fails (e.g. 403 from RBAC denial).  useNodes must forward those
+  // events as `clusterErrors` so the multi-cluster drill-down can
+  // distinguish RBAC denial from a transient endpoint failure when the
+  // cluster summary count disagrees with the list length.
+  it('surfaces per-cluster errors from SSE cluster_error events', async () => {
+    // Simulate the SSE stream invoking onClusterError for a 403 and a timeout.
+    mockFetchSSE.mockImplementation(async (opts: {
+      onClusterError?: (cluster: string, message: string) => void
+    }) => {
+      opts.onClusterError?.('rbac-cluster', 'nodes is forbidden: User "u" cannot list resource "nodes"')
+      opts.onClusterError?.('slow-cluster', 'context deadline exceeded')
+      return []
+    })
+
+    const { result } = renderHook(() => useNodes('rbac-test-unique-nodes'))
+    await waitFor(() => expect(result.current.isLoading).toBe(false), { timeout: 5000 })
+
+    // Both events surface in clusterErrors, classified by type.  The RBAC
+    // denial is 'auth' (matches /forbidden/i) and the timeout is 'timeout'.
+    expect(result.current.clusterErrors).toHaveLength(2)
+    const rbac = result.current.clusterErrors.find(e => e.cluster === 'rbac-cluster')
+    const slow = result.current.clusterErrors.find(e => e.cluster === 'slow-cluster')
+    expect(rbac?.errorType).toBe('auth')
+    expect(slow?.errorType).toBe('timeout')
+  })
+
+  it('returns empty clusterErrors when the stream succeeds for every cluster', async () => {
+    mockFetchSSE.mockResolvedValue([
+      {
+        name: 'n1', cluster: 'c1', status: 'Ready', roles: ['worker'],
+        kubeletVersion: 'v1.28.4', cpuCapacity: '8', memoryCapacity: '16Gi',
+        podCapacity: '110', conditions: [], unschedulable: false,
+      },
+    ])
+
+    const { result } = renderHook(() => useNodes('happy-test-unique-nodes'))
+    await waitFor(() => expect(result.current.isLoading).toBe(false), { timeout: 5000 })
+
+    expect(result.current.clusterErrors).toEqual([])
   })
 })
 
@@ -915,7 +960,9 @@ describe('useNodes — empty cluster handling', () => {
     expect(result.current.error).toBeNull()
   })
 
-  it('builds placeholder from cluster cache with cpuCores and memoryGB', async () => {
+  it('returns empty on SSE failure — no placeholder fabrication (#7351)', async () => {
+    // #7396 — After #7351, placeholder node fabrication was removed.
+    // SSE failure returns empty state regardless of cluster cache.
     mockFetchSSE.mockRejectedValue(new Error('SSE failed'))
     mockClusterCacheRef.clusters = [
       { name: 'cached-cluster', nodeCount: 5, cpuCores: 32, memoryGB: 128 },
@@ -924,10 +971,8 @@ describe('useNodes — empty cluster handling', () => {
     const { result } = renderHook(() => useNodes('cached-cluster'))
 
     await waitFor(() => expect(result.current.isLoading).toBe(false))
-    expect(result.current.nodes.length).toBe(1)
-    expect(result.current.nodes[0].cpuCapacity).toBe('32')
-    expect(result.current.nodes[0].memoryCapacity).toBe('128Gi')
-    expect(result.current.nodes[0].status).toBe('Ready')
+    expect(result.current.nodes).toEqual([])
+    expect(result.current.error).toBeNull()
   })
 
   it('returns empty when cluster cache has nodeCount=0', async () => {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,10 +15,12 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/kubestellar/console/pkg/agent"
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/k8s"
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/store"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -36,11 +39,21 @@ const (
 	workloadDeployLogsTimeout = 15 * time.Second
 )
 
+const (
+	// clusterGroupRefreshInterval is how often the in-memory cluster group
+	// cache is re-synced from the persistent store. This ensures that in
+	// multi-instance deployments each backend picks up writes made by
+	// other instances within a bounded window (#10007).
+	clusterGroupRefreshInterval = 30 * time.Second
+)
+
 // WorkloadHandlers handles workload API endpoints
 type WorkloadHandlers struct {
 	k8sClient *k8s.MultiClusterClient
 	hub       *Hub
 	store     store.Store
+	stopOnce  sync.Once
+	stopCh    chan struct{}
 }
 
 // NewWorkloadHandlers creates a new workload handlers instance
@@ -49,6 +62,7 @@ func NewWorkloadHandlers(k8sClient *k8s.MultiClusterClient, hub *Hub, s store.St
 		k8sClient: k8sClient,
 		hub:       hub,
 		store:     s,
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -62,7 +76,7 @@ func (h *WorkloadHandlers) requireAdmin(c *fiber.Ctx) error {
 		return nil
 	}
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
 		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
 	}
@@ -73,7 +87,7 @@ func (h *WorkloadHandlers) requireAdmin(c *fiber.Ctx) error {
 // GET /api/workloads
 func (h *WorkloadHandlers) ListWorkloads(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	// Optional filters
@@ -96,7 +110,7 @@ func (h *WorkloadHandlers) ListWorkloads(c *fiber.Ctx) error {
 // GET /api/workloads/:cluster/:namespace/:name
 func (h *WorkloadHandlers) GetWorkload(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")
@@ -118,95 +132,16 @@ func (h *WorkloadHandlers) GetWorkload(c *fiber.Ctx) error {
 	return c.JSON(workload)
 }
 
-// DeployWorkload deploys a workload to specified clusters
-// POST /api/workloads/deploy
-func (h *WorkloadHandlers) DeployWorkload(c *fiber.Ctx) error {
-	// Workload mutations require console admin (#5974).
-	if err := h.requireAdmin(c); err != nil {
-		return err
-	}
-
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
-	}
-
-	type DeployRequest struct {
-		WorkloadName   string   `json:"workloadName"`
-		Namespace      string   `json:"namespace"`
-		SourceCluster  string   `json:"sourceCluster"`
-		TargetClusters []string `json:"targetClusters"`
-		Replicas       int32    `json:"replicas,omitempty"`
-		GroupName      string   `json:"groupName,omitempty"`
-	}
-
-	var req DeployRequest
-	if err := c.BodyParser(&req); err != nil {
-		slog.Info("[Workloads] invalid request body", "error", err)
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
-	}
-
-	// Validate required fields
-	if req.WorkloadName == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "workloadName is required"})
-	}
-	if req.Namespace == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "namespace is required"})
-	}
-	if req.SourceCluster == "" {
-		// #5957 — reject missing sourceCluster with a clear 400 rather than
-		// letting it fall through and surface as a confusing downstream error.
-		return c.Status(400).JSON(fiber.Map{"error": "sourceCluster is required"})
-	}
-	if err := validateK8sName(req.SourceCluster, "sourceCluster"); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-	}
-	if len(req.TargetClusters) == 0 {
-		return c.Status(400).JSON(fiber.Map{"error": "at least one targetCluster is required"})
-	}
-	// Verify sourceCluster is actually known to the multi-cluster client (#5957).
-	// Catches typos and stale UI state before we attempt to read from the source.
-	if h.k8sClient != nil {
-		known := false
-		if clusters, _, cerr := h.k8sClient.HealthyClusters(c.Context()); cerr == nil {
-			for _, cl := range clusters {
-				if cl.Name == req.SourceCluster || cl.Context == req.SourceCluster {
-					known = true
-					break
-				}
-			}
-		}
-		if !known {
-			return c.Status(400).JSON(fiber.Map{"error": fmt.Sprintf("sourceCluster %q is not a known cluster", req.SourceCluster)})
-		}
-	}
-
-	// Extract authenticated user
-	deployedBy := "anonymous"
-	if login := middleware.GetGitHubLogin(c); login != "" {
-		deployedBy = login
-	}
-
-	opts := &k8s.DeployOptions{
-		DeployedBy: deployedBy,
-		GroupName:  req.GroupName,
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), workloadWriteTimeout)
-	defer cancel()
-
-	result, err := h.k8sClient.DeployWorkload(ctx, req.SourceCluster, req.Namespace, req.WorkloadName, req.TargetClusters, req.Replicas, opts)
-	if err != nil {
-		return handleK8sError(c, err)
-	}
-
-	return c.JSON(result)
-}
+// NOTE: DeployWorkload moved to kc-agent (#7993 Phase 1 PR B).
+// The agent (pkg/agent/server_http.go handleDeployWorkloadHTTP) runs under
+// the user's kubeconfig instead of the backend pod SA and calls the same
+// shared pkg/k8s MultiClusterClient.DeployWorkload method.
 
 // ResolveDependencies returns the dependency tree for a workload without deploying (dry-run).
 // GET /api/workloads/resolve-deps/:cluster/:namespace/:name
 func (h *WorkloadHandlers) ResolveDependencies(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")
@@ -263,7 +198,7 @@ func (h *WorkloadHandlers) ResolveDependencies(c *fiber.Ctx) error {
 // GET /api/workloads/monitor/:cluster/:namespace/:name
 func (h *WorkloadHandlers) MonitorWorkload(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")
@@ -289,7 +224,7 @@ func (h *WorkloadHandlers) MonitorWorkload(c *fiber.Ctx) error {
 // GET /api/workloads/deploy-status/:cluster/:namespace/:name
 func (h *WorkloadHandlers) GetDeployStatus(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")
@@ -365,10 +300,95 @@ type ClusterGroup struct {
 const allHealthyClustersGroupName = "all-healthy-clusters"
 
 // In-memory cluster group store (persisted via frontend localStorage; backend is source of truth for labels)
+// validLabelValue matches Kubernetes label values: alphanumeric, '-', '_', '.'
+// up to 63 characters. Used to prevent label selector injection (#7004).
+var validLabelValue = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,61}[a-zA-Z0-9])?$`)
+
 var (
 	clusterGroups   = make(map[string]ClusterGroup)
 	clusterGroupsMu sync.RWMutex
 )
+
+// LoadPersistedClusterGroups reloads cluster group definitions from the store
+// into the in-memory map on startup so they survive server restarts (#7013).
+func (h *WorkloadHandlers) LoadPersistedClusterGroups() {
+	if h.store == nil {
+		return
+	}
+	persisted, err := h.store.ListClusterGroups(context.Background())
+	if err != nil {
+		slog.Error("[Workloads] failed to load persisted cluster groups", "error", err)
+		return
+	}
+	clusterGroupsMu.Lock()
+	defer clusterGroupsMu.Unlock()
+	for name, data := range persisted {
+		var g ClusterGroup
+		if err := json.Unmarshal(data, &g); err != nil {
+			slog.Error("[Workloads] failed to unmarshal persisted cluster group", "name", name, "error", err)
+			continue
+		}
+		clusterGroups[name] = g
+	}
+	slog.Info("[Workloads] loaded persisted cluster groups", "count", len(persisted))
+}
+
+// StartCacheRefresh launches a background goroutine that periodically reloads
+// cluster groups from the persistent store. In multi-instance deployments this
+// ensures each backend converges on the same state within
+// clusterGroupRefreshInterval (#10007).
+func (h *WorkloadHandlers) StartCacheRefresh() {
+	if h.store == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(clusterGroupRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-h.stopCh:
+				return
+			case <-ticker.C:
+				h.LoadPersistedClusterGroups()
+			}
+		}
+	}()
+	slog.Info("[Workloads] started periodic cluster group cache refresh",
+		"interval", clusterGroupRefreshInterval)
+}
+
+// StopCacheRefresh signals the background refresh goroutine to exit.
+func (h *WorkloadHandlers) StopCacheRefresh() {
+	h.stopOnce.Do(func() {
+		close(h.stopCh)
+		slog.Info("[Workloads] stopped periodic cluster group cache refresh")
+	})
+}
+
+// persistClusterGroup saves a cluster group to the store for durability (#7013).
+func (h *WorkloadHandlers) persistClusterGroup(ctx context.Context, name string, g ClusterGroup) {
+	if h.store == nil {
+		return
+	}
+	data, err := json.Marshal(g)
+	if err != nil {
+		slog.Error("[Workloads] failed to marshal cluster group for persistence", "name", name, "error", err)
+		return
+	}
+	if err := h.store.SaveClusterGroup(ctx, name, data); err != nil {
+		slog.Error("[Workloads] failed to persist cluster group", "name", name, "error", err)
+	}
+}
+
+// deletePersistedClusterGroup removes a cluster group from the store (#7013).
+func (h *WorkloadHandlers) deletePersistedClusterGroup(ctx context.Context, name string) {
+	if h.store == nil {
+		return
+	}
+	if err := h.store.DeleteClusterGroup(ctx, name); err != nil {
+		slog.Error("[Workloads] failed to delete persisted cluster group", "name", name, "error", err)
+	}
+}
 
 // ListClusterGroups returns all cluster groups
 // GET /api/cluster-groups
@@ -438,6 +458,9 @@ func (h *WorkloadHandlers) CreateClusterGroup(c *fiber.Ctx) error {
 	clusterGroups[group.Name] = group
 	clusterGroupsMu.Unlock()
 
+	// Persist to store so the group survives server restarts (#7013).
+	h.persistClusterGroup(c.UserContext(), group.Name, group)
+
 	// Label cluster nodes with group membership
 	if h.k8sClient != nil {
 		ctx, cancel := context.WithTimeout(c.Context(), workloadWriteTimeout)
@@ -459,6 +482,8 @@ func (h *WorkloadHandlers) CreateClusterGroup(c *fiber.Ctx) error {
 			})
 		}
 	}
+
+	audit.Log(c, audit.ActionCreateClusterGroup, "cluster_group", group.Name)
 
 	return c.Status(201).JSON(group)
 }
@@ -487,6 +512,9 @@ func (h *WorkloadHandlers) UpdateClusterGroup(c *fiber.Ctx) error {
 	oldGroup, existed := clusterGroups[name]
 	clusterGroups[name] = group
 	clusterGroupsMu.Unlock()
+
+	// Persist to store so the group survives server restarts (#7013).
+	h.persistClusterGroup(c.UserContext(), name, group)
 
 	// Remove labels from clusters no longer in the group
 	if existed && h.k8sClient != nil {
@@ -521,12 +549,16 @@ func (h *WorkloadHandlers) UpdateClusterGroup(c *fiber.Ctx) error {
 			}
 		}
 		if len(labelErrors) > 0 {
-			return c.JSON(fiber.Map{
+			// Return 207 Multi-Status for partial success, consistent with
+			// CreateClusterGroup (#7006).
+			return c.Status(207).JSON(fiber.Map{
 				"group":    group,
 				"warnings": labelErrors,
 			})
 		}
 	}
+
+	audit.Log(c, audit.ActionUpdateClusterGroup, "cluster_group", name)
 
 	return c.JSON(group)
 }
@@ -549,6 +581,9 @@ func (h *WorkloadHandlers) DeleteClusterGroup(c *fiber.Ctx) error {
 	delete(clusterGroups, name)
 	clusterGroupsMu.Unlock()
 
+	// Remove from persistent store (#7013).
+	h.deletePersistedClusterGroup(c.UserContext(), name)
+
 	// Remove labels from all clusters in the deleted group
 	if existed && h.k8sClient != nil {
 		ctx, cancel := context.WithTimeout(c.Context(), workloadWriteTimeout)
@@ -562,13 +597,17 @@ func (h *WorkloadHandlers) DeleteClusterGroup(c *fiber.Ctx) error {
 			}
 		}
 		if len(labelErrors) > 0 {
-			return c.JSON(fiber.Map{
+			// Return 207 Multi-Status for partial success, consistent with
+			// CreateClusterGroup (#7007).
+			return c.Status(207).JSON(fiber.Map{
 				"message":  "Cluster group deleted with warnings",
 				"name":     name,
 				"warnings": labelErrors,
 			})
 		}
 	}
+
+	audit.Log(c, audit.ActionDeleteClusterGroup, "cluster_group", name)
 
 	return c.JSON(fiber.Map{"message": "Cluster group deleted", "name": name})
 }
@@ -593,6 +632,11 @@ func (h *WorkloadHandlers) SyncClusterGroups(c *fiber.Ctx) error {
 	}
 
 	clusterGroupsMu.Lock()
+	// Capture old names so we can remove deleted groups from the store.
+	oldNames := make(map[string]bool, len(clusterGroups))
+	for n := range clusterGroups {
+		oldNames[n] = true
+	}
 	clusterGroups = make(map[string]ClusterGroup)
 	for _, g := range groups {
 		if g.Name == allHealthyClustersGroupName {
@@ -600,22 +644,55 @@ func (h *WorkloadHandlers) SyncClusterGroups(c *fiber.Ctx) error {
 		}
 		clusterGroups[g.Name] = g
 	}
+	// Capture count inside the lock to avoid a data race (#7008).
+	syncedCount := len(clusterGroups)
+	// Snapshot for persistence outside the lock.
+	toSave := make(map[string]ClusterGroup, syncedCount)
+	for n, g := range clusterGroups {
+		toSave[n] = g
+	}
 	clusterGroupsMu.Unlock()
 
-	return c.JSON(fiber.Map{"synced": len(clusterGroups)})
+	// Persist the new set and remove stale entries (#7013).
+	for n, g := range toSave {
+		h.persistClusterGroup(c.UserContext(), n, g)
+		delete(oldNames, n) // still exists
+	}
+	for n := range oldNames {
+		h.deletePersistedClusterGroup(c.UserContext(), n)
+	}
+
+	return c.JSON(fiber.Map{"synced": syncedCount})
 }
 
 // EvaluateClusterQuery evaluates a dynamic group query against current cluster state
 // POST /api/cluster-groups/evaluate
 func (h *WorkloadHandlers) EvaluateClusterQuery(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	var query ClusterGroupQuery
 	if err := c.BodyParser(&query); err != nil {
 		slog.Info("[Workloads] invalid query", "error", err)
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
+
+	// Validate the label selector up front so we can return a specific
+	// 400 Bad Request with the parser's error message instead of silently
+	// matching zero clusters and returning a 200 OK with an empty result
+	// set (issue #9092). Matching code below may re-parse, but doing it
+	// here guarantees we never swallow the parse error.
+	if query.LabelSelector != "" {
+		if _, selErr := labels.Parse(query.LabelSelector); selErr != nil {
+			slog.Info("[Workloads] invalid label selector in cluster query",
+				"selector", query.LabelSelector, "error", selErr)
+			return c.Status(400).JSON(fiber.Map{
+				"error":         "invalid label selector",
+				"labelSelector": query.LabelSelector,
+				"detail":        selErr.Error(),
+			})
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), workloadListTimeout)
@@ -647,16 +724,28 @@ func (h *WorkloadHandlers) EvaluateClusterQuery(c *fiber.Ctx) error {
 		}
 	}
 
-	// Fetch nodes only for deduplicated clusters
+	// Fetch nodes in parallel using errgroup instead of sequentially (#7012).
 	nodesByCluster := make(map[string][]k8s.NodeInfo)
 	needNodes := query.LabelSelector != "" || hasGPUFilter(query.Filters)
 	if needNodes {
+		var nodesMu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
 		for _, cl := range dedupClusters {
-			nodes, err := h.k8sClient.GetNodes(ctx, cl.Name)
-			if err == nil {
-				nodesByCluster[cl.Name] = nodes
-			}
+			clName := cl.Name
+			g.Go(func() error {
+				nodes, err := h.k8sClient.GetNodes(gctx, clName)
+				if err != nil {
+					// Non-fatal: skip clusters that fail, matching original behavior.
+					slog.Warn("[Workloads] failed to get nodes for cluster", "cluster", clName, "error", err)
+					return nil
+				}
+				nodesMu.Lock()
+				nodesByCluster[clName] = nodes
+				nodesMu.Unlock()
+				return nil
+			})
 		}
+		_ = g.Wait() // errors are non-fatal (logged above)
 	}
 
 	matching := make([]string, 0)
@@ -692,10 +781,15 @@ func clusterMatchesQuery(health k8s.ClusterHealth, nodes []k8s.NodeInfo, query *
 	return true
 }
 
-// clusterMatchesLabelSelector returns true if at least one node matches the selector
+// clusterMatchesLabelSelector returns true if at least one node matches the selector.
+// The EvaluateClusterQuery handler validates the selector up front and returns
+// 400 on parse errors (issue #9092); we still log here as a defense-in-depth
+// signal in case any future caller feeds an unvalidated selector string.
 func clusterMatchesLabelSelector(nodes []k8s.NodeInfo, selectorStr string) bool {
 	selector, err := labels.Parse(selectorStr)
 	if err != nil {
+		slog.Warn("[Workloads] label selector parse failed in matcher (should have been validated upstream)",
+			"selector", selectorStr, "error", err)
 		return false
 	}
 	for _, node := range nodes {
@@ -972,86 +1066,16 @@ func buildClusterContextForAI(healthData []k8s.ClusterHealth) string {
 	return sb.String()
 }
 
-// ScaleWorkload scales a workload in specified clusters
-// POST /api/workloads/scale
-func (h *WorkloadHandlers) ScaleWorkload(c *fiber.Ctx) error {
-	// Workload mutations require console admin (#5974).
-	if err := h.requireAdmin(c); err != nil {
-		return err
-	}
-
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
-	}
-
-	type ScaleRequest struct {
-		WorkloadName   string   `json:"workloadName"`
-		Namespace      string   `json:"namespace"`
-		TargetClusters []string `json:"targetClusters,omitempty"`
-		Replicas       int32    `json:"replicas"`
-	}
-
-	var req ScaleRequest
-	if err := c.BodyParser(&req); err != nil {
-		slog.Info("[Workloads] invalid request body", "error", err)
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
-	}
-
-	// Validate required fields
-	if req.WorkloadName == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "workloadName is required"})
-	}
-	if req.Namespace == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "namespace is required"})
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), workloadWriteTimeout)
-	defer cancel()
-
-	result, err := h.k8sClient.ScaleWorkload(ctx, req.Namespace, req.WorkloadName, req.TargetClusters, req.Replicas)
-	if err != nil {
-		return handleK8sError(c, err)
-	}
-
-	return c.JSON(result)
-}
-
-// DeleteWorkload deletes a workload from specified clusters
-// DELETE /api/workloads/:cluster/:namespace/:name
-func (h *WorkloadHandlers) DeleteWorkload(c *fiber.Ctx) error {
-	// Workload mutations require console admin (#5974).
-	if err := h.requireAdmin(c); err != nil {
-		return err
-	}
-
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
-	}
-
-	cluster := c.Params("cluster")
-	namespace := c.Params("namespace")
-	name := c.Params("name")
-
-	ctx, cancel := context.WithTimeout(c.Context(), workloadWriteTimeout)
-	defer cancel()
-
-	if err := h.k8sClient.DeleteWorkload(ctx, cluster, namespace, name); err != nil {
-		return handleK8sError(c, err)
-	}
-
-	return c.JSON(fiber.Map{
-		"message":   "Workload deleted successfully",
-		"cluster":   cluster,
-		"namespace": namespace,
-		"name":      name,
-	})
-}
+// NOTE: DeleteWorkload moved to kc-agent (#7993 Phase 1 PR B).
+// The agent (pkg/agent/server_http.go handleDeleteWorkloadHTTP) runs under
+// the user's kubeconfig instead of the backend pod SA and calls the same
+// shared pkg/k8s MultiClusterClient.DeleteWorkload method.
 
 // GetClusterCapabilities returns the capabilities of all clusters
 // GET /api/workloads/capabilities
 func (h *WorkloadHandlers) GetClusterCapabilities(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), workloadListTimeout)
@@ -1069,7 +1093,7 @@ func (h *WorkloadHandlers) GetClusterCapabilities(c *fiber.Ctx) error {
 // GET /api/workloads/policies
 func (h *WorkloadHandlers) ListBindingPolicies(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), workloadDefaultTimeout)
@@ -1088,13 +1112,18 @@ func (h *WorkloadHandlers) ListBindingPolicies(c *fiber.Ctx) error {
 // GET /api/workloads/deploy-logs/:cluster/:namespace/:name?tail=8
 func (h *WorkloadHandlers) GetDeployLogs(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")
 	namespace := c.Params("namespace")
 	name := c.Params("name")
-	tailLines := c.QueryInt("tail", 8)
+	const defaultTailLines = 8
+	tailLines := c.QueryInt("tail", defaultTailLines)
+	// Clamp to a safe range to prevent panic from negative slice indices (#7003).
+	if tailLines <= 0 {
+		tailLines = defaultTailLines
+	}
 
 	client, err := h.k8sClient.GetClient(cluster)
 	if err != nil {
@@ -1103,6 +1132,13 @@ func (h *WorkloadHandlers) GetDeployLogs(c *fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(c.Context(), workloadDeployLogsTimeout)
 	defer cancel()
+
+	// Validate workload name to prevent label selector injection (#7004).
+	// A crafted name like "foo,env=prod" would expand to "app=foo,env=prod"
+	// and match pods from unrelated workloads.
+	if !validLabelValue.MatchString(name) {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid workload name"})
+	}
 
 	// Try label selector first: app=<name>
 	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{

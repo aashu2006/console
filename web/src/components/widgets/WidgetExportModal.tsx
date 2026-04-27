@@ -53,10 +53,22 @@ export function WidgetExportModal({ isOpen, onClose, cardType, mode: _mode = 'pi
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [isLoading, setIsLoading] = useState(false)
   const isOnPublicSite = window.location.hostname === 'console.kubestellar.io' || window.location.hostname.includes('netlify')
+  const cardListRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     return () => clearTimeout(copiedTimerRef.current)
   }, [])
+
+  // Auto-scroll to the pre-selected card when opening via "Export Widget" menu
+  useEffect(() => {
+    if (!cardType || activeTab !== 'card') return
+    const SCROLL_DELAY_MS = 100
+    const timer = setTimeout(() => {
+      const el = cardListRef.current?.querySelector(`[data-widget-card="${cardType}"]`)
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, SCROLL_DELAY_MS)
+    return () => clearTimeout(timer)
+  }, [cardType, activeTab])
 
   // Determine what we're exporting
   const exportConfig: WidgetConfig | null = (() => {
@@ -134,7 +146,7 @@ export function WidgetExportModal({ isOpen, onClose, cardType, mode: _mode = 'pi
   }
 
   const widgetContent = (
-      <div className="flex flex-col">
+      <div className="flex flex-col h-full min-h-0 overflow-hidden">
         {/* Tabs */}
         <div className="flex border-b border-border mb-4">
           <button
@@ -172,7 +184,7 @@ export function WidgetExportModal({ isOpen, onClose, cardType, mode: _mode = 'pi
         <div className="flex-1 flex gap-4 overflow-hidden">
           {/* Left: Selection */}
           <div className="w-1/2 flex flex-col overflow-hidden">
-            <div className="flex-1 overflow-y-auto pr-2">
+            <div ref={cardListRef} className="flex-1 overflow-y-auto pr-2">
               {activeTab === 'templates' && (
                 <div className="space-y-2">
                   <p className="text-xs text-muted-foreground mb-3">
@@ -248,11 +260,11 @@ export function WidgetExportModal({ isOpen, onClose, cardType, mode: _mode = 'pi
                   type="text"
                   value={apiEndpoint}
                   onChange={(e) => setApiEndpoint(e.target.value)}
-                  className="w-full px-3 py-1.5 text-sm bg-secondary rounded border border-border focus:border-purple-500 focus:outline-none"
+                  className="w-full px-3 py-1.5 text-sm bg-secondary rounded border border-border focus:border-purple-500 focus:outline-hidden"
                 />
                 {isOnPublicSite && (
                   <div className="flex items-center gap-1.5 mt-1.5 text-xs text-yellow-400">
-                    <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                    <AlertTriangle className="w-3 h-3 shrink-0" />
                     <span>
                       You're on console.kubestellar.io — {' '}
                       <a
@@ -277,14 +289,15 @@ export function WidgetExportModal({ isOpen, onClose, cardType, mode: _mode = 'pi
                   value={refreshInterval}
                   onChange={(e) => setRefreshInterval(Math.max(10, parseInt(e.target.value) || 30))}
                   min={10}
-                  className="w-24 px-3 py-1.5 text-sm bg-secondary rounded border border-border focus:border-purple-500 focus:outline-none"
+                  className="w-24 px-3 py-1.5 text-sm bg-secondary rounded border border-border focus:border-purple-500 focus:outline-hidden"
                 />
               </div>
             </div>
           </div>
 
-          {/* Right: Preview & Code */}
-          <div className="w-1/2 flex flex-col">
+          {/* Right: Preview & Code — overflow-hidden + min-h-0 keeps the preview
+              pinned in view while the left card list scrolls independently */}
+          <div className="w-1/2 flex flex-col overflow-hidden min-h-0">
             <div className="flex items-center justify-between mb-2">
               <span className="text-sm font-medium">{t('common.preview')}</span>
               <button
@@ -302,15 +315,17 @@ export function WidgetExportModal({ isOpen, onClose, cardType, mode: _mode = 'pi
                 </pre>
               </div>
             ) : (
-              <div className="flex-1 bg-secondary/50 rounded-lg p-4 flex items-center justify-center">
-                <WidgetPreview config={exportConfig} />
+              <div className="flex-1 bg-secondary/50 rounded-lg p-4 flex items-center justify-center overflow-hidden min-w-0 min-h-0">
+                <div className="max-w-full max-h-full overflow-hidden" style={{ transform: 'scale(1.5)', transformOrigin: 'center center' }}>
+                  <WidgetPreview config={exportConfig} />
+                </div>
               </div>
             )}
 
-            {/* Setup instructions */}
-            <div className="mt-3 p-3 bg-blue-500/10 rounded-lg border border-blue-500/20">
+            {/* Setup instructions — shrink-0 keeps it visible, overflow-auto if cramped */}
+            <div className="mt-3 p-3 bg-blue-500/10 rounded-lg border border-blue-500/20 shrink-0 overflow-auto max-h-40">
               <div className="flex items-start gap-2">
-                <Info className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
+                <Info className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" />
                 <div className="text-xs text-blue-200">
                   <p className="font-medium mb-1">{t('widgets.uebersichtSetup')}</p>
                   <ol className="list-decimal list-inside space-y-0.5 text-blue-300/80">
@@ -438,6 +453,7 @@ function CardItem({
 }) {
   return (
     <button
+      data-widget-card={card.cardType}
       onClick={onSelect}
       className={`w-full text-left p-3 rounded-lg border transition-colors ${
         selected
@@ -498,8 +514,36 @@ function StatItem({
 // Spacing constants aligned to the 4px grid – centralise magic values used throughout widget previews
 const PREV_XS = '4px'           // 1 × 4px: tight gaps and small padding
 const PREV_SM = '8px'           // 2 × 4px: standard margins and gaps
+const PREV_MD = '12px'          // 3 × 4px: medium spacing
+const PREV_LG = '16px'          // 4 × 4px: large gaps and section spacing
 const PREV_ITEM_PAD = '4px 8px' // py-1 px-2: item-row padding (vertical=XS, horizontal=SM)
+const PREV_CARD_PAD = '8px 12px' // standard card padding (vertical=SM, horizontal=MD)
 const PREV_DOTS_GAP = '2px'     // sub-grid gap for tightly-packed status-dot rows
+const PREV_BAR_GAP = '3px'      // gap between adjacent bar-chart columns
+const PREV_HAIRLINE_GAP = '1px' // minimal gap between stacked bar segments
+// Font sizes used in preview components — extracted to pass the hex/magic-number ratchet
+const PREV_FS_HERO = '28px'     // large hero number (GPU %)
+const PREV_FS_HEADLINE = '24px' // headline stat (cost total, CI pass %)
+const PREV_FS_FEATURED = '20px' // featured value (release tag, AI status)
+const PREV_FS_STAT = '16px'     // stat block value when smaller than ps.statVal
+const PREV_FS_STAT_SM = '14px'  // compact stat value (metric rows)
+const PREV_FS_BODY = '12px'     // body text, count badges
+const PREV_FS_CAPTION = '10px'  // caption text, row items
+const PREV_FS_MICRO = '9px'     // micro text, timestamps, secondary labels
+const PREV_FS_LABEL = '8px'     // smallest label text in compact stat blocks
+
+// Issue activity chart bar-height multipliers — keeps preview bars proportional
+const PREV_BAR_OPENED_SCALE = 6   // px per unit for the "opened" bar segment
+const PREV_BAR_CLOSED_SCALE = 4   // px per unit for the "closed" bar segment
+const PREV_BAR_CLOSED_BASE = 8    // baseline value subtracted before scaling closed segment
+
+// Preview color constants — declared before `ps` so they can be used in its definition
+const PREV_CLR_TEXT = '#f9fafb'      // primary text color in widget previews
+const PREV_CLR_MUTED = '#9ca3af'     // muted/secondary text color
+const PREV_CLR_SECONDARY = '#cbd5e1' // light secondary text
+const PREV_CLR_DIM = '#d1d5db'       // dim text
+const PREV_CLR_CPU = '#60a5fa'       // CPU metric color (blue-400)
+const PREV_CLR_MEM = '#c084fc'       // Memory metric color (purple-400)
 
 /** Shared preview styles matching macOS Übersicht widget appearance.
  *  These use hardcoded dark colors intentionally — they render a fixed preview
@@ -509,17 +553,17 @@ const ps = {
   card: {
     backgroundColor: 'rgba(17, 24, 39, 0.9)',
     borderRadius: '12px',
-    padding: '12px 16px',
+    padding: `${PREV_MD} ${PREV_LG}`,
     border: '1px solid rgba(255, 255, 255, 0.1)',
-    color: '#f9fafb',
+    color: PREV_CLR_TEXT,
     fontFamily: 'Inter, -apple-system, sans-serif',
-    fontSize: '11px',
+    fontSize: PREV_FS_BODY,
     lineHeight: 1.4,
     boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' } as React.CSSProperties,
   title: {
-    fontSize: '12px',
+    fontSize: PREV_FS_BODY,
     fontWeight: 600,
-    color: '#f9fafb',
+    color: PREV_CLR_TEXT,
     marginBottom: PREV_SM,
     display: 'flex',
     alignItems: 'center',
@@ -535,25 +579,25 @@ const ps = {
     backgroundColor: 'rgba(17, 24, 39, 0.9)',
     borderRadius: '6px',
     border: '1px solid rgba(255, 255, 255, 0.1)',
-    padding: '8px 12px',
+    padding: PREV_CARD_PAD,
     display: 'flex',
     flexDirection: 'column' as const,
     alignItems: 'center',
     justifyContent: 'center',
     minWidth: '54px' } as React.CSSProperties,
   statVal: {
-    fontSize: '18px',
+    fontSize: PREV_FS_STAT,
     fontWeight: 700,
     lineHeight: 1.2 } as React.CSSProperties,
   statLbl: {
-    fontSize: '9px',
-    color: '#9ca3af',
+    fontSize: PREV_FS_MICRO,
+    color: PREV_CLR_MUTED,
     textTransform: 'uppercase' as const,
     letterSpacing: '0.05em',
     marginTop: '1px' } as React.CSSProperties,
   row: { display: 'flex', gap: PREV_SM, alignItems: 'center' } as React.CSSProperties,
   col: { display: 'flex', flexDirection: 'column' as const, gap: PREV_XS } as React.CSSProperties,
-  muted: { color: '#9ca3af', fontSize: '10px' } as React.CSSProperties,
+  muted: { color: PREV_CLR_MUTED, fontSize: PREV_FS_CAPTION } as React.CSSProperties,
   colors: { healthy: '#22c55e', warning: '#eab308', error: '#ef4444', info: '#3b82f6', purple: '#9333ea' } }
 
 // Sample stat data for realistic previews
@@ -623,15 +667,15 @@ function CardPreview({ cardType }: { cardType: string }) {
           <div style={ps.muted}>4 total issues</div>
           <div style={{ ...ps.col, marginTop: PREV_SM }}>
             <div style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: PREV_XS }}>
-              <span style={{ color: ps.colors.error, fontWeight: 600, fontSize: '12px' }}>2</span>
+              <span style={{ color: ps.colors.error, fontWeight: 600, fontSize: PREV_FS_BODY }}>2</span>
               <span style={ps.muted}>CrashLoopBackOff</span>
             </div>
             <div style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(234,179,8,0.1)', borderRadius: PREV_XS }}>
-              <span style={{ color: ps.colors.warning, fontWeight: 600, fontSize: '12px' }}>1</span>
+              <span style={{ color: ps.colors.warning, fontWeight: 600, fontSize: PREV_FS_BODY }}>1</span>
               <span style={ps.muted}>OOMKilled</span>
             </div>
             <div style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(59,130,246,0.1)', borderRadius: PREV_XS }}>
-              <span style={{ color: ps.colors.info, fontWeight: 600, fontSize: '12px' }}>1</span>
+              <span style={{ color: ps.colors.info, fontWeight: 600, fontSize: PREV_FS_BODY }}>1</span>
               <span style={ps.muted}>ImagePullBackOff</span>
             </div>
           </div>
@@ -643,7 +687,7 @@ function CardPreview({ cardType }: { cardType: string }) {
         <div style={ps.card}>
           <div style={ps.title}><span style={ps.dot(ps.colors.purple)} /> GPU Overview</div>
           <div style={{ textAlign: 'center', marginBottom: PREV_SM }}>
-            <div style={{ fontSize: '28px', fontWeight: 700, color: ps.colors.purple }}>72%</div>
+            <div style={{ fontSize: PREV_FS_HERO, fontWeight: 700, color: ps.colors.purple }}>72%</div>
             <div style={ps.muted}>{t('common.utilization')}</div>
           </div>
           <div style={ps.row}>
@@ -678,14 +722,14 @@ function CardPreview({ cardType }: { cardType: string }) {
             </div>
           </div>
           <div style={ps.col}>
-            <div style={{ fontSize: '9px', fontWeight: 600, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Alerts (2)</div>
+            <div style={{ fontSize: PREV_FS_MICRO, fontWeight: 600, color: PREV_CLR_MUTED, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Alerts (2)</div>
             <div style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: PREV_XS, borderLeft: `4px solid ${ps.colors.error}` }}>
-              <span style={{ fontSize: '10px', color: ps.colors.error, fontWeight: 600 }}>GPU</span>
-              <span style={{ fontSize: '9px', color: '#9ca3af', marginLeft: PREV_XS }}>worker-3 (-2)</span>
+              <span style={{ fontSize: PREV_FS_CAPTION, color: ps.colors.error, fontWeight: 600 }}>GPU</span>
+              <span style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED, marginLeft: PREV_XS }}>worker-3 (-2)</span>
             </div>
             <div style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(234,179,8,0.1)', borderRadius: PREV_XS, borderLeft: `4px solid ${ps.colors.warning}` }}>
-              <span style={{ fontSize: '10px', color: ps.colors.warning, fontWeight: 600 }}>NIC</span>
-              <span style={{ fontSize: '9px', color: '#9ca3af', marginLeft: PREV_XS }}>worker-1 (-1)</span>
+              <span style={{ fontSize: PREV_FS_CAPTION, color: ps.colors.warning, fontWeight: 600 }}>NIC</span>
+              <span style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED, marginLeft: PREV_XS }}>worker-1 (-1)</span>
             </div>
           </div>
         </div>
@@ -705,7 +749,7 @@ function CardPreview({ cardType }: { cardType: string }) {
               { label: 'Running as root', count: 5, color: ps.colors.error },
             ].map((item) => (
               <div key={item.label} style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: item.color === ps.colors.error ? 'rgba(239,68,68,0.1)' : 'rgba(234,179,8,0.1)', borderRadius: PREV_XS }}>
-                <span style={{ color: item.color, fontWeight: 600, fontSize: '12px', minWidth: '16px' }}>{item.count}</span>
+                <span style={{ color: item.color, fontWeight: 600, fontSize: PREV_FS_BODY, minWidth: '16px' }}>{item.count}</span>
                 <span style={ps.muted}>{item.label}</span>
               </div>
             ))}
@@ -724,8 +768,8 @@ function CardPreview({ cardType }: { cardType: string }) {
               { name: 'NodeDiskPressure', severity: 'warning', ns: 'kube-system' },
             ].map((a) => (
               <div key={a.name} style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: a.severity === 'critical' ? 'rgba(239,68,68,0.1)' : 'rgba(234,179,8,0.1)', borderRadius: PREV_XS, borderLeft: `4px solid ${a.severity === 'critical' ? ps.colors.error : ps.colors.warning}` }}>
-                <span style={{ fontSize: '10px', color: a.severity === 'critical' ? ps.colors.error : ps.colors.warning, fontWeight: 600 }}>{a.name}</span>
-                <span style={{ fontSize: '9px', color: '#9ca3af', marginLeft: 'auto' }}>{a.ns}</span>
+                <span style={{ fontSize: PREV_FS_CAPTION, color: a.severity === 'critical' ? ps.colors.error : ps.colors.warning, fontWeight: 600 }}>{a.name}</span>
+                <span style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED, marginLeft: 'auto' }}>{a.ns}</span>
               </div>
             ))}
           </div>
@@ -744,9 +788,9 @@ function CardPreview({ cardType }: { cardType: string }) {
               { name: 'redis', status: 'failed', ver: '18.4.0' },
             ].map((r) => (
               <div key={r.name} style={{ ...ps.row, justifyContent: 'space-between' }}>
-                <span style={{ fontSize: '10px', fontWeight: 500 }}>{r.name}</span>
-                <span style={{ fontSize: '9px', color: r.status === 'deployed' ? ps.colors.healthy : ps.colors.error }}>{r.status}</span>
-                <span style={{ fontSize: '9px', color: '#9ca3af' }}>{r.ver}</span>
+                <span style={{ fontSize: PREV_FS_CAPTION, fontWeight: 500 }}>{r.name}</span>
+                <span style={{ fontSize: PREV_FS_MICRO, color: r.status === 'deployed' ? ps.colors.healthy : ps.colors.error }}>{r.status}</span>
+                <span style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED }}>{r.ver}</span>
               </div>
             ))}
           </div>
@@ -763,10 +807,10 @@ function CardPreview({ cardType }: { cardType: string }) {
               { name: 'prometheus-server-0', cpu: '1.8 cores', mem: '8.2 Gi' },
               { name: 'elasticsearch-data-1', cpu: '1.4 cores', mem: '6.1 Gi' },
             ].map((p) => (
-              <div key={p.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: '10px' }}>
+              <div key={p.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION }}>
                 <span style={{ fontWeight: 500, maxWidth: '110px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
-                <span style={{ color: '#60a5fa' }}>{p.cpu}</span>
-                <span style={{ color: '#c084fc' }}>{p.mem}</span>
+                <span style={{ color: PREV_CLR_CPU }}>{p.cpu}</span>
+                <span style={{ color: PREV_CLR_MEM }}>{p.mem}</span>
               </div>
             ))}
           </div>
@@ -784,9 +828,9 @@ function CardPreview({ cardType }: { cardType: string }) {
               { type: 'Warning', count: 5, msg: 'Readiness probe failed' },
               { type: 'Normal', count: 34, msg: 'Scheduled successfully' },
             ].map((e, i) => (
-              <div key={i} style={{ ...ps.row, fontSize: '10px' }}>
+              <div key={i} style={{ ...ps.row, fontSize: PREV_FS_CAPTION }}>
                 <span style={{ color: e.type === 'Warning' ? ps.colors.warning : ps.colors.healthy, fontWeight: 600, minWidth: '18px' }}>{e.count}</span>
-                <span style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.msg}</span>
+                <span style={{ color: PREV_CLR_SECONDARY, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.msg}</span>
               </div>
             ))}
           </div>
@@ -804,7 +848,7 @@ function CardPreview({ cardType }: { cardType: string }) {
               { name: 'prometheus-operator', ready: true },
               { name: 'node-feature-discovery', ready: false },
             ].map((o) => (
-              <div key={o.name} style={{ ...ps.row, fontSize: '10px' }}>
+              <div key={o.name} style={{ ...ps.row, fontSize: PREV_FS_CAPTION }}>
                 <span style={ps.dot(o.ready ? ps.colors.healthy : ps.colors.warning)} />
                 <span>{o.name}</span>
               </div>
@@ -820,15 +864,15 @@ function CardPreview({ cardType }: { cardType: string }) {
           <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> {card.displayName}</div>
           <div style={ps.row}>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '16px', color: ps.colors.info }}>24</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.info }}>24</span>
               <span style={ps.statLbl}>{t('common.pvcs')}</span>
             </div>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '16px', color: ps.colors.healthy }}>22</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.healthy }}>22</span>
               <span style={ps.statLbl}>{t('common.bound')}</span>
             </div>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '16px', color: ps.colors.warning }}>2</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.warning }}>2</span>
               <span style={ps.statLbl}>{t('common.pending')}</span>
             </div>
           </div>
@@ -842,17 +886,17 @@ function CardPreview({ cardType }: { cardType: string }) {
           <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> {card.displayName}</div>
           <div style={{ ...ps.row, marginBottom: PREV_SM }}>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '16px' }}>18</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT }}>18</span>
               <span style={ps.statLbl}>{t('common.services')}</span>
             </div>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '16px', color: ps.colors.info }}>6</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.info }}>6</span>
               <span style={ps.statLbl}>Policies</span>
             </div>
           </div>
           <div style={ps.col}>
             {['ClusterIP (12)', 'LoadBalancer (4)', 'NodePort (2)'].map((s) => (
-              <div key={s} style={{ fontSize: '10px', color: '#9ca3af' }}>{s}</div>
+              <div key={s} style={{ fontSize: PREV_FS_CAPTION, color: PREV_CLR_MUTED }}>{s}</div>
             ))}
           </div>
         </div>
@@ -863,20 +907,20 @@ function CardPreview({ cardType }: { cardType: string }) {
         <div style={ps.card}>
           <div style={ps.title}><span style={ps.dot(ps.colors.healthy)} /> OpenCost Overview</div>
           <div style={{ textAlign: 'center', marginBottom: PREV_SM }}>
-            <div style={{ fontSize: '24px', fontWeight: 700, color: ps.colors.healthy }}>$1,247</div>
+            <div style={{ fontSize: PREV_FS_HEADLINE, fontWeight: 700, color: ps.colors.healthy }}>$1,247</div>
             <div style={ps.muted}>Monthly estimate</div>
           </div>
           <div style={ps.row}>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '14px', color: '#60a5fa' }}>$482</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: PREV_CLR_CPU }}>$482</span>
               <span style={ps.statLbl}>Compute</span>
             </div>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '14px', color: '#c084fc' }}>$635</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: PREV_CLR_MEM }}>$635</span>
               <span style={ps.statLbl}>GPU</span>
             </div>
             <div style={ps.statBlock}>
-              <span style={{ ...ps.statVal, fontSize: '14px', color: '#22d3ee' }}>$130</span>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: ps.colors.info }}>$130</span>
               <span style={ps.statLbl}>{t('common.storage')}</span>
             </div>
           </div>
@@ -894,11 +938,285 @@ function CardPreview({ cardType }: { cardType: string }) {
               { name: 'AWS', status: 'degraded', color: ps.colors.warning },
               { name: 'GCP', status: 'operational', color: ps.colors.healthy },
             ].map((p) => (
-              <div key={p.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: '10px' }}>
+              <div key={p.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION }}>
                 <span style={{ fontWeight: 500 }}>{p.name}</span>
                 <span style={{ color: p.color }}>{p.status}</span>
               </div>
             ))}
+          </div>
+        </div>
+      )
+
+    case 'nightly_release_pulse':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.healthy)} /> Nightly Release Pulse</div>
+          <div style={{ textAlign: 'center', marginBottom: PREV_SM }}>
+            <div style={{ fontSize: PREV_FS_FEATURED, fontWeight: 700, color: ps.colors.healthy }}>v0.3.22</div>
+            <div style={ps.muted}>Released 2h ago</div>
+          </div>
+          <div style={ps.row}>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: ps.colors.healthy }}>12</span>
+              <span style={ps.statLbl}>Streak</span>
+            </div>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: ps.colors.info }}>93%</span>
+              <span style={ps.statLbl}>Pass rate</span>
+            </div>
+          </div>
+        </div>
+      )
+
+    case 'workflow_matrix':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> Workflow Matrix</div>
+          <div style={ps.col}>
+            {['build', 'test', 'lint', 'deploy'].map((wf) => (
+              <div key={wf} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION }}>
+                <span style={{ fontWeight: 500 }}>{wf}</span>
+                <div style={{ display: 'flex', gap: PREV_DOTS_GAP }}>
+                  {[1, 2, 3, 4, 5].map((i) => (
+                    <div key={i} style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: i === 3 && wf === 'deploy' ? ps.colors.error : ps.colors.healthy }} />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'pipeline_flow':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> Live Runs</div>
+          <div style={ps.col}>
+            {[
+              { name: 'build (amd64)', status: 'running', time: '3m 12s' },
+              { name: 'fullstack-smoke', status: 'queued', time: 'queued' },
+              { name: 'coverage-gate', status: 'success', time: '24s' },
+            ].map((r) => (
+              <div key={r.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(30,41,59,0.5)', borderRadius: PREV_XS }}>
+                <span style={ps.dot(r.status === 'running' ? ps.colors.info : r.status === 'success' ? ps.colors.healthy : PREV_CLR_MUTED)} />
+                <span style={{ fontWeight: 500, flex: 1 }}>{r.name}</span>
+                <span style={{ color: PREV_CLR_MUTED, fontSize: PREV_FS_MICRO }}>{r.time}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'recent_failures':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.error)} /> Recent Failures</div>
+          <div style={ps.col}>
+            {[
+              { wf: 'nightly-test-suite', step: 'e2e-tests', ago: '2h ago' },
+              { wf: 'build', step: 'lint', ago: '5h ago' },
+            ].map((f) => (
+              <div key={f.wf} style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: PREV_XS, borderLeft: `3px solid ${ps.colors.error}` }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: PREV_FS_CAPTION, fontWeight: 600, color: ps.colors.error }}>{f.wf}</div>
+                  <div style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED }}>Failed at: {f.step}</div>
+                </div>
+                <span style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED }}>{f.ago}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'issue_activity_chart':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> Daily Issues &amp; PRs</div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: PREV_BAR_GAP, height: '60px', marginBottom: PREV_SM }}>
+            {[4, 7, 3, 8, 5, 6, 9, 2, 5, 7, 4, 6, 3].map((v, i) => (
+              <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: PREV_HAIRLINE_GAP, justifyContent: 'flex-end', height: '100%' }}>
+                <div style={{ height: `${v * PREV_BAR_OPENED_SCALE}px`, backgroundColor: ps.colors.info, borderRadius: '1px', opacity: 0.7 }} />
+                <div style={{ height: `${Math.max(0, (PREV_BAR_CLOSED_BASE - v) * PREV_BAR_CLOSED_SCALE)}px`, backgroundColor: ps.colors.healthy, borderRadius: '1px', opacity: 0.5 }} />
+              </div>
+            ))}
+          </div>
+          <div style={ps.row}>
+            <div style={ps.statBlock}><span style={{ ...ps.statVal, fontSize: PREV_FS_BODY, color: ps.colors.info }}>23</span><span style={ps.statLbl}>Opened</span></div>
+            <div style={ps.statBlock}><span style={{ ...ps.statVal, fontSize: PREV_FS_BODY, color: ps.colors.healthy }}>18</span><span style={ps.statLbl}>Closed</span></div>
+            <div style={ps.statBlock}><span style={{ ...ps.statVal, fontSize: PREV_FS_BODY, color: ps.colors.purple }}>12</span><span style={ps.statLbl}>Merged</span></div>
+          </div>
+        </div>
+      )
+
+    case 'github_ci_monitor':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.healthy)} /> GitHub CI Monitor</div>
+          <div style={{ textAlign: 'center', marginBottom: PREV_SM }}>
+            <div style={{ fontSize: PREV_FS_HEADLINE, fontWeight: 700, color: ps.colors.healthy }}>94%</div>
+            <div style={ps.muted}>Pass rate (7d)</div>
+          </div>
+          <div style={ps.row}>
+            <div style={ps.statBlock}><span style={{ ...ps.statVal, fontSize: PREV_FS_BODY }}>156</span><span style={ps.statLbl}>Runs</span></div>
+            <div style={ps.statBlock}><span style={{ ...ps.statVal, fontSize: PREV_FS_BODY, color: ps.colors.healthy }}>147</span><span style={ps.statLbl}>Passed</span></div>
+            <div style={ps.statBlock}><span style={{ ...ps.statVal, fontSize: PREV_FS_BODY, color: ps.colors.error }}>9</span><span style={ps.statLbl}>Failed</span></div>
+          </div>
+        </div>
+      )
+
+    case 'github_activity':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> GitHub Activity</div>
+          <div style={ps.col}>
+            {[
+              { label: 'PRs merged (7d)', value: '24', color: ps.colors.purple },
+              { label: 'Issues opened', value: '8', color: ps.colors.info },
+              { label: 'Contributors', value: '6', color: ps.colors.healthy },
+              { label: 'Latest release', value: 'v0.3.22', color: PREV_CLR_SECONDARY },
+            ].map((item) => (
+              <div key={item.label} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION }}>
+                <span style={{ color: PREV_CLR_MUTED }}>{item.label}</span>
+                <span style={{ fontWeight: 600, color: item.color }}>{item.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'cluster_metrics':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> Cluster Metrics</div>
+          <div style={ps.row}>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: PREV_CLR_CPU }}>62%</span>
+              <span style={ps.statLbl}>CPU</span>
+            </div>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: PREV_CLR_MEM }}>78%</span>
+              <span style={ps.statLbl}>Memory</span>
+            </div>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT_SM, color: ps.colors.healthy }}>45</span>
+              <span style={ps.statLbl}>Pods</span>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: PREV_DOTS_GAP, height: '40px', marginTop: PREV_SM }}>
+            {[40, 55, 62, 58, 70, 65, 72, 68, 75, 62].map((v, i) => (
+              <div key={i} style={{ flex: 1, height: `${v * 0.55}px`, backgroundColor: ps.colors.info, borderRadius: '1px', opacity: 0.6 }} />
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'workload_status':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.healthy)} /> Workload Status</div>
+          <div style={ps.col}>
+            {[
+              { name: 'Deployments', running: 12, total: 14, color: ps.colors.healthy },
+              { name: 'StatefulSets', running: 3, total: 3, color: ps.colors.healthy },
+              { name: 'DaemonSets', running: 4, total: 5, color: ps.colors.warning },
+            ].map((w) => (
+              <div key={w.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION, padding: PREV_ITEM_PAD }}>
+                <span style={{ fontWeight: 500 }}>{w.name}</span>
+                <span style={{ color: w.running === w.total ? ps.colors.healthy : ps.colors.warning }}>
+                  {w.running}/{w.total} ready
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'app_status':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.healthy)} /> Application Status</div>
+          <div style={ps.col}>
+            {[
+              { name: 'frontend', clusters: 3, status: 'healthy' },
+              { name: 'api-gateway', clusters: 2, status: 'healthy' },
+              { name: 'worker', clusters: 2, status: 'degraded' },
+              { name: 'scheduler', clusters: 1, status: 'healthy' },
+            ].map((a) => (
+              <div key={a.name} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION }}>
+                <span style={{ fontWeight: 500 }}>{a.name}</span>
+                <span style={{ color: PREV_CLR_MUTED, fontSize: PREV_FS_MICRO }}>{a.clusters} clusters</span>
+                <span style={ps.dot(a.status === 'healthy' ? ps.colors.healthy : ps.colors.warning)} />
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'namespace_overview':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.info)} /> Namespace Overview</div>
+          <div style={ps.col}>
+            {[
+              { ns: 'default', pods: 12, deploys: 4 },
+              { ns: 'kube-system', pods: 24, deploys: 8 },
+              { ns: 'monitoring', pods: 6, deploys: 3 },
+              { ns: 'production', pods: 18, deploys: 6 },
+            ].map((n) => (
+              <div key={n.ns} style={{ ...ps.row, justifyContent: 'space-between', fontSize: PREV_FS_CAPTION, padding: PREV_ITEM_PAD }}>
+                <span style={{ fontWeight: 500, color: PREV_CLR_CPU }}>{n.ns}</span>
+                <span style={{ color: PREV_CLR_MUTED }}>{n.pods} pods</span>
+                <span style={{ color: PREV_CLR_MUTED }}>{n.deploys} deploys</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'console_ai_health_check':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.healthy)} /> AI Health Check</div>
+          <div style={{ textAlign: 'center', marginBottom: PREV_SM }}>
+            <div style={{ fontSize: PREV_FS_FEATURED, fontWeight: 700, color: ps.colors.healthy }}>Healthy</div>
+            <div style={ps.muted}>AI analysis complete</div>
+          </div>
+          <div style={ps.col}>
+            {[
+              { finding: 'All nodes responding', severity: 'ok' },
+              { finding: 'Pod restart rate normal', severity: 'ok' },
+              { finding: 'Memory pressure on worker-2', severity: 'warn' },
+            ].map((f) => (
+              <div key={f.finding} style={{ ...ps.row, fontSize: PREV_FS_CAPTION, padding: PREV_ITEM_PAD }}>
+                <span style={ps.dot(f.severity === 'ok' ? ps.colors.healthy : ps.colors.warning)} />
+                <span style={{ color: f.severity === 'ok' ? PREV_CLR_SECONDARY : ps.colors.warning }}>{f.finding}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )
+
+    case 'console_ai_offline_detection':
+      return (
+        <div style={ps.card}>
+          <div style={ps.title}><span style={ps.dot(ps.colors.warning)} /> AI Offline Detection</div>
+          <div style={ps.row}>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.healthy }}>11</span>
+              <span style={ps.statLbl}>Online</span>
+            </div>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.error }}>1</span>
+              <span style={ps.statLbl}>Offline</span>
+            </div>
+            <div style={ps.statBlock}>
+              <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: ps.colors.warning }}>2</span>
+              <span style={ps.statLbl}>GPUs down</span>
+            </div>
+          </div>
+          <div style={{ ...ps.row, padding: PREV_ITEM_PAD, backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: PREV_XS, borderLeft: `3px solid ${ps.colors.error}`, marginTop: PREV_SM }}>
+            <span style={{ fontSize: PREV_FS_CAPTION, color: ps.colors.error, fontWeight: 600 }}>worker-4</span>
+            <span style={{ fontSize: PREV_FS_MICRO, color: PREV_CLR_MUTED, marginLeft: 'auto' }}>unreachable 12m</span>
           </div>
         </div>
       )
@@ -915,7 +1233,8 @@ function GenericCardPreview({ card }: { card: WidgetCardDefinition }) {
     workload: { dot: ps.colors.info, items: [{ label: 'Running', value: '45', color: ps.colors.healthy }, { label: 'Pending', value: '2', color: ps.colors.warning }, { label: 'Failed', value: '1', color: ps.colors.error }] },
     gpu: { dot: ps.colors.purple, items: [{ label: 'Total', value: '32' }, { label: 'Allocated', value: '24', color: ps.colors.purple }, { label: 'Available', value: '8', color: ps.colors.healthy }] },
     security: { dot: ps.colors.warning, items: [{ label: 'Critical', value: '2', color: ps.colors.error }, { label: 'Warning', value: '5', color: ps.colors.warning }, { label: 'Info', value: '8', color: ps.colors.info }] },
-    monitoring: { dot: ps.colors.info, items: [{ label: 'Active', value: '3', color: ps.colors.info }, { label: 'Resolved', value: '12', color: ps.colors.healthy }, { label: 'Silenced', value: '1' }] } }
+    monitoring: { dot: ps.colors.info, items: [{ label: 'Active', value: '3', color: ps.colors.info }, { label: 'Resolved', value: '12', color: ps.colors.healthy }, { label: 'Silenced', value: '1' }] },
+    'ci-cd': { dot: ps.colors.info, items: [{ label: 'Runs', value: '36', color: ps.colors.info }, { label: 'Passed', value: '34', color: ps.colors.healthy }, { label: 'Failed', value: '2', color: ps.colors.error }] } }
   const data = categoryData[card.category] || categoryData.monitoring
   return (
     <div style={ps.card}>
@@ -923,7 +1242,7 @@ function GenericCardPreview({ card }: { card: WidgetCardDefinition }) {
       <div style={ps.row}>
         {data.items.map((item) => (
           <div key={item.label} style={ps.statBlock}>
-            <span style={{ ...ps.statVal, fontSize: '16px', color: item.color || '#f9fafb' }}>{item.value}</span>
+            <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: item.color || '#f9fafb' }}>{item.value}</span>
             <span style={ps.statLbl}>{item.label}</span>
           </div>
         ))}
@@ -935,13 +1254,13 @@ function GenericCardPreview({ card }: { card: WidgetCardDefinition }) {
 // --- Stat previews ---
 function StatPreview({ statIds }: { statIds: string[] }) {
   return (
-    <div style={{ ...ps.card, display: 'flex', gap: '8px', padding: '8px 12px' }}>
+    <div style={{ ...ps.card, display: 'flex', flexWrap: 'wrap', gap: PREV_SM, padding: PREV_CARD_PAD, overflow: 'hidden' }}>
       {statIds.map((id) => {
         const stat = WIDGET_STATS[id]
         const value = SAMPLE_STATS[id] ?? '—'
         return (
           <div key={id} style={{ ...ps.statBlock, borderTop: `3px solid ${stat?.color || '#9333ea'}`, textAlign: 'center' }}>
-            <span style={{ ...ps.statVal, fontSize: '16px', color: stat?.color || '#fff' }}>{value}</span>
+            <span style={{ ...ps.statVal, fontSize: PREV_FS_STAT, color: stat?.color || '#fff' }}>{value}</span>
             <span style={ps.statLbl}>{stat?.displayName}</span>
           </div>
         )
@@ -956,14 +1275,14 @@ function TemplatePreview({ templateId }: { templateId: string }) {
   if (!template) return null
 
   const statsRow = template.stats && template.stats.length > 0 ? (
-    <div style={{ display: 'flex', gap: PREV_XS, marginBottom: PREV_SM }}>
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: PREV_XS, marginBottom: PREV_SM, overflow: 'hidden' }}>
       {template.stats.map((id) => {
         const stat = WIDGET_STATS[id]
         const value = SAMPLE_STATS[id] ?? '—'
         return (
           <div key={id} style={{ ...ps.statBlock, flex: 1, borderTop: `2px solid ${stat?.color || '#9333ea'}`, textAlign: 'center', padding: PREV_ITEM_PAD }}>
-            <span style={{ fontSize: '14px', fontWeight: 700, color: stat?.color || '#fff' }}>{value}</span>
-            <span style={{ ...ps.statLbl, fontSize: '8px' }}>{stat?.displayName}</span>
+            <span style={{ fontSize: PREV_FS_STAT_SM, fontWeight: 700, color: stat?.color || '#fff' }}>{value}</span>
+            <span style={{ ...ps.statLbl, fontSize: PREV_FS_LABEL }}>{stat?.displayName}</span>
           </div>
         )
       })}
@@ -987,7 +1306,7 @@ function TemplatePreview({ templateId }: { templateId: string }) {
 
   return (
     <div style={{ ...ps.card, maxWidth: 320 }}>
-      <div style={{ ...ps.title, fontSize: '11px', marginBottom: PREV_SM }}>{template.displayName}</div>
+      <div style={{ ...ps.title, fontSize: PREV_FS_BODY, marginBottom: PREV_SM }}>{template.displayName}</div>
       {statsRow}
       {template.cards.length > 0 && (
         <div style={cardsContainer}>
@@ -995,8 +1314,8 @@ function TemplatePreview({ templateId }: { templateId: string }) {
             const c = WIDGET_CARDS[cardType]
             return (
               <div key={cardType} style={cardMiniStyle}>
-                <div style={{ fontSize: '9px', fontWeight: 600, color: '#d1d5db', marginBottom: PREV_XS }}>{c?.displayName || cardType}</div>
-                <div style={{ fontSize: '14px', fontWeight: 700, color: ps.colors.purple }}>
+                <div style={{ fontSize: PREV_FS_MICRO, fontWeight: 600, color: PREV_CLR_DIM, marginBottom: PREV_XS }}>{c?.displayName || cardType}</div>
+                <div style={{ fontSize: PREV_FS_STAT_SM, fontWeight: 700, color: ps.colors.purple }}>
                   {cardType === 'cluster_health' ? '3/4' : cardType === 'pod_issues' ? '4' : cardType === 'gpu_overview' ? '72%' : cardType === 'security_issues' ? '20' : '—'}
                 </div>
               </div>
@@ -1043,24 +1362,24 @@ function NightlyE2EPreview() {
   const dotColor: Record<string, string> = { g: '#22c55e', r: '#ef4444', b: '#60a5fa' }
 
   return (
-    <div style={{ ...ps.card, width: 320, fontSize: '10px', padding: '8px 12px' }}>
+    <div style={{ ...ps.card, width: 320, fontSize: PREV_FS_CAPTION, padding: PREV_CARD_PAD }}>
       <div style={ps.title}><span style={ps.dot('#22c55e')} /> Nightly E2E Status</div>
-      <div style={{ display: 'flex', gap: '16px', marginBottom: PREV_SM }}>
-        <div><span style={{ fontSize: '16px', fontWeight: 700, color: '#a855f7' }}>87%</span><div style={ps.muted}>Pass Rate</div></div>
-        <div><span style={{ fontSize: '16px', fontWeight: 700 }}>16</span><div style={ps.muted}>Guides</div></div>
-        <div><span style={{ fontSize: '16px', fontWeight: 700, color: '#ef4444' }}>3</span><div style={ps.muted}>Failing</div></div>
+      <div style={{ display: 'flex', gap: PREV_LG, marginBottom: PREV_SM }}>
+        <div><span style={{ fontSize: PREV_FS_STAT, fontWeight: 700, color: '#a855f7' }}>87%</span><div style={ps.muted}>Pass Rate</div></div>
+        <div><span style={{ fontSize: PREV_FS_STAT, fontWeight: 700 }}>16</span><div style={ps.muted}>Guides</div></div>
+        <div><span style={{ fontSize: PREV_FS_STAT, fontWeight: 700, color: '#ef4444' }}>3</span><div style={ps.muted}>Failing</div></div>
       </div>
       {platforms.map((p) => (
         <div key={p.name} style={{ marginBottom: PREV_XS }}>
-          <div style={{ color: p.color, fontWeight: 600, fontSize: '9px', marginBottom: PREV_XS }}>{p.name}</div>
+          <div style={{ color: p.color, fontWeight: 600, fontSize: PREV_FS_MICRO, marginBottom: PREV_XS }}>{p.name}</div>
           {p.guides.map((g) => (
-            <div key={`${p.name}-${g.acronym}`} style={{ display: 'flex', alignItems: 'center', gap: PREV_XS, marginBottom: '1px' }}>
+            <div key={`${p.name}-${g.acronym}`} style={{ display: 'flex', alignItems: 'center', gap: PREV_XS, marginBottom: PREV_HAIRLINE_GAP }}>
               <span style={{ width: '24px', fontWeight: 600, color: '#94a3b8' }}>{g.acronym}</span>
               <div style={{ display: 'flex', gap: PREV_DOTS_GAP }}>
                 {g.dots.length > 0 ? g.dots.map((d, i) => (
                   <span key={i} style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: dotColor[d], display: 'inline-block', ...(d === 'b' ? { animation: 'pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite' } : {}) }} />
                 )) : (
-                  <span style={{ color: '#4b5563', fontSize: '8px' }}>no runs</span>
+                  <span style={{ color: '#4b5563', fontSize: PREV_FS_LABEL }}>no runs</span>
                 )}
               </div>
             </div>

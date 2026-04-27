@@ -158,7 +158,7 @@ Please proceed step by step.`,
       <BaseModal.Content>
         <div className="space-y-4">
           {/* Severity summary */}
-          <div className="grid grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <SeverityBox label="Critical" count={critical} color="text-red-400" bg="bg-red-500/10" />
             <SeverityBox label="High" count={high} color="text-orange-400" bg="bg-orange-500/10" />
             <SeverityBox label="Medium" count={medium} color="text-yellow-400" bg="bg-yellow-500/10" />
@@ -207,7 +207,7 @@ Please proceed step by step.`,
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search images..."
-              className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500"
+              className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500"
             />
           </div>
 

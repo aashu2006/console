@@ -112,8 +112,8 @@ export function CardChat({
       if (response.action && onApplyAction) {
         // Show that an action was taken
       }
-    } catch (error) {
-      console.error('Chat error:', error)
+    } catch {
+      // User-visible toast already surfaces the failure (#8816)
       showToast('Failed to send message. Please try again.', 'error')
     } finally {
       setIsLoading(false)
@@ -176,7 +176,7 @@ export function CardChat({
               )}
             >
               {message.role === 'assistant' && (
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center">
+                <div className="shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center">
                   <Bot className="w-4 h-4 text-purple-400" />
                 </div>
               )}
@@ -199,14 +199,14 @@ export function CardChat({
                     </button>
                   </div>
                 )}
-                <div className="flex items-center justify-between mt-1">
+                <div className="flex flex-wrap items-center justify-between gap-y-2 mt-1">
                   <span className="text-xs opacity-50">
                     {new Date(message.timestamp).toLocaleTimeString()}
                   </span>
                   {message.role === 'assistant' && (
                     <button
                       onClick={() => handleCopy(message.id, message.content)}
-                      className="p-1 rounded hover:bg-white/10"
+                      className="p-1 rounded hover:bg-black/10 dark:hover:bg-white/10"
                     >
                       {copiedId === message.id ? (
                         <CheckCircle className="w-3 h-3 text-green-400" />
@@ -218,7 +218,7 @@ export function CardChat({
                 </div>
               </div>
               {message.role === 'user' && (
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-secondary flex items-center justify-center">
+                <div className="shrink-0 w-8 h-8 rounded-full bg-secondary flex items-center justify-center">
                   <User className="w-4 h-4 text-muted-foreground" />
                 </div>
               )}
@@ -227,7 +227,7 @@ export function CardChat({
 
           {isLoading && (
             <div className="flex gap-3">
-              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center">
+              <div className="shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center">
                 <Bot className="w-4 h-4 text-purple-400" />
               </div>
               <div className="bg-secondary/50 rounded-2xl px-4 py-3">

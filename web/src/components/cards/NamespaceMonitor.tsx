@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import {
   Layers, ChevronRight, ChevronDown, Server, Box, Network, HardDrive,
   FileText, FileKey, Clock, Container, RefreshCw, Plus, Minus,
@@ -13,6 +13,7 @@ import { BaseModal } from '../../lib/modals/BaseModal'
 import { CardComponentProps } from './cardRegistry'
 import { useCardLoadingState } from './CardDataContext'
 import { useDemoMode } from '../../hooks/useDemoMode'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
 
 // Resource types to monitor
 type ResourceType = 'pods' | 'deployments' | 'services' | 'configmaps' | 'secrets' | 'pvcs' | 'jobs'
@@ -102,9 +103,14 @@ const ChangeAnimations: Record<Exclude<ChangeType, null>, string> = {
  */
 const MAX_NAMESPACES_RENDERED_PER_CLUSTER = 30
 
+// Shared empty result for clusters that aren't the selected one — avoids
+// allocating a fresh Map on every render of every non-selected cluster row.
+const EMPTY_NAMESPACE_DATA: Map<string, NamespaceData> = new Map()
+const MAX_VISIBLE_ITEMS = 10
+
 export function NamespaceMonitor({ config: _config }: CardComponentProps) {
   const { isDemoMode } = useDemoMode()
-  const { deduplicatedClusters: clusters, isLoading } = useClusters()
+  const { deduplicatedClusters: clusters, isLoading, isFailed, consecutiveFailures } = useClusters()
   const { selectedClusters, isAllClustersSelected } = useGlobalFilters()
   const { drillToNamespace, drillToPod, drillToDeployment, drillToService, drillToPVC } = useDrillDownActions()
   // UI state
@@ -158,11 +164,14 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
     pvcsDemoFallback || podsDemoFallback || configmapsDemoFallback || secretsDemoFallback || jobsDemoFallback
 
   // Report loading state to CardWrapper for skeleton/refresh behavior
+  const hasData = clusters.length > 0
   useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasData,
     isRefreshing: namespacesRefreshing || deploymentsRefreshing || servicesRefreshing || pvcsRefreshing || podsRefreshing || configmapsRefreshing || secretsRefreshing || jobsRefreshing,
-    hasAnyData: clusters.length > 0,
-    isDemoData: isDemoMode || isDemoData })
+    hasAnyData: hasData,
+    isDemoData: isDemoMode || isDemoData,
+    isFailed,
+    consecutiveFailures })
 
   // Build snapshots and detect changes
   useEffect(() => {
@@ -378,11 +387,11 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
     })
   }
 
-  // Build namespace data for a cluster
-  const getNamespaceData = (clusterName: string): Map<string, NamespaceData> => {
-    if (clusterName !== selectedCluster) return new Map()
-
-    const nsData = new Map<string, NamespaceData>()
+  // Build namespace data map for the currently selected cluster.
+  // One pass over each source array builds a Map<namespace, T[]> index, then
+  // each namespace does an O(1) lookup instead of an O(M) Array.filter().
+  const selectedClusterNamespaceData = useMemo<Map<string, NamespaceData>>(() => {
+    if (!selectedCluster) return new Map()
 
     // Filter namespaces by search
     let filteredNs = namespaces || []
@@ -391,39 +400,76 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
       filteredNs = filteredNs.filter(ns => ns.toLowerCase().includes(query))
     }
 
-    // Initialize namespaces
-    filteredNs.forEach(ns => {
-      const nsPods: PodItem[] = (pods || []).filter(p => p.namespace === ns).map(p => ({
-        name: p.name,
-        namespace: p.namespace,
-        status: p.status,
-        restarts: p.restarts }))
-      const nsDeps: DeploymentItem[] = (deployments || []).filter(d => d.namespace === ns).map(d => ({
+    const podsByNs = new Map<string, PodItem[]>()
+    for (const p of (pods || [])) {
+      const item: PodItem = { name: p.name, namespace: p.namespace, status: p.status, restarts: p.restarts }
+      const arr = podsByNs.get(p.namespace)
+      if (arr) arr.push(item)
+      else podsByNs.set(p.namespace, [item])
+    }
+
+    const depsByNs = new Map<string, DeploymentItem[]>()
+    for (const d of (deployments || [])) {
+      const item: DeploymentItem = {
         name: d.name,
         namespace: d.namespace,
         replicas: d.replicas,
         readyReplicas: d.readyReplicas,
-        status: d.status }))
-      const nsSvcs: ServiceItem[] = (services || []).filter(s => s.namespace === ns).map(s => ({
-        name: s.name,
-        namespace: s.namespace,
-        type: s.type }))
-      const nsCms: ConfigMapItem[] = (configmaps || []).filter(c => c.namespace === ns).map(c => ({
-        name: c.name,
-        namespace: c.namespace,
-        dataCount: c.dataCount }))
-      const nsSecrets: SecretItem[] = (secrets || []).filter(s => s.namespace === ns).map(s => ({
-        name: s.name,
-        namespace: s.namespace,
-        type: s.type }))
-      const nsPvcs: PVCItem[] = (pvcs || []).filter(p => p.namespace === ns).map(p => ({
-        name: p.name,
-        namespace: p.namespace,
-        status: p.status }))
-      const nsJobs: JobItem[] = (jobs || []).filter(j => j.namespace === ns).map(j => ({
-        name: j.name,
-        namespace: j.namespace,
-        status: j.status }))
+        status: d.status }
+      const arr = depsByNs.get(d.namespace)
+      if (arr) arr.push(item)
+      else depsByNs.set(d.namespace, [item])
+    }
+
+    const svcsByNs = new Map<string, ServiceItem[]>()
+    for (const s of (services || [])) {
+      const item: ServiceItem = { name: s.name, namespace: s.namespace, type: s.type }
+      const arr = svcsByNs.get(s.namespace)
+      if (arr) arr.push(item)
+      else svcsByNs.set(s.namespace, [item])
+    }
+
+    const cmsByNs = new Map<string, ConfigMapItem[]>()
+    for (const c of (configmaps || [])) {
+      const item: ConfigMapItem = { name: c.name, namespace: c.namespace, dataCount: c.dataCount }
+      const arr = cmsByNs.get(c.namespace)
+      if (arr) arr.push(item)
+      else cmsByNs.set(c.namespace, [item])
+    }
+
+    const secretsByNs = new Map<string, SecretItem[]>()
+    for (const s of (secrets || [])) {
+      const item: SecretItem = { name: s.name, namespace: s.namespace, type: s.type }
+      const arr = secretsByNs.get(s.namespace)
+      if (arr) arr.push(item)
+      else secretsByNs.set(s.namespace, [item])
+    }
+
+    const pvcsByNs = new Map<string, PVCItem[]>()
+    for (const p of (pvcs || [])) {
+      const item: PVCItem = { name: p.name, namespace: p.namespace, status: p.status }
+      const arr = pvcsByNs.get(p.namespace)
+      if (arr) arr.push(item)
+      else pvcsByNs.set(p.namespace, [item])
+    }
+
+    const jobsByNs = new Map<string, JobItem[]>()
+    for (const j of (jobs || [])) {
+      const item: JobItem = { name: j.name, namespace: j.namespace, status: j.status }
+      const arr = jobsByNs.get(j.namespace)
+      if (arr) arr.push(item)
+      else jobsByNs.set(j.namespace, [item])
+    }
+
+    const nsData = new Map<string, NamespaceData>()
+    filteredNs.forEach(ns => {
+      const nsPods = podsByNs.get(ns) || []
+      const nsDeps = depsByNs.get(ns) || []
+      const nsSvcs = svcsByNs.get(ns) || []
+      const nsCms = cmsByNs.get(ns) || []
+      const nsSecrets = secretsByNs.get(ns) || []
+      const nsPvcs = pvcsByNs.get(ns) || []
+      const nsJobs = jobsByNs.get(ns) || []
 
       const hasIssues = nsPods.some(p => p.status !== 'Running' && p.status !== 'Succeeded') ||
                        nsDeps.some(d => d.readyReplicas < d.replicas)
@@ -440,12 +486,17 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
     })
 
     return nsData
+  }, [selectedCluster, namespaces, pods, deployments, services, configmaps, secrets, pvcs, jobs, searchFilter])
+
+  const getNamespaceData = (clusterName: string): Map<string, NamespaceData> => {
+    if (clusterName !== selectedCluster) return EMPTY_NAMESPACE_DATA
+    return selectedClusterNamespaceData
   }
 
   // Count recent changes by type
   const changeCountsByType = (() => {
     const counts = { added: 0, modified: 0, deleted: 0, error: 0 }
-    const recentTime = Date.now() - 60000 // Last minute
+    const recentTime = Date.now() - MS_PER_MINUTE
     recentChanges.forEach(c => {
       if (c.timestamp > recentTime && c.type) {
         counts[c.type]++
@@ -514,7 +565,7 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
     <div className={`absolute right-0 top-12 w-80 bg-card border border-border rounded-lg shadow-xl z-40 transition-all ${
       showChangesPanel ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-2 pointer-events-none'
     }`}>
-      <div className="flex items-center justify-between p-3 border-b border-border">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 p-3 border-b border-border">
         <span className="text-sm font-medium text-foreground">Recent Changes</span>
         <button onClick={() => setShowChangesPanel(false)} aria-label="Close recent changes panel" className="p-2 hover:bg-secondary rounded min-h-11 min-w-11 flex items-center justify-center">
           <X className="w-4 h-4 text-muted-foreground" />
@@ -572,7 +623,7 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
   return (
     <div className="h-full flex flex-col min-h-0 relative">
       {/* Header */}
-      <div className="flex items-center justify-end mb-3 flex-shrink-0">
+      <div className="flex items-center justify-end mb-3 shrink-0">
         <div className="flex items-center gap-2">
           {/* Changes indicator */}
           <button
@@ -597,11 +648,11 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
         value={searchFilter}
         onChange={setSearchFilter}
         placeholder="Search clusters, namespaces..."
-        className="mb-3 flex-shrink-0"
+        className="mb-3 shrink-0"
       />
 
       {/* Resource type filters */}
-      <div className="flex flex-wrap gap-1.5 mb-3 flex-shrink-0">
+      <div className="flex flex-wrap gap-1.5 mb-3 shrink-0">
         {(Object.keys(ResourceIcons) as ResourceType[]).map(type => {
           const Icon = ResourceIcons[type]
           const isActive = activeResourceTypes.has(type)
@@ -889,7 +940,7 @@ function ResourceSection({
         <span>({items.length})</span>
       </div>
       <div className="space-y-0.5">
-        {items.slice(0, 10).map(item => {
+        {items.slice(0, MAX_VISIBLE_ITEMS).map(item => {
           const changeType = getResourceChange(cluster, namespace, type, item.name)
           const key = `${cluster}:${namespace}:${type}:${item.name}`
 
@@ -929,9 +980,9 @@ function ResourceSection({
             </div>
           )
         })}
-        {items.length > 10 && (
+        {items.length > MAX_VISIBLE_ITEMS && (
           <div className="text-2xs text-muted-foreground px-2 py-1">
-            +{items.length - 10} more
+            +{items.length - MAX_VISIBLE_ITEMS} more
           </div>
         )}
       </div>

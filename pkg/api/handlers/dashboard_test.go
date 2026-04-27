@@ -23,6 +23,14 @@ const fiberTestTimeout = 5000
 func setupDashboardTest(userID uuid.UUID) (*fiber.App, *test.MockStore, *DashboardHandler) {
 	app := fiber.New()
 	mockStore := new(test.MockStore)
+
+	// CreateDashboard now enforces a per-user dashboard limit (#7010) by
+	// calling store.CountUserDashboards before creating. Register a default
+	// expectation so tests that don't override it return 0 (under limit) and
+	// proceed to creation. Tests exercising the limit can override with a
+	// higher return value before calling the handler.
+	mockStore.On("CountUserDashboards", userID).Return(0, nil).Maybe()
+
 	handler := NewDashboardHandler(mockStore)
 
 	// Inject userID into context (simulates auth middleware)
@@ -216,3 +224,56 @@ func TestImportDashboard_Success(t *testing.T) {
 	require.NoError(t, json.Unmarshal(respBody, &result))
 	assert.Equal(t, "Imported", result.Name)
 }
+
+// TestImportDashboard_ExceedsCardLimit verifies that an import payload
+// containing more than MaxCardsPerDashboard cards is rejected up-front with
+// a 400 instead of being partially imported (#6553).
+func TestImportDashboard_ExceedsCardLimit(t *testing.T) {
+	userID := uuid.New()
+	app, _, handler := setupDashboardTest(userID)
+	app.Post("/api/dashboards/import", handler.ImportDashboard)
+
+	var sb strings.Builder
+	sb.WriteString(`{"format":"kc-dashboard-v1","name":"TooBig","cards":[`)
+	// MaxCardsPerDashboard+1 minimal card entries
+	for i := 0; i < MaxCardsPerDashboard+1; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(`{"card_type":"note","position":{"x":0,"y":0,"w":1,"h":1}}`)
+	}
+	sb.WriteString(`]}`)
+
+	req, err := http.NewRequest("POST", "/api/dashboards/import", strings.NewReader(sb.String()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, fiberTestTimeout)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// TestImportDashboard_ExceedsUserLimit verifies that an import is rejected
+// with HTTP 429 when the user has already reached MaxDashboardsPerUser (#10162).
+func TestImportDashboard_ExceedsUserLimit(t *testing.T) {
+	userID := uuid.New()
+	app, mockStore, handler := setupDashboardTest(userID)
+
+	// Override the default CountUserDashboards mock to simulate the user
+	// already being at the dashboard limit.
+	mockStore.ExpectedCalls = nil
+	mockStore.On("CountUserDashboards", userID).Return(MaxDashboardsPerUser, nil)
+
+	app.Post("/api/dashboards/import", handler.ImportDashboard)
+
+	body := `{"format":"kc-dashboard-v1","name":"ShouldFail","cards":[]}`
+	req, err := http.NewRequest("POST", "/api/dashboards/import", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, fiberTestTimeout)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	mockStore.AssertExpectations(t)
+}
+

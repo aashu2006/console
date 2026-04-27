@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useLocalAgent } from '../../../hooks/useLocalAgent'
 import { LOCAL_AGENT_WS_URL } from '../../../lib/constants'
+import { appendWsAuthToken } from '../../../lib/utils/wsAuth'
 import { useDrillDownActions } from '../../../hooks/useDrillDown'
 import { useMissions } from '../../../hooks/useMissions'
 import { ClusterBadge } from '../../ui/ClusterBadge'
@@ -164,7 +165,7 @@ export function HelmReleaseDrillDown({ data }: Props) {
     return new Promise((resolve) => {
       let ws: WebSocket
       try {
-        ws = new WebSocket(LOCAL_AGENT_WS_URL)
+        ws = new WebSocket(appendWsAuthToken(LOCAL_AGENT_WS_URL))
       } catch {
         resolve('')
         return
@@ -312,10 +313,13 @@ Release Details:
 - Revision: ${releaseRevision || releaseInfo?.revision || 'Unknown'}
 
 Please:
-1. Check if the release is healthy
-2. Identify any issues or misconfigurations
-3. Compare with best practices for this chart
-4. Suggest improvements or upgrades if available`
+1. Check the release health — status, values, and resource state.
+2. Tell me what you found, then ask:
+   - "Should I apply a fix or upgrade?"
+   - "Show me the full analysis first"
+3. If I say go ahead, apply and verify. Then ask:
+   - "Should I check other Helm releases?"
+   - "All done"`
 
     startMission({
       title: `Diagnose Helm: ${releaseName}`,
@@ -664,7 +668,7 @@ Please:
               </div>
             ) : releaseHistory && releaseHistory.length > 0 ? (
               <div className="space-y-2">
-                {releaseHistory.sort((a, b) => b.revision - a.revision).map((rev) => {
+                {[...releaseHistory].sort((a, b) => b.revision - a.revision).map((rev) => {
                   const revStatus = getStatusStyle(rev.status)
                   return (
                     <div

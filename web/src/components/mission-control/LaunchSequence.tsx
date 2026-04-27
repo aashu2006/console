@@ -24,7 +24,7 @@ import type { DeployPhase, MissionControlState, PhaseProgress, PhaseStatus } fro
 import { buildInstallPromptForProject, isSafeProjectName } from './useMissionControl'
 
 /** Terminal statuses that indicate a project is no longer in-flight */
-const TERMINAL_STATUSES: readonly string[] = ['completed', 'failed', 'skipped']
+const TERMINAL_STATUSES: readonly string[] = ['completed', 'failed', 'skipped', 'cancelled']
 
 /**
  * #6408 — Fallback phase builder used when `state.phases` is empty but
@@ -97,6 +97,17 @@ export function LaunchSequence({
   const [isStarted, setIsStarted] = useState(false)
   const progressRef = useRef<PhaseProgress[]>(state.launchProgress)
   const startedMissions = useRef(new Set<string>())
+  // #6632 — Track mount state so effects scheduled before unmount (phase
+  // initialization, mission monitor, auto-start) can't call onUpdateProgress
+  // or onComplete on a closed dialog. Without this, closing Mission Control
+  // mid-launch fired a cascade of stale progress updates on a dead tree.
+  const isMountedRef = useRef(true)
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+    }
+  }, [])
 
   // #6408 — If `state.phases` is empty but the user has assignments, rebuild
   // a single deploy phase from those assignments instead of calling
@@ -131,6 +142,8 @@ export function LaunchSequence({
         status: 'pending' as const })) }))
     progressRef.current = initial
     startedMissions.current = new Set<string>()
+    // #6632 — guard against firing onUpdateProgress on a closed dialog
+    if (!isMountedRef.current) return
     setIsStarted(false)
     onUpdateProgress(initial)
   }, [phaseSignature])
@@ -138,6 +151,8 @@ export function LaunchSequence({
   const updateProgress = (updater: (prev: PhaseProgress[]) => PhaseProgress[]) => {
       const next = updater(progressRef.current)
       progressRef.current = next
+      // #6632 — Never call onUpdateProgress after the dialog has been closed.
+      if (!isMountedRef.current) return
       onUpdateProgress(next)
     }
 
@@ -146,12 +161,19 @@ export function LaunchSequence({
       const project = state.projects.find((p) => p.name === projectName)
       if (!project) return
 
-      const assignment = state.assignments.find((a) =>
+      // #7155 — Resolve ALL matching cluster assignments for multi-cluster
+      // missions, not just the first. Each cluster gets its own startMission
+      // call so retry operates at the cluster level.
+      const assignments = state.assignments.filter((a) =>
         (a.projectNames || []).includes(projectName)
       )
-      const clusterName = assignment?.clusterName ?? 'default'
+      const clusterName = assignments.length > 0
+        ? assignments[0]?.clusterName ?? 'default'
+        : 'default'
 
-      // Update status to running
+      // #7156 — Update status to running BEFORE any async/network calls.
+      // This ensures the progress pointer is set even if the network call
+      // fails, preventing the UI from showing 0% infinitely.
       updateProgress((prev) =>
         prev.map((p) =>
           p.phase === phaseNum
@@ -175,10 +197,13 @@ export function LaunchSequence({
           project.name,
           project.displayName,
         )
+        // #8482 — Pass Kubara chart name so loadMissionPrompt can embed
+        // production-tested Helm values into the install prompt.
         const prompt = await loadMissionPrompt(
           project.name,
           fallbackPrompt,
           project.kbPath ? [project.kbPath] : undefined,
+          project.kubaraChartName ? { kubaraChartName: project.kubaraChartName } : undefined,
         )
 
         // Derive a safe display name for UI strings too — the title is
@@ -196,6 +221,12 @@ export function LaunchSequence({
           : project.name
         const dryRunPrefix = state.isDryRun ? '[DRY RUN] ' : ''
         const clusterContext = `\n\n**Target cluster:** ${clusterName}`
+
+        // #6815 — startMission is synchronous and returns the missionId
+        // immediately; updateProgress must follow in the same try block so
+        // that if any future refactor introduces a throw between the two
+        // calls, the missionId is still captured in progress (preventing an
+        // orphaned mission ref).
         const missionId = startMission({
           title: `${dryRunPrefix}Install ${uiSafeDisplayName}`,
           description: `${state.isDryRun ? 'Dry-run validation' : 'Automated install'} of ${uiSafeDisplayName} as part of Mission Control deployment`,
@@ -204,7 +235,8 @@ export function LaunchSequence({
           initialPrompt: prompt + clusterContext,
           dryRun: state.isDryRun })
 
-        // Update with missionId
+        // Update with missionId — placed immediately after startMission in
+        // the same try block so the id is always persisted into progressRef.
         updateProgress((prev) =>
           prev.map((p) =>
             p.phase === phaseNum
@@ -217,13 +249,19 @@ export function LaunchSequence({
           )
         )
       } catch (err) {
+        // #7143 — Capture the full error message. When `err` is an array
+        // (e.g. from Promise.all rejections or grouped validation errors),
+        // stringify each element individually to avoid losing detail.
+        const errorMessage = Array.isArray(err)
+          ? err.map(String).join('; ')
+          : String(err)
         // Mark project as failed AND recompute phase-level status (#5507)
         updateProgress((prev) =>
           prev.map((p) => {
             if (p.phase !== phaseNum) return p
             const updatedProjects = p.projects.map((proj) =>
               proj.name === projectName
-                ? { ...proj, status: 'failed' as const, error: String(err) }
+                ? { ...proj, status: 'failed' as const, error: errorMessage }
                 : proj
             )
             const updatedPhase = { ...p, projects: updatedProjects }
@@ -234,6 +272,8 @@ export function LaunchSequence({
     }
 
   // Monitor mission statuses and update progress
+  // #7157 — Added 'cancelled' status mapping so cancelled missions are
+  // reflected in launch progress instead of staying in a stale state.
   useEffect(() => {
     const progress = progressRef.current
     let changed = false
@@ -249,9 +289,9 @@ export function LaunchSequence({
           changed = true
           return { ...proj, status: 'completed' as const }
         }
-        if (mission.status === 'failed') {
+        if (mission.status === 'failed' || mission.status === 'cancelled') {
           changed = true
-          return { ...proj, status: 'failed' as const, error: 'Mission failed' }
+          return { ...proj, status: 'failed' as const, error: mission.status === 'cancelled' ? 'Mission cancelled' : 'Mission failed' }
         }
         return proj
       }) }))
@@ -262,6 +302,8 @@ export function LaunchSequence({
         ...phase,
         status: derivePhaseStatus(phase) }))
       progressRef.current = updated
+      // #6632 — Don't fire onUpdateProgress / onComplete on a closed dialog.
+      if (!isMountedRef.current) return
       onUpdateProgress(updated)
 
       // #6408 — Never call onComplete on an empty progress list. Without
@@ -283,39 +325,67 @@ export function LaunchSequence({
    * "fully succeeded" from "terminally failed" and block dependent phases
    * when a failure occurred.
    */
-  const waitForPhaseCompletion = useCallback((phaseNum: number): Promise<PhaseStatus> => {
-    return new Promise((resolve) => {
+  const waitForPhaseCompletion = useCallback((phaseNum: number, signal?: AbortSignal): Promise<PhaseStatus> => {
+    return new Promise((resolve, reject) => {
       /** Poll interval in ms — checks progressRef for phase terminal state */
       const PHASE_POLL_INTERVAL_MS = 500
+      let timer: ReturnType<typeof setTimeout> | null = null
+
+      const onAbort = () => {
+        if (timer !== null) clearTimeout(timer)
+        reject(new DOMException('Phase wait aborted', 'AbortError'))
+      }
+
+      if (signal?.aborted) {
+        onAbort()
+        return
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+
       const check = () => {
+        // #7140 — Stop polling when the component unmounts to prevent ghost
+        // tasks consuming CPU after the dialog is closed.
+        if (!isMountedRef.current) {
+          signal?.removeEventListener('abort', onAbort)
+          reject(new DOMException('Component unmounted', 'AbortError'))
+          return
+        }
         const phase = progressRef.current.find((p) => p.phase === phaseNum)
         if (phase && TERMINAL_STATUSES.includes(phase.status)) {
+          signal?.removeEventListener('abort', onAbort)
           resolve(phase.status)
           return
         }
-        setTimeout(check, PHASE_POLL_INTERVAL_MS)
+        timer = setTimeout(check, PHASE_POLL_INTERVAL_MS)
       }
       check()
     })
   }, [])
 
   // Execute the launch sequence
-  const startLaunch = async () => {
+  const startLaunch = async (abortSignal?: AbortSignal) => {
     if (isStarted) return
     setIsStarted(true)
 
     const isYolo = state.deployMode === 'yolo'
 
     if (isYolo) {
-      // Launch everything at once
+      // Launch everything at once. #6634 — collect the promises and await
+      // them with Promise.allSettled so the yolo path doesn't swallow
+      // rejections or leave unhandled-rejection warnings in the console.
+      // launchProject has its own try/catch around the failing branch, but
+      // any future refactor that throws before that catch would otherwise
+      // go unnoticed.
+      const pending: Promise<void>[] = []
       for (const phase of effectivePhases) {
         for (const projectName of (phase.projectNames || [])) {
           if (!startedMissions.current.has(projectName)) {
             startedMissions.current.add(projectName)
-            launchProject(projectName, phase.phase)
+            pending.push(launchProject(projectName, phase.phase))
           }
         }
       }
+      await Promise.allSettled(pending)
     } else {
       // Phased: launch phase N, wait for completion, then phase N+1 (#5506)
       for (const phase of effectivePhases) {
@@ -338,7 +408,7 @@ export function LaunchSequence({
         // means at least one project in this phase is terminally failed and
         // the user is looking at a "Retry Failed" button — we must NOT
         // auto-advance to dependent phases from that state.
-        const result = await waitForPhaseCompletion(phase.phase)
+        const result = await waitForPhaseCompletion(phase.phase, abortSignal)
         if (result !== 'completed') {
           // Block dependent phases. The Retry Failed button will re-invoke
           // launchProject for the failed entries; if the retry succeeds, the
@@ -350,10 +420,17 @@ export function LaunchSequence({
   }
 
   // Auto-start on mount — keyed on content signature (#5508)
+  // #6785 — AbortController cancels waitForPhaseCompletion polling on unmount
+  // so leaked timers and stale setState calls cannot occur.
   useEffect(() => {
+    const controller = new AbortController()
     if (!isStarted && effectivePhases.length > 0) {
-      startLaunch()
+      startLaunch(controller.signal).catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return
+        throw err
+      })
     }
+    return () => { controller.abort() }
   }, [phaseSignature])
 
   const progress = state.launchProgress.length > 0 ? state.launchProgress : progressRef.current
@@ -394,7 +471,7 @@ export function LaunchSequence({
           initial={{ scale: 0 }}
           animate={{ scale: 1 }}
           transition={{ type: 'spring', stiffness: 300, damping: 20 }}
-          className="inline-flex p-3 rounded-2xl bg-gradient-to-br from-violet-500/20 to-indigo-500/20 mb-3"
+          className="inline-flex p-3 rounded-2xl bg-linear-to-br from-violet-500/20 to-indigo-500/20 mb-3"
         >
           {allComplete ? (
             allSuccess ? (
@@ -454,9 +531,49 @@ export function LaunchSequence({
                     className="h-6 text-xs"
                     icon={<RotateCcw className="w-3 h-3" />}
                     onClick={() => {
+                      // #6634 — Track the retry promises so any rejection
+                      // is observed rather than dropped. Promise.allSettled
+                      // keeps the click handler from becoming `async` in a
+                      // JSX attribute (which confuses React type checks).
+                      // #7147 — After retry succeeds, resume dependent phases
+                      // that were blocked by the original failure. Without this,
+                      // the phased loop had already `break`-ed and later phases
+                      // would never start.
+                      const retries: Promise<void>[] = []
                       phase.projects.forEach((p) => {
                         if (p.status === 'failed') {
-                          launchProject(p.name, phase.phase)
+                          retries.push(launchProject(p.name, phase.phase))
+                        }
+                      })
+                      void Promise.allSettled(retries).then(() => {
+                        // Resume subsequent phases if this phase now completes
+                        if (state.deployMode !== 'yolo') {
+                          const phaseIdx = effectivePhases.findIndex(
+                            (ep) => ep.phase === phase.phase
+                          )
+                          const remaining = effectivePhases.slice(phaseIdx + 1)
+                          if (remaining.length > 0) {
+                            const resumePhases = async () => {
+                              const result = await waitForPhaseCompletion(phase.phase)
+                              if (result !== 'completed') return
+                              for (const nextPhase of remaining) {
+                                updateProgress((prev) =>
+                                  prev.map((p) =>
+                                    p.phase === nextPhase.phase ? { ...p, status: 'running' } : p
+                                  )
+                                )
+                                for (const projName of (nextPhase.projectNames || [])) {
+                                  if (!startedMissions.current.has(projName)) {
+                                    startedMissions.current.add(projName)
+                                    await launchProject(projName, nextPhase.phase)
+                                  }
+                                }
+                                const nextResult = await waitForPhaseCompletion(nextPhase.phase)
+                                if (nextResult !== 'completed') break
+                              }
+                            }
+                            void resumePhases()
+                          }
                         }
                       })
                     }}
@@ -475,7 +592,7 @@ export function LaunchSequence({
                       animate={{ opacity: 1, x: 0 }}
                       className="flex items-center gap-2 text-xs"
                     >
-                      <span className="flex-shrink-0">{STATUS_ICONS[proj.status]}</span>
+                      <span className="shrink-0">{STATUS_ICONS[proj.status]}</span>
                       <span
                         className={cn(
                           'flex-1',

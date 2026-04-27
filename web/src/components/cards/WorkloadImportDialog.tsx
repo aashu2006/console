@@ -390,7 +390,7 @@ export function WorkloadImportDialog({ isOpen, onClose, onImport }: WorkloadImpo
     return renderPreviewTable([resource])
   }
 
-  const inputClasses = 'w-full px-3 py-2 text-sm rounded-lg border border-border bg-secondary/30 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500/50 focus:border-purple-500/50'
+  const inputClasses = 'w-full px-3 py-2 text-sm rounded-lg border border-border bg-secondary/30 text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500/50 focus:border-purple-500/50'
   const labelClasses = 'block text-xs font-medium text-muted-foreground mb-1'
 
   // -----------------------------------------------------------------------
@@ -415,7 +415,7 @@ export function WorkloadImportDialog({ isOpen, onClose, onImport }: WorkloadImpo
 
   const renderYamlTab = () => (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <p className="text-xs text-muted-foreground">
           {t('workloadImport.yamlDescription')}
         </p>
@@ -638,6 +638,7 @@ export function WorkloadImportDialog({ isOpen, onClose, onImport }: WorkloadImpo
       onClose={handleClose}
       size="md"
       enableBackspace={false}
+      closeOnBackdrop={false}
     >
       <BaseModal.Header
         title={t('workloadImport.title')}

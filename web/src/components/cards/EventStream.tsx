@@ -30,6 +30,13 @@ const DEFAULT_API_FETCH_LIMIT = 100
  * not configured a `limit` for this card. */
 const DEFAULT_DISPLAY_LIMIT = 5
 
+/** Reserved footer height (px). The pagination bar and LimitedAccessWarning
+ * conditionally render, so without a reserved slot the card grows/shrinks
+ * each time those toggle on refresh — causing layout shift on neighboring
+ * cards (#8384). A fixed min-height for the footer region absorbs the
+ * variance so the card body stays a consistent size across refreshes. */
+const EVENT_STREAM_FOOTER_MIN_HEIGHT_PX = 48
+
 interface EventStreamConfig {
   /** User-configurable max events from the Configure Card modal. Drives BOTH
    * the API fetch ceiling and the initial in-card "show N" dropdown
@@ -70,10 +77,11 @@ function EventStreamInternal({ config }: { config?: EventStreamConfig }) {
   )
 
   // Report state to CardWrapper for refresh animation
+  const hasData = filteredRawEvents.length > 0
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading: hookLoading,
+    isLoading: hookLoading && !hasData,
     isDemoData: isDemoMode || isDemoFallback,
-    hasAnyData: filteredRawEvents.length > 0,
+    hasAnyData: hasData,
     isFailed,
     consecutiveFailures,
     isRefreshing,
@@ -202,7 +210,7 @@ function EventStreamInternal({ config }: { config?: EventStreamConfig }) {
   return (
     <div className="h-full flex flex-col content-loaded">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <RefreshIndicator
             isRefreshing={isRefreshing}
@@ -260,12 +268,12 @@ function EventStreamInternal({ config }: { config?: EventStreamConfig }) {
 
             return (
               <div
-                key={`${event.cluster || 'unknown'}-${event.object}-${event.lastSeen || event.firstSeen || ''}-${event.reason}`}
+                key={`${event.cluster || 'unknown'}-${event.object}-${event.lastSeen || event.firstSeen || ''}-${event.reason}-${idx}`}
                 className={`flex items-start gap-3 p-3 rounded-lg hover:bg-secondary/40 transition-colors cursor-pointer group ${idx % 2 === 0 ? 'bg-secondary/10' : 'bg-secondary/25'}`}
                 onClick={() => handleEventClick(event)}
                 title={`Click to view details for ${event.object}`}
               >
-                <div className={`p-1.5 rounded ${style.bg} flex-shrink-0`} title={style.tooltip}>
+                <div className={`p-1.5 rounded ${style.bg} shrink-0`} title={style.tooltip}>
                   <EventIcon className={`w-3.5 h-3.5 ${style.color}`} />
                 </div>
                 <div className="flex-1 min-w-0">
@@ -292,17 +300,26 @@ function EventStreamInternal({ config }: { config?: EventStreamConfig }) {
         )}
       </div>
 
-      {/* Pagination */}
-      <CardPaginationFooter
-        currentPage={currentPage}
-        totalPages={totalPages}
-        totalItems={totalItems}
-        itemsPerPage={typeof itemsPerPage === 'number' ? itemsPerPage : 1000}
-        onPageChange={goToPage}
-        needsPagination={needsPagination}
-      />
+      {/*
+       * Footer region: pagination + limited-access warning live here.
+       * Both are conditional, so we reserve a fixed min-height to prevent
+       * the card from growing/shrinking on refresh (#8384).
+       */}
+      <div
+        className="shrink-0"
+        style={{ minHeight: `${EVENT_STREAM_FOOTER_MIN_HEIGHT_PX}px` }}
+      >
+        <CardPaginationFooter
+          currentPage={currentPage}
+          totalPages={totalPages}
+          totalItems={totalItems}
+          itemsPerPage={typeof itemsPerPage === 'number' ? itemsPerPage : 1000}
+          onPageChange={goToPage}
+          needsPagination={needsPagination}
+        />
 
-      <LimitedAccessWarning hasError={!!error} className="mt-2" />
+        <LimitedAccessWarning hasError={!!error} className="mt-2" />
+      </div>
     </div>
   )
 }

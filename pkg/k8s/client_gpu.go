@@ -19,19 +19,41 @@ import (
 )
 
 func (m *MultiClusterClient) GetGPUNodes(ctx context.Context, contextName string) ([]GPUNode, error) {
+	nodes, _, err := m.getGPUNodesWithPods(ctx, contextName)
+	return nodes, err
+}
+
+// getGPUNodesWithPods is the shared implementation of GetGPUNodes that also
+// returns the cluster-wide pod list it fetched for allocation accounting.
+// Callers that need the same pod list for subsequent analysis (e.g. stuck-pod
+// detection in GetGPUNodeHealth, #9339) can reuse it instead of issuing a
+// second cluster-wide Pods("").List call.
+//
+// The returned pod list may be nil on a listing failure; in that case the
+// node inventory is still returned with zero allocations and the listing
+// error is logged (#9091). Callers that rely on the pod list must handle nil.
+func (m *MultiClusterClient) getGPUNodesWithPods(ctx context.Context, contextName string) ([]GPUNode, *corev1.PodList, error) {
 	client, err := m.GetClient(contextName)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Fetch all pods once upfront to calculate accelerator allocations per node
-	// This is much faster than querying pods per-node for large clusters
-	allPods, _ := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	// This is much faster than querying pods per-node for large clusters.
+	// A failure here is non-fatal — we still return the node inventory with
+	// zero allocations, but we log the error so operators can see RBAC /
+	// connectivity problems rather than seeing silently wrong allocation
+	// numbers in the UI (issue #9091).
+	allPods, allPodsErr := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if allPodsErr != nil {
+		slog.Error("[GPUNodes] failed to list pods for allocation accounting",
+			"cluster", contextName, "error", allPodsErr)
+	}
 	// Track allocations by node and accelerator type
 	gpuAllocationByNode := make(map[string]int) // GPU allocations
 	tpuAllocationByNode := make(map[string]int) // TPU allocations
@@ -44,26 +66,12 @@ func (m *MultiClusterClient) GetGPUNodes(ctx context.Context, contextName string
 				continue
 			}
 			for _, container := range pod.Spec.Containers {
-				// Check GPU requests (NVIDIA, AMD, Intel GPU, Intel Gaudi/Habana)
-				// Intel Gaudi is classified as AcceleratorGPU, so track in gpuAllocationByNode
-				if gpuReq, ok := container.Resources.Requests["nvidia.com/gpu"]; ok {
-					gpuAllocationByNode[nodeName] += int(gpuReq.Value())
-				}
-				if gpuReq, ok := container.Resources.Requests["amd.com/gpu"]; ok {
-					gpuAllocationByNode[nodeName] += int(gpuReq.Value())
-				}
-				if gpuReq, ok := container.Resources.Requests["gpu.intel.com/i915"]; ok {
-					gpuAllocationByNode[nodeName] += int(gpuReq.Value())
-				}
-				if gpuReq, ok := container.Resources.Requests["habana.ai/gaudi"]; ok {
-					gpuAllocationByNode[nodeName] += int(gpuReq.Value())
-				}
-				if gpuReq, ok := container.Resources.Requests["habana.ai/gaudi2"]; ok {
-					gpuAllocationByNode[nodeName] += int(gpuReq.Value())
-				}
-				if gpuReq, ok := container.Resources.Requests["intel.com/gaudi"]; ok {
-					gpuAllocationByNode[nodeName] += int(gpuReq.Value())
-				}
+				// Sum GPU requests (NVIDIA, AMD, Intel GPU, Intel Gaudi/Habana)
+				// via the shared GPUResourceNames list in gpu_resources.go so this
+				// path and the pod-level tracker in client_resources.go cannot
+				// drift. Intel Gaudi is classified as AcceleratorGPU, so it rolls
+				// into gpuAllocationByNode alongside nvidia/amd/i915.
+				gpuAllocationByNode[nodeName] += SumGPURequested(container.Resources.Requests)
 				// Check TPU requests (Google Cloud)
 				if tpuReq, ok := container.Resources.Requests["google.com/tpu"]; ok {
 					tpuAllocationByNode[nodeName] += int(tpuReq.Value())
@@ -260,6 +268,22 @@ func (m *MultiClusterClient) GetGPUNodes(ctx context.Context, contextName string
 			allocated = xpuAllocationByNode[node.Name]
 		}
 
+		// Collect scheduling-gating taints so the UI can offer taint-aware
+		// filtering of "available" GPUs. Only NoSchedule and
+		// NoExecute gate scheduling; PreferNoSchedule is advisory and is
+		// intentionally dropped here.
+		var nodeTaints []GPUTaint
+		for _, t := range node.Spec.Taints {
+			if t.Effect != corev1.TaintEffectNoSchedule && t.Effect != corev1.TaintEffectNoExecute {
+				continue
+			}
+			nodeTaints = append(nodeTaints, GPUTaint{
+				Key:    t.Key,
+				Value:  t.Value,
+				Effect: string(t.Effect),
+			})
+		}
+
 		gpuNodes = append(gpuNodes, GPUNode{
 			Name:               node.Name,
 			Cluster:            contextName,
@@ -267,6 +291,7 @@ func (m *MultiClusterClient) GetGPUNodes(ctx context.Context, contextName string
 			GPUCount:           deviceCount,
 			GPUAllocated:       allocated,
 			AcceleratorType:    accelType,
+			Taints:             nodeTaints,
 			GPUMemoryMB:        gpuMemoryMB,
 			GPUFamily:          gpuFamily,
 			CUDADriverVersion:  cudaDriverVersion,
@@ -277,7 +302,7 @@ func (m *MultiClusterClient) GetGPUNodes(ctx context.Context, contextName string
 		})
 	}
 
-	return gpuNodes, nil
+	return gpuNodes, allPods, nil
 }
 
 // GPU operator namespace names to search for operator pods
@@ -296,8 +321,12 @@ func (m *MultiClusterClient) GetGPUNodeHealth(ctx context.Context, contextName s
 		return nil, err
 	}
 
-	// 1. Get GPU nodes using existing method
-	gpuNodes, err := m.GetGPUNodes(ctx, contextName)
+	// 1. Get GPU nodes AND reuse the cluster-wide pod list the lookup already
+	// fetched. Previously we issued a redundant second Pods("").List call below
+	// for stuck-pod detection — on large clusters (hundreds of namespaces,
+	// thousands of pods) that second list doubled API-server load and latency
+	// of this endpoint. (#9339)
+	gpuNodes, allPods, err := m.getGPUNodesWithPods(ctx, contextName)
 	if err != nil {
 		return nil, fmt.Errorf("listing GPU nodes: %w", err)
 	}
@@ -325,14 +354,21 @@ func (m *MultiClusterClient) GetGPUNodeHealth(ctx context.Context, contextName s
 		operatorPods = append(operatorPods, pods.Items...)
 	}
 
-	// 4. Find non-running pods for stuck pod detection (exclude Succeeded/Running)
-	allPods, _ := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	// 4. Stuck-pod detection reuses allPods from step 1 (see #9339). A nil
+	// allPods means getGPUNodesWithPods failed the inner pod list — we've
+	// already logged it there, so just proceed with empty stuck-pod data.
 
-	// 5. Get warning events from the last hour for GPU reset detection
+	// 5. Get warning events from the last hour for GPU reset detection.
+	// Non-fatal, but log so operators can see why GPU-reset signals are
+	// missing instead of silently getting a clean health state (issue #9091).
 	oneHourAgo := time.Now().Add(-1 * time.Hour)
-	events, _ := client.CoreV1().Events("").List(ctx, metav1.ListOptions{
+	events, eventsErr := client.CoreV1().Events("").List(ctx, metav1.ListOptions{
 		FieldSelector: "type=Warning",
 	})
+	if eventsErr != nil {
+		slog.Error("[GPUNodeHealth] failed to list warning events for GPU reset detection",
+			"cluster", contextName, "error", eventsErr)
+	}
 
 	// 6. Build health status for each GPU node
 	checkedAt := time.Now().UTC().Format(time.RFC3339)

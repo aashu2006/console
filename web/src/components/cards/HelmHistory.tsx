@@ -1,4 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
+// Modal safety: HelmHistoryDetailModal is a read-only detail pane (no form
+// inputs the user could lose). Inline search is transient filter state.
+// Treat as closeOnBackdropClick={false}.
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { CheckCircle, XCircle, RotateCcw, ArrowUp, Clock, ChevronRight } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useClusters, type HelmHistoryEntry } from '../../hooks/useMCP'
@@ -104,13 +107,13 @@ export function HelmHistory({ config }: HelmHistoryProps) {
   }, [isDemoData, allHelmReleases, allClusters])
 
   // Look up namespace from the selected release (required for helm history command)
-  const selectedReleaseNamespace = (() => {
+  const selectedReleaseNamespace = useMemo(() => {
     if (!selectedCluster || !selectedRelease) return undefined
     const release = allHelmReleases.find(
       r => r.cluster === selectedCluster && r.name === selectedRelease
     )
     return release?.namespace
-  })()
+  }, [selectedCluster, selectedRelease, allHelmReleases])
 
   // Fetch history for selected release (hook handles caching)
   const {
@@ -126,16 +129,17 @@ export function HelmHistory({ config }: HelmHistoryProps) {
 
   // Report loading state to CardWrapper for skeleton/refresh behavior
   // Note: Consider "hasAnyData" true when no release selected - we want to show selectors, not empty state
+  const hasData = rawHistory.length > 0 || !selectedRelease
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading: historyLoading,
+    isLoading: historyLoading && !hasData,
     isRefreshing: historyRefreshing || releasesRefreshing,
-    hasAnyData: rawHistory.length > 0 || !selectedRelease,
+    hasAnyData: hasData,
     isFailed,
     consecutiveFailures,
     isDemoData })
 
   // Apply global filters to clusters
-  const clusters = (() => {
+  const clusters = useMemo(() => {
     let result = allClusters
 
     if (!isAllClustersSelected) {
@@ -151,19 +155,19 @@ export function HelmHistory({ config }: HelmHistoryProps) {
     }
 
     return result
-  })()
+  }, [allClusters, isAllClustersSelected, globalSelectedClusters, customFilter])
 
   // Filter releases locally by selected cluster (no API call)
-  const filteredReleases = (() => {
+  const filteredReleases = useMemo(() => {
     if (!selectedCluster) return allHelmReleases
     return allHelmReleases.filter(r => r.cluster === selectedCluster)
-  })()
+  }, [allHelmReleases, selectedCluster])
 
   // Get unique release names for dropdown
-  const releases = (() => {
+  const releases = useMemo(() => {
     const releaseSet = new Set(filteredReleases.map(r => r.name))
     return Array.from(releaseSet).sort()
-  })()
+  }, [filteredReleases])
 
   // Use shared card data hook for filtering, sorting, and pagination
   const {
@@ -232,7 +236,7 @@ export function HelmHistory({ config }: HelmHistoryProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={120} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -258,7 +262,7 @@ export function HelmHistory({ config }: HelmHistoryProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           {totalItems > 0 && (
             <StatusBadge color="purple">
@@ -322,15 +326,6 @@ export function HelmHistory({ config }: HelmHistoryProps) {
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">
           {t('helmHistory.selectClusterRelease')}
         </div>
-      ) : (historyLoading || historyRefreshing) && rawHistory.length === 0 ? (
-        <div className="flex-1 flex flex-col items-center justify-center gap-3">
-          <div className="flex items-center gap-2 text-sm text-blue-400">
-            <RotateCcw className="w-4 h-4 animate-spin" />
-            <span>{t('helmHistory.loadingHistory', { release: selectedRelease })}</span>
-          </div>
-          <Skeleton variant="rounded" height={50} className="w-full" />
-          <Skeleton variant="rounded" height={50} className="w-full" />
-        </div>
       ) : (
         <>
           {/* Scope badge - clickable to drill down */}
@@ -368,14 +363,14 @@ export function HelmHistory({ config }: HelmHistoryProps) {
 
                 {/* History entries */}
                 <div className="space-y-3">
-                  {history.map((entry, idx) => {
+                  {history.map((entry) => {
                     const StatusIcon = getStatusIcon(entry.status)
                     const color = getStatusColor(entry.status)
                     const isCurrent = entry.status === 'deployed'
 
                     return (
                       <div
-                        key={idx}
+                        key={`${entry.revision}-${entry.chart}-${entry.updated}`}
                         className="relative pl-6 group cursor-pointer"
                         onClick={() => setModalEntry(entry)}
                         title={`Click to view details for revision ${entry.revision}`}
@@ -388,7 +383,7 @@ export function HelmHistory({ config }: HelmHistoryProps) {
                         </div>
 
                         <div className={`p-2 rounded-lg transition-colors ${isCurrent ? 'bg-green-500/10 border border-green-500/20 group-hover:bg-green-500/20' : 'bg-secondary/30 group-hover:bg-secondary/50'}`}>
-                          <div className="flex items-center justify-between mb-1">
+                          <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                             <div className="flex items-center gap-2">
                               <span className="text-sm font-medium text-foreground">{t('helmHistory.rev', { revision: entry.revision })}</span>
                               {isCurrent && (

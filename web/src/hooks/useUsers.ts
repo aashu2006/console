@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api } from '../lib/api'
+import { api, isBackendUnavailable } from '../lib/api'
 import { mapSettledWithConcurrency } from '../lib/utils/concurrency'
 import { getDemoMode } from './useDemoMode'
+import { LOCAL_AGENT_HTTP_URL, STORAGE_KEY_TOKEN } from '../lib/constants'
+import { FETCH_DEFAULT_TIMEOUT_MS, RBAC_QUERY_TIMEOUT_MS } from '../lib/constants/network'
+import { MS_PER_DAY, MS_PER_HOUR } from '../lib/constants/time'
 import type {
   ConsoleUser,
   K8sServiceAccount,
@@ -15,6 +18,18 @@ import type {
   CreateServiceAccountRequest,
   CreateRoleBindingRequest } from '../types/users'
 
+// agentAuthHeaders attaches the local-agent Bearer token when one is stored.
+// The token is optional — the agent accepts unauthenticated requests from
+// allowed origins when KC_AGENT_TOKEN is unset — so we simply omit the
+// Authorization header when no token is configured. Mirrors authHeaders() in
+// useWorkloads.ts.
+function agentAuthHeaders(): Record<string, string> {
+  const token = localStorage.getItem(STORAGE_KEY_TOKEN)
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  return headers
+}
+
 // Demo data for console users
 function getDemoConsoleUsers(): ConsoleUser[] {
   return [
@@ -26,8 +41,8 @@ function getDemoConsoleUsers(): ConsoleUser[] {
       avatar_url: 'https://avatars.githubusercontent.com/u/12345?v=4',
       role: 'admin',
       onboarded: true,
-      created_at: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
-      last_login: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() },
+      created_at: new Date(Date.now() - 90 * MS_PER_DAY).toISOString(),
+      last_login: new Date(Date.now() - 2 * MS_PER_HOUR).toISOString() },
     {
       id: '2',
       github_id: '23456',
@@ -36,8 +51,8 @@ function getDemoConsoleUsers(): ConsoleUser[] {
       avatar_url: 'https://avatars.githubusercontent.com/u/23456?v=4',
       role: 'editor',
       onboarded: true,
-      created_at: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString(),
-      last_login: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString() },
+      created_at: new Date(Date.now() - 60 * MS_PER_DAY).toISOString(),
+      last_login: new Date(Date.now() - 5 * MS_PER_HOUR).toISOString() },
     {
       id: '3',
       github_id: '34567',
@@ -45,8 +60,8 @@ function getDemoConsoleUsers(): ConsoleUser[] {
       email: 'bob@example.com',
       role: 'viewer',
       onboarded: true,
-      created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
-      last_login: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() },
+      created_at: new Date(Date.now() - 30 * MS_PER_DAY).toISOString(),
+      last_login: new Date(Date.now() - MS_PER_DAY).toISOString() },
     {
       id: '4',
       github_id: '45678',
@@ -55,8 +70,8 @@ function getDemoConsoleUsers(): ConsoleUser[] {
       avatar_url: 'https://avatars.githubusercontent.com/u/45678?v=4',
       role: 'editor',
       onboarded: true,
-      created_at: new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString(),
-      last_login: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString() },
+      created_at: new Date(Date.now() - 45 * MS_PER_DAY).toISOString(),
+      last_login: new Date(Date.now() - 1 * MS_PER_HOUR).toISOString() },
   ]
 }
 
@@ -222,27 +237,27 @@ function getDemoOpenShiftUsers(cluster?: string): OpenShiftUser[] {
       identities: ['htpasswd:admin'],
       groups: ['system:cluster-admins', 'system:authenticated'],
       cluster,
-      createdAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString() },
+      createdAt: new Date(Date.now() - 90 * MS_PER_DAY).toISOString() },
     {
       name: 'developer',
       fullName: 'Dev User',
       identities: ['htpasswd:developer'],
       groups: ['developers', 'system:authenticated'],
       cluster,
-      createdAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString() },
+      createdAt: new Date(Date.now() - 60 * MS_PER_DAY).toISOString() },
     {
       name: 'ops-user',
       fullName: 'Operations Engineer',
       identities: ['ldap:ops-user'],
       groups: ['operations', 'system:authenticated'],
       cluster,
-      createdAt: new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString() },
+      createdAt: new Date(Date.now() - 45 * MS_PER_DAY).toISOString() },
     {
       name: 'viewer',
       identities: ['htpasswd:viewer'],
       groups: ['viewers', 'system:authenticated'],
       cluster,
-      createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString() },
+      createdAt: new Date(Date.now() - 30 * MS_PER_DAY).toISOString() },
   ]
 }
 
@@ -456,7 +471,7 @@ export function useK8sServiceAccounts(cluster?: string, namespace?: string) {
       const params = new URLSearchParams()
       params.set('cluster', cluster)
       if (namespace) params.set('namespace', namespace)
-      const { data } = await api.get<K8sServiceAccount[]>(`/api/rbac/service-accounts?${params}`, { timeout: 60000 })
+      const { data } = await api.get<K8sServiceAccount[]>(`/api/rbac/service-accounts?${params}`, { timeout: RBAC_QUERY_TIMEOUT_MS })
       setServiceAccounts(data || [])
       setError(null)
     } catch (err) {
@@ -477,7 +492,20 @@ export function useK8sServiceAccounts(cluster?: string, namespace?: string) {
   }, [fetchServiceAccounts])
 
   const createServiceAccount = async (req: CreateServiceAccountRequest) => {
-    const { data } = await api.post<K8sServiceAccount>('/api/rbac/service-accounts', req)
+    // Creating a ServiceAccount is a user-initiated mutation on a managed
+    // cluster, so it must run under the user's kubeconfig via kc-agent, not
+    // the backend pod ServiceAccount. See #7993 Phase 1.5 PR A.
+    const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/serviceaccounts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...agentAuthHeaders() },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+    })
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({ error: 'unknown error' }))
+      throw new Error(errorData.error || 'Failed to create service account')
+    }
+    const data = (await res.json()) as K8sServiceAccount
     setServiceAccounts((prev) => [...prev, data])
     return data
   }
@@ -528,7 +556,7 @@ export function useAllK8sServiceAccounts(clusters: Array<{ name: string }>) {
       clusters,
       async (cluster) => {
         try {
-          const { data } = await api.get<K8sServiceAccount[]>(`/api/rbac/service-accounts?cluster=${cluster.name}`, { timeout: 60000 })
+          const { data } = await api.get<K8sServiceAccount[]>(`/api/rbac/service-accounts?cluster=${cluster.name}`, { timeout: RBAC_QUERY_TIMEOUT_MS })
           return { cluster: cluster.name, sas: data || [] }
         } catch {
           // Mark cluster as failed but don't break the whole fetch
@@ -580,7 +608,7 @@ export function useK8sRoles(cluster: string, namespace?: string, includeSystem?:
       const params = new URLSearchParams({ cluster })
       if (namespace) params.set('namespace', namespace)
       if (includeSystem) params.set('includeSystem', 'true')
-      const { data } = await api.get<K8sRole[]>(`/api/rbac/roles?${params}`, { timeout: 60000 })
+      const { data } = await api.get<K8sRole[]>(`/api/rbac/roles?${params}`, { timeout: RBAC_QUERY_TIMEOUT_MS })
       setRoles(data || [])
     } catch {
       // Silently fail - backend may be unavailable
@@ -613,7 +641,7 @@ export function useK8sRoleBindings(cluster: string, namespace?: string, includeS
       const params = new URLSearchParams({ cluster })
       if (namespace) params.set('namespace', namespace)
       if (includeSystem) params.set('includeSystem', 'true')
-      const { data } = await api.get<K8sRoleBinding[]>(`/api/rbac/bindings?${params}`, { timeout: 60000 })
+      const { data } = await api.get<K8sRoleBinding[]>(`/api/rbac/bindings?${params}`, { timeout: RBAC_QUERY_TIMEOUT_MS })
       setBindings(data || [])
     } catch {
       // Silently fail - backend may be unavailable
@@ -627,7 +655,19 @@ export function useK8sRoleBindings(cluster: string, namespace?: string, includeS
   }, [fetchBindings])
 
   const createRoleBinding = async (req: CreateRoleBindingRequest) => {
-    await api.post('/api/rbac/bindings', req)
+    // Creating a RoleBinding is a user-initiated RBAC mutation, so it must
+    // run under the user's kubeconfig via kc-agent, not the backend pod
+    // ServiceAccount. See #7993 Phase 1.5 PR A.
+    const res = await fetch(`${LOCAL_AGENT_HTTP_URL}/rolebindings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...agentAuthHeaders() },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+    })
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({ error: 'unknown error' }))
+      throw new Error(errorData.error || 'Failed to create role binding')
+    }
     await fetchBindings()
     return true
   }
@@ -649,16 +689,32 @@ export function useClusterPermissions(cluster?: string) {
   const [error, setError] = useState<string | null>(null)
 
   const fetchPermissions = useCallback(async () => {
+    // Skip in demo / Netlify mode — kc-agent is not running.
+    if (isBackendUnavailable()) {
+      setIsLoading(false)
+      return
+    }
     setIsLoading(true)
     setError(null)
     try {
+      // #7993 Phase 6: route through kc-agent so SelfSubjectAccessReviews run
+      // under the user's kubeconfig instead of the backend pod ServiceAccount.
+      // Reuse agentAuthHeaders() so the Authorization header is omitted when
+      // no token is configured (agent accepts unauthenticated requests from
+      // allowed origins when KC_AGENT_TOKEN is unset). Sending an empty
+      // Authorization header would fail token validation on the agent side.
       const params = cluster ? `?cluster=${cluster}` : ''
-      const { data } = await api.get<ClusterPermissions | ClusterPermissions[]>(
-        `/api/rbac/permissions${params}`
-      )
+      const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/rbac/permissions${params}`, {
+        headers: agentAuthHeaders(),
+        signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
+      if (!response.ok) {
+        setIsLoading(false)
+        return
+      }
+      const data = (await response.json()) as ClusterPermissions | ClusterPermissions[]
       setPermissions(Array.isArray(data) ? data : [data])
     } catch {
-      // Silently fail - backend may be unavailable
+      // Silently fail - kc-agent may be unavailable
     } finally {
       setIsLoading(false)
     }

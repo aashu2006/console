@@ -7,6 +7,10 @@
 
 import { registerDemoDataBatch } from '../demoDataRegistry'
 import type { DemoDataEntry } from '../types'
+import { MS_PER_HOUR, MS_PER_DAY } from '../../../constants/time'
+
+const TWO_DAYS_MS = 2 * MS_PER_DAY
+const ONE_WEEK_MS = 7 * MS_PER_DAY
 
 // Import existing demo data functions (these are scattered across the codebase)
 // We'll reference them here for registration
@@ -86,7 +90,10 @@ function getDemoSecurityIssues() {
  */
 function getDemoGPUNodes() {
   return [
-    { name: 'gpu-node-1', cluster: 'vllm-gpu-cluster', gpuCount: 8, gpuType: 'NVIDIA A100', gpuAllocated: 6, gpuAvailable: 2, memory: '80GB', status: 'Ready' },
+    // gpu-node-1 carries a `dedicated=ofer:NoSchedule` taint so the taint-aware
+    // filter on GPU Utilization / GPU Inventory has something to gate on in
+    // demo mode (issue #8172 — matches Mike Spreitzer's reported scenario).
+    { name: 'gpu-node-1', cluster: 'vllm-gpu-cluster', gpuCount: 8, gpuType: 'NVIDIA A100', gpuAllocated: 6, gpuAvailable: 2, memory: '80GB', status: 'Ready', taints: [{ key: 'dedicated', value: 'ofer', effect: 'NoSchedule' }] },
     { name: 'gpu-node-2', cluster: 'vllm-gpu-cluster', gpuCount: 8, gpuType: 'NVIDIA A100', gpuAllocated: 8, gpuAvailable: 0, memory: '80GB', status: 'Ready' },
     { name: 'gpu-node-3', cluster: 'vllm-gpu-cluster', gpuCount: 4, gpuType: 'NVIDIA V100', gpuAllocated: 2, gpuAvailable: 2, memory: '32GB', status: 'Ready' },
     { name: 'ml-worker-1', cluster: 'eks-prod-us-east-1', gpuCount: 4, gpuType: 'NVIDIA T4', gpuAllocated: 4, gpuAvailable: 0, memory: '16GB', status: 'Ready' },
@@ -98,10 +105,10 @@ function getDemoGPUNodes() {
  */
 function getDemoHelmReleases() {
   return [
-    { name: 'nginx-ingress', namespace: 'ingress', cluster: 'eks-prod-us-east-1', chart: 'nginx-ingress', version: '4.7.1', status: 'deployed', updated: Date.now() - 86400000 },
-    { name: 'prometheus-stack', namespace: 'monitoring', cluster: 'gke-staging', chart: 'kube-prometheus-stack', version: '45.7.1', status: 'deployed', updated: Date.now() - 172800000 },
-    { name: 'redis', namespace: 'cache', cluster: 'aks-dev-westeu', chart: 'redis', version: '17.11.3', status: 'failed', updated: Date.now() - 3600000 },
-    { name: 'cert-manager', namespace: 'cert-manager', cluster: 'openshift-prod', chart: 'cert-manager', version: '1.12.0', status: 'deployed', updated: Date.now() - 604800000 },
+    { name: 'nginx-ingress', namespace: 'ingress', cluster: 'eks-prod-us-east-1', chart: 'nginx-ingress', version: '4.7.1', status: 'deployed', updated: Date.now() - MS_PER_DAY },
+    { name: 'prometheus-stack', namespace: 'monitoring', cluster: 'gke-staging', chart: 'kube-prometheus-stack', version: '45.7.1', status: 'deployed', updated: Date.now() - TWO_DAYS_MS },
+    { name: 'redis', namespace: 'cache', cluster: 'aks-dev-westeu', chart: 'redis', version: '17.11.3', status: 'failed', updated: Date.now() - MS_PER_HOUR },
+    { name: 'cert-manager', namespace: 'cert-manager', cluster: 'openshift-prod', chart: 'cert-manager', version: '1.12.0', status: 'deployed', updated: Date.now() - ONE_WEEK_MS },
   ]
 }
 

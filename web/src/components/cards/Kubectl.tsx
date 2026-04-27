@@ -13,6 +13,8 @@ import { copyToClipboard } from '../../lib/clipboard'
 import { downloadText } from '../../lib/download'
 import { useToast } from '../ui/Toast'
 
+const YAML_PREVIEW_LINES = 5
+
 interface CommandHistoryItem {
   id: string
   context: string
@@ -34,15 +36,25 @@ export function Kubectl() {
   // #6226: useToast for download error feedback.
   const { showToast } = useToast()
   const { execute } = useKubectl()
-  const { deduplicatedClusters: clusters, isLoading } = useClusters()
+  const { deduplicatedClusters: allClusters, isLoading, isRefreshing, isFailed, consecutiveFailures } = useClusters()
+  // Filter to only reachable & healthy clusters — running kubectl against an
+  // unreachable cluster just hangs and frustrates the user. The status of
+  // every kubeconfig context is already known from the cluster cache, so we
+  // can hide the unhealthy ones from the picker entirely. (A cluster is
+  // considered usable if it is both reachable and not explicitly unhealthy.)
+  const clusters = allClusters.filter(c => c.reachable !== false && c.healthy !== false)
   const { isDemoMode } = useDemoMode()
   const [selectedContext, setSelectedContext] = useState<string>('')
 
   // Report loading state to CardWrapper for skeleton/refresh behavior
+  const hasData = clusters.length > 0
   useCardLoadingState({
-    isLoading,
-    hasAnyData: clusters.length > 0,
-    isDemoData: isDemoMode })
+    isLoading: isLoading && !hasData,
+    isRefreshing,
+    hasAnyData: hasData,
+    isDemoData: isDemoMode,
+    isFailed,
+    consecutiveFailures })
   const [command, setCommand] = useState('')
   const [aiPrompt, setAiPrompt] = useState('')
   const [output, setOutput] = useState<string[]>([])
@@ -400,7 +412,7 @@ data:
         ...prev,
         `$ kubectl apply -f -`,
         isDryRun ? `(dry-run) ${result || 'Manifest validated successfully'}` : result || `Applied manifest "${manifestName}"`,
-        yamlContent.split('\n').slice(0, 5).join('\n') + (yamlContent.split('\n').length > 5 ? '\n...' : ''),
+        yamlContent.split('\n').slice(0, YAML_PREVIEW_LINES).join('\n') + (yamlContent.split('\n').length > YAML_PREVIEW_LINES ? '\n...' : ''),
         ''
       ])
 
@@ -476,7 +488,7 @@ data:
   return (
     <div className="h-full flex flex-col min-h-card overflow-hidden">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-4 gap-2 min-w-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4 gap-2 min-w-0">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           {clusters.length > 0 && (
             <select
@@ -547,7 +559,7 @@ data:
             onChange={(e) => setAiPrompt(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && generateCommand()}
             placeholder="e.g., Create a deployment for nginx with 3 replicas"
-            className="w-full px-3 py-2 text-sm bg-secondary rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+            className="w-full px-3 py-2 text-sm bg-secondary rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
           />
           <div className="flex gap-2 mt-2">
             <Button
@@ -574,7 +586,7 @@ data:
       {/* YAML Editor Panel */}
       {showYAMLEditor && (
         <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
-          <div className="flex items-center justify-between mb-2">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
             <div className="flex items-center gap-2">
               <FileCode className="w-4 h-4 text-blue-400" />
               <span className="text-sm font-medium text-blue-300">{t('cards:kubectl.yamlEditor')}</span>
@@ -618,7 +630,7 @@ data:
               validateYAML(e.target.value)
             }}
             placeholder="Paste or write your YAML manifest here..."
-            className="w-full h-40 px-3 py-2 text-xs font-mono bg-black/30 rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-blue-500/50 resize-none"
+            className="w-full h-40 px-3 py-2 text-xs font-mono bg-black/30 rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-blue-500/50 resize-none"
           />
           {yamlError && (
             <div className="flex items-center gap-2 mt-2 text-xs text-red-400">
@@ -675,7 +687,7 @@ data:
                       selectedManifest === manifest.id ? 'bg-secondary/50 text-foreground' : 'text-muted-foreground'
                     )}
                   >
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-y-2">
                       <span>{manifest.name}</span>
                       <span className="text-2xs">{manifest.timestamp.toLocaleTimeString()}</span>
                     </div>
@@ -701,7 +713,7 @@ data:
               value={historySearch}
               onChange={(e) => setHistorySearch(e.target.value)}
               placeholder={t('cards:kubectl.searchHistory')}
-              className="w-full pl-7 pr-3 py-1.5 text-xs bg-secondary rounded text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-orange-500/50"
+              className="w-full pl-7 pr-3 py-1.5 text-xs bg-secondary rounded text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-orange-500/50"
             />
           </div>
           <div className="flex-1 overflow-y-auto space-y-1">
@@ -716,16 +728,16 @@ data:
                 }}
                 className="w-full px-2 py-1.5 text-xs rounded text-left hover:bg-secondary/50 group"
               >
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-y-2">
                   <div className="flex items-center gap-2 flex-1 min-w-0">
                     {item.success ? (
-                      <CheckCircle className="w-3 h-3 text-green-400 flex-shrink-0" />
+                      <CheckCircle className="w-3 h-3 text-green-400 shrink-0" />
                     ) : (
-                      <AlertCircle className="w-3 h-3 text-red-400 flex-shrink-0" />
+                      <AlertCircle className="w-3 h-3 text-red-400 shrink-0" />
                     )}
                     <span className="text-muted-foreground truncate">{item.command}</span>
                   </div>
-                  <span className="text-2xs text-muted-foreground ml-2 flex-shrink-0">
+                  <span className="text-2xs text-muted-foreground ml-2 shrink-0">
                     {item.timestamp.toLocaleTimeString()}
                   </span>
                 </div>
@@ -771,7 +783,7 @@ data:
               <pre
                 key={idx}
                 className={cn(
-                  'whitespace-pre-wrap break-words m-0 py-0 leading-snug',
+                  'whitespace-pre-wrap wrap-break-word m-0 py-0 leading-snug',
                   isCommand && 'text-green-400 font-semibold bg-green-500/5 -mx-1 px-1 rounded mt-1 py-0.5 border-l-2 border-green-500/40',
                   isError && 'text-red-400 bg-red-500/5 -mx-1 px-1 rounded',
                   isAI && 'text-purple-400',
@@ -795,7 +807,7 @@ data:
             onKeyDown={handleKeyDown}
             placeholder="Enter kubectl command (without 'kubectl' prefix)"
             disabled={isExecuting || !selectedContext}
-            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
+            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden disabled:opacity-50"
           />
           <div className="flex items-center gap-1">
             <div className="relative">

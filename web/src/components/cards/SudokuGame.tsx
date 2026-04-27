@@ -446,7 +446,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
   return (
     <div className="h-full flex-1 flex flex-col min-h-card content-loaded">
       {/* Header */}
-      <div className={`flex items-center justify-between ${isMaximized ? 'mb-4' : 'mb-1.5'}`}>
+      <div className={`flex flex-wrap items-center justify-between gap-y-2 ${isMaximized ? 'mb-4' : 'mb-1.5'}`}>
         <div className={`flex items-center ${isMaximized ? 'gap-3' : 'gap-1.5'}`}>
           <Sparkles className={isMaximized ? 'w-5 h-5 text-purple-400' : 'w-3.5 h-3.5 text-purple-400'} />
           <span className={`font-medium text-muted-foreground ${isMaximized ? 'text-base' : 'text-xs'}`}>Sudoku</span>
@@ -463,7 +463,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
       </div>
 
       {/* Game info */}
-      <div className={`flex items-center justify-between ${isMaximized ? 'mb-4 text-sm' : 'mb-1.5 text-2xs'}`}>
+      <div className={`flex flex-wrap items-center justify-between gap-y-2 ${isMaximized ? 'mb-4 text-sm' : 'mb-1.5 text-2xs'}`}>
         <div className={`flex items-center ${isMaximized ? 'gap-4' : 'gap-2'}`}>
           <span className={`${isMaximized ? 'px-3 py-1' : 'px-1.5 py-0.5'} rounded bg-purple-500/20 text-purple-400 font-medium`}>
             {DIFFICULTIES[gameState.difficulty].label}
@@ -488,7 +488,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
 
       {/* Sudoku Grid */}
       <div className={`flex-1 flex items-center justify-center ${isMaximized ? 'mb-8' : 'mb-1.5'}`}>
-        <div className={`inline-grid grid-cols-9 gap-0 ${isMaximized ? 'border-4 rounded-lg' : 'border rounded'} border-purple-500/30 overflow-hidden bg-secondary/20`}>
+        <div className={`inline-grid grid-cols-9 gap-0 ${isMaximized ? 'border-4 rounded-lg' : 'border-2 rounded'} border-purple-400 overflow-hidden bg-secondary/20`}>
           {gameState.board.map((row, i) =>
             row.map((cell, j) => {
               const isSelected = selectedCell?.[0] === i && selectedCell?.[1] === j
@@ -508,8 +508,8 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
                   disabled={gameState.isComplete}
                   className={`
                     ${cellSize} font-medium transition-all
-                    ${rightBorder ? (isMaximized ? 'border-r-4' : 'border-r-2') + ' border-purple-500/50' : 'border-r border-border/30'}
-                    ${bottomBorder ? (isMaximized ? 'border-b-4' : 'border-b-2') + ' border-purple-500/50' : 'border-b border-border/30'}
+                    ${rightBorder ? (isMaximized ? 'border-r-4' : 'border-r-2') + ' border-purple-400' : 'border-r border-border/60'}
+                    ${bottomBorder ? (isMaximized ? 'border-b-4' : 'border-b-2') + ' border-purple-400' : 'border-b border-border/60'}
                     ${isSelected ? 'bg-purple-500/30 ring-2 ring-purple-500' : ''}
                     ${!isSelected && (isInSameRow || isInSameCol || isInSameBox) ? 'bg-purple-500/10' : ''}
                     ${cell.isOriginal ? 'text-foreground font-bold' : 'text-purple-400'}
@@ -559,7 +559,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
             }`}
           >
             <Pencil className={iconSize} />
-            <span className={isMaximized ? 'inline' : 'hidden sm:inline'}>Notes</span>
+            <span className={isMaximized ? 'inline' : 'hidden @sm:inline'}>Notes</span>
           </button>
           <button
             onClick={handleHint}
@@ -567,7 +567,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
             className={`flex items-center justify-center gap-1 ${controlButtonSize} rounded bg-secondary/50 hover:bg-secondary transition-colors disabled:opacity-30 disabled:cursor-not-allowed`}
           >
             <Lightbulb className={iconSize} />
-            <span className={isMaximized ? 'inline' : 'hidden sm:inline'}>Hint</span>
+            <span className={isMaximized ? 'inline' : 'hidden @sm:inline'}>Hint</span>
           </button>
           <button
             onClick={undo}
@@ -595,14 +595,14 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
             className={`flex-1 flex items-center justify-center gap-1 ${controlButtonSize} rounded bg-secondary/50 hover:bg-secondary transition-colors disabled:opacity-30`}
           >
             {gameState.isPaused ? <Play className={iconSize} /> : <Pause className={iconSize} />}
-            <span className={isMaximized ? 'inline' : 'hidden sm:inline'}>{gameState.isPaused ? 'Resume' : 'Pause'}</span>
+            <span className={isMaximized ? 'inline' : 'hidden @sm:inline'}>{gameState.isPaused ? 'Resume' : 'Pause'}</span>
           </button>
           <button
             onClick={saveGame}
             className={`flex-1 flex items-center justify-center gap-1 ${controlButtonSize} rounded bg-secondary/50 hover:bg-secondary transition-colors`}
           >
             <Save className={iconSize} />
-            <span className={isMaximized ? 'inline' : 'hidden sm:inline'}>{t('common.save')}</span>
+            <span className={isMaximized ? 'inline' : 'hidden @sm:inline'}>{t('common.save')}</span>
           </button>
         </div>
       </div>
@@ -611,7 +611,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
       {showSettings && (
         <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50 rounded-lg">
           <div className="bg-background border border-border rounded-lg p-4 max-w-xs w-full mx-4">
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
               <h3 className="text-sm font-medium">New Game</h3>
               <button
                 onClick={() => setShowSettings(false)}
@@ -627,7 +627,7 @@ function SudokuGameInternal({ config: _config }: SudokuGameProps) {
                   onClick={() => startNewGame(difficulty)}
                   className="w-full text-left px-3 py-2 rounded bg-secondary/50 hover:bg-purple-500/20 transition-colors"
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-y-2">
                     <span className="font-medium">{DIFFICULTIES[difficulty].label}</span>
                     {bestTimes[difficulty] && (
                       <span className="text-xs text-muted-foreground flex items-center gap-1">

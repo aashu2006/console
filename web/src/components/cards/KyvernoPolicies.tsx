@@ -195,7 +195,7 @@ Please proceed step by step.`,
       {/* Fetch error state: one or more clusters failed to return scanner data */}
       {hasErrors && !isDemoData && (
         <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs">
-          <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-red-400 font-medium">Failed to fetch scanner data</p>
             <p className="text-muted-foreground">
@@ -211,7 +211,7 @@ Please proceed step by step.`,
       {/* Install prompt when not detected and no errors (only after scanning completes) */}
       {!installed && !isLoading && !isRefreshing && !hasErrors && (
         <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-xs">
-          <AlertCircle className="w-4 h-4 text-cyan-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
           <div>
             <p className="text-cyan-400 font-medium">Kyverno Integration</p>
             <p className="text-muted-foreground">
@@ -243,7 +243,7 @@ Please proceed step by step.`,
       {/* Deploy Sample Policies when installed but no policies */}
       {isDegraded && (
         <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-purple-500/10 border border-purple-500/20 text-xs">
-          <Sparkles className="w-4 h-4 text-purple-400 flex-shrink-0 mt-0.5" />
+          <Sparkles className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
           <div>
             <p className="text-purple-400 font-medium">No Policies Configured</p>
             <p className="text-muted-foreground">
@@ -257,7 +257,7 @@ Please proceed step by step.`,
       )}
 
       {/* Stats */}
-      <div className="grid grid-cols-3 gap-2 mb-3">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-3">
         <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-center">
           <p className="text-2xs text-cyan-400">Policies</p>
           <p className="text-lg font-bold text-foreground">{stats.totalPolicies}</p>
@@ -295,7 +295,7 @@ Please proceed step by step.`,
             tabIndex={0}
             onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handlePolicyClick(policy) } }}
           >
-            <div className="flex items-center justify-between mb-1">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-medium text-foreground truncate">{policy.name}</span>
                 <span className={`px-1.5 py-0.5 rounded text-2xs ${getStatusColor(policy.status)}`}>
@@ -309,7 +309,7 @@ Please proceed step by step.`,
                 </span>
               )}
             </div>
-            <div className="flex items-center justify-between text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs">
               <span className={getCategoryColor(policy.category)}>{policy.category}</span>
               <div className="flex items-center gap-2 text-muted-foreground">
                 <span>{policy.kind}</span>

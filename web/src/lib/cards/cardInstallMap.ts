@@ -100,4 +100,46 @@ export const CARD_INSTALL_MAP: Record<string, CardInstallInfo> = {
 
   // Knative
   knative_services: { project: 'Knative', missionKey: 'install-knative', kbPaths: ['fixes/cncf-install/install-knative.json'] },
+  // NATS
+  nats_status: { project: 'NATS', missionKey: 'install-nats', kbPaths: ['fixes/cncf-install/install-nats.json'] },
+
+  // in-toto
+  intoto_supply_chain: { project: 'in-toto', missionKey: 'install-in-toto', kbPaths: ['fixes/cncf-install/install-in-toto.json'] },
+
+  // OpenKruise
+  openkruise_status: { project: 'OpenKruise', missionKey: 'install-openkruise', kbPaths: ['fixes/cncf-install/install-openkruise.json'] },
+  // KServe
+  kserve_status: { project: 'KServe', missionKey: 'install-kserve', kbPaths: ['fixes/cncf-install/install-kserve.json'] },
+  // Keycloak
+  keycloak_status: { project: 'Keycloak', missionKey: 'install-keycloak', kbPaths: ['fixes/cncf-install/install-keycloak.json'] },
 }
+
+/**
+ * Validate CARD_INSTALL_MAP keys against the set of actually-registered
+ * card types. Logs a single warning for each dead alias. Intended to be
+ * called once at app bootstrap (dev builds only) so typos and cards that
+ * were removed from the registry but left behind in the install map are
+ * surfaced instead of silently rotting.
+ *
+ * @param registeredCardTypes full list of card type ids currently registered
+ *        (e.g. the result of `getUnifiedCardTypes()` from config/cards/index).
+ * @returns array of install-map keys that do NOT correspond to a registered card.
+ */
+export function validateCardInstallMap(registeredCardTypes: readonly string[]): string[] {
+  const known = new Set(registeredCardTypes)
+  const unknown: string[] = []
+  for (const key of Object.keys(CARD_INSTALL_MAP)) {
+    if (!known.has(key)) {
+      unknown.push(key)
+    }
+  }
+  if (unknown.length > 0 && typeof console !== 'undefined') {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[cardInstallMap] ${unknown.length} install-map key(s) do not match any registered card type:`,
+      unknown,
+    )
+  }
+  return unknown
+}
+

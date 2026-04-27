@@ -39,7 +39,7 @@ interface KubeFlexDetailModalProps {
 
 function ControlPlaneRow({ cp }: { cp: ControlPlaneInfo }) {
   return (
-    <div className="flex items-center justify-between text-sm gap-3 px-3 py-2.5 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
+    <div className="flex flex-wrap items-center justify-between gap-y-2 text-sm gap-3 px-3 py-2.5 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
       <div className="flex items-center gap-2 min-w-0 flex-1">
         <Layers className="w-4 h-4 text-purple-400 shrink-0" />
         <span className="text-foreground truncate font-medium" title={cp.name}>
@@ -180,7 +180,7 @@ export function KubeFlexDetailModal({ isOpen, onClose, data, isDemoData }: KubeF
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t('kubeFlexStatus.searchControlPlanes', 'Search control planes...')}
-              className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500"
+              className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500"
             />
           </div>
 

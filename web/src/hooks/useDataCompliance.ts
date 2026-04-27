@@ -24,7 +24,10 @@ const FETCH_TIMEOUT_MS = 15_000
 /** Auto-refresh interval (3 minutes) */
 const REFRESH_INTERVAL_MS = 180_000
 
-/** localStorage cache key */
+/** sessionStorage cache key
+ * security: stored in sessionStorage, not localStorage — compliance posture data contains
+ * cluster security metadata; sessionStorage clears on tab close to reduce exposure window
+ */
 const CACHE_KEY = 'kc-data-compliance-cache'
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -62,7 +65,7 @@ interface CacheData {
 
 function loadFromCache(): CacheData | null {
   try {
-    const stored = localStorage.getItem(CACHE_KEY)
+    const stored = sessionStorage.getItem(CACHE_KEY)
     if (!stored) return null
     return JSON.parse(stored) as CacheData
   } catch {
@@ -72,7 +75,9 @@ function loadFromCache(): CacheData | null {
 
 function saveToCache(posture: CompliancePosture): void {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({ posture, timestamp: Date.now() }))
+    // Deliberate accepted risk: compliance posture (counts/scores) cached in sessionStorage for UX;
+    // cleared on tab close. Contains aggregate metrics only — no secrets, tokens, or private keys.
+    sessionStorage.setItem(CACHE_KEY, JSON.stringify({ posture, timestamp: Date.now() })) // lgtm[js/clear-text-storage-of-sensitive-data]
   } catch {
     // Ignore storage errors
   }
@@ -80,7 +85,7 @@ function saveToCache(posture: CompliancePosture): void {
 
 function clearCache(): void {
   try {
-    localStorage.removeItem(CACHE_KEY)
+    sessionStorage.removeItem(CACHE_KEY)
   } catch {
     // Ignore
   }
@@ -255,10 +260,18 @@ export function useDataCompliance() {
         totalClusters: allClusters.length,
         reachableClusters: clusters.length }
 
-      const clusterFailures: string[] = []
+      // (#6857) Return data from each callback to avoid shared mutation.
       const tasks = clusters.map(cluster => async () => {
-        try {
-          const data = await fetchClusterCompliance(cluster.name)
+        const data = await fetchClusterCompliance(cluster.name)
+        return { cluster: cluster.name, data }
+      })
+
+      const settled = await settledWithConcurrency(tasks)
+
+      const clusterFailures: string[] = []
+      for (const result of settled) {
+        if (result.status === 'fulfilled') {
+          const { data } = result.value
           aggregated.totalSecrets += data.secrets.total
           aggregated.opaqueSecrets += data.secrets.opaque
           aggregated.tlsSecrets += data.secrets.tls
@@ -268,12 +281,15 @@ export function useDataCompliance() {
           aggregated.roleBindings += data.roleBindings
           aggregated.clusterAdminBindings += data.clusterAdminBindings
           aggregated.totalNamespaces += data.namespaces
-        } catch {
-          clusterFailures.push(cluster.name)
+        } else {
+          // Extract cluster name from the task index — rejected tasks
+          // don't carry their cluster reference, so use the tasks array index
+          const idx = (settled as PromiseSettledResult<{ cluster: string; data: unknown }>[]).indexOf(result)
+          if (idx >= 0 && idx < clusters.length) {
+            clusterFailures.push(clusters[idx].name)
+          }
         }
-      })
-
-      await settledWithConcurrency(tasks)
+      }
 
       setPosture(aggregated)
       saveToCache(aggregated)

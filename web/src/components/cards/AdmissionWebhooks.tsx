@@ -56,7 +56,7 @@ export function AdmissionWebhooks() {
 
       {isFailed && (
         <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-2">
-          <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-xs font-medium text-red-400">{t('admissionWebhooks.errorTitle', 'Error loading webhooks')}</p>
             <p className="text-2xs text-muted-foreground mt-0.5">{t('admissionWebhooks.errorDescription', 'Failed to fetch webhook data ({{count}} attempts)', { count: consecutiveFailures })}</p>
@@ -66,7 +66,7 @@ export function AdmissionWebhooks() {
 
       <div className="space-y-1 max-h-[300px] overflow-y-auto">
         {filtered.map((wh, i) => (
-          <div key={`${wh.cluster}-${wh.name}-${i}`} className="flex items-center justify-between px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+          <div key={`${wh.cluster}-${wh.name}-${i}`} className="flex flex-wrap items-center justify-between gap-y-2 px-2 py-1.5 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <span className={`text-xs px-1.5 py-0.5 rounded ${

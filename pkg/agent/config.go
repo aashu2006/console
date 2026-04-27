@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,6 +27,12 @@ type AgentConfig struct {
 type AgentKeyConfig struct {
 	APIKey string `yaml:"api_key"`
 	Model  string `yaml:"model,omitempty"`
+	// BaseURL lets operators point a provider at a non-default endpoint —
+	// for example, an in-cluster Ollama Service URL or a corporate Groq
+	// gateway. Empty string means "use the provider's compiled-in default";
+	// the env var for the provider (OLLAMA_URL, GROQ_BASE_URL, ...) still
+	// wins over this field, matching the APIKey / Model precedence.
+	BaseURL string `yaml:"base_url,omitempty"`
 }
 
 // ConfigManager handles reading and writing the local config file
@@ -35,6 +42,11 @@ type ConfigManager struct {
 	config      *AgentConfig
 	keyValidity map[string]bool // Cache of key validity (true=valid, false=invalid)
 	validityMu  sync.RWMutex    // Separate mutex for validity cache
+	// inMemoryKeys holds provider API keys that should NOT be persisted to
+	// ~/.kc/config.yaml — for example the sentinel placeholder used by local
+	// LLM runners that do not enforce auth. Using an in-memory map avoids
+	// disk side-effects and works on read-only filesystems (#8255).
+	inMemoryKeys sync.Map // map[string]string
 }
 
 var (
@@ -47,6 +59,7 @@ func GetConfigManager() *ConfigManager {
 	configManagerOnce.Do(func() {
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
+			slog.Warn("[AgentConfig] HOME directory unavailable, falling back to current directory for config", "error", err)
 			homeDir = "."
 		}
 		configPath := filepath.Join(homeDir, configDirName, configFileName)
@@ -96,11 +109,15 @@ func (cm *ConfigManager) Load() error {
 	return nil
 }
 
-// Save writes the config to disk with secure permissions
+// Save writes the config to disk with secure permissions.
 func (cm *ConfigManager) Save() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	return cm.saveLocked()
+}
 
+// saveLocked writes config to disk. Caller MUST hold cm.mu.
+func (cm *ConfigManager) saveLocked() error {
 	// Ensure directory exists with secure permissions
 	configDir := filepath.Dir(cm.configPath)
 	if err := os.MkdirAll(configDir, configDirMode); err != nil {
@@ -120,7 +137,12 @@ func (cm *ConfigManager) Save() error {
 	return nil
 }
 
-// GetAPIKey returns the API key for a provider (env var takes precedence)
+// GetAPIKey returns the API key for a provider. Precedence:
+//  1. Environment variable
+//  2. Persistent config file (~/.kc/config.yaml)
+//  3. In-memory override set via SetAPIKeyInMemory (e.g. local LLM sentinel)
+//
+// Real operator keys always win over in-memory placeholders.
 func (cm *ConfigManager) GetAPIKey(provider string) string {
 	// Environment variable takes precedence
 	envKey := getEnvKeyForProvider(provider)
@@ -133,11 +155,25 @@ func (cm *ConfigManager) GetAPIKey(provider string) string {
 	defer cm.mu.RUnlock()
 
 	if cm.config != nil {
-		if agentConfig, ok := cm.config.Agents[provider]; ok {
+		if agentConfig, ok := cm.config.Agents[provider]; ok && agentConfig.APIKey != "" {
 			return agentConfig.APIKey
 		}
 	}
+	// Finally, fall back to in-memory override (never persisted).
+	if v, ok := cm.inMemoryKeys.Load(provider); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
 	return ""
+}
+
+// SetAPIKeyInMemory stores a key for a provider WITHOUT writing to disk.
+// Used for sentinel placeholders (e.g. local LLM runners that do not
+// enforce auth) so read-only filesystems and ephemeral containers do not
+// see spurious writes to ~/.kc/config.yaml (#8255).
+func (cm *ConfigManager) SetAPIKeyInMemory(provider, apiKey string) {
+	cm.inMemoryKeys.Store(provider, apiKey)
 }
 
 // GetModel returns the model for a provider (env var takes precedence)
@@ -160,46 +196,97 @@ func (cm *ConfigManager) GetModel(provider, defaultModel string) string {
 	return defaultModel
 }
 
-// SetAPIKey stores an API key for a provider
+// SetAPIKey stores an API key for a provider. The lock is held across
+// both the map mutation and the disk write to prevent lost updates (#7245).
 func (cm *ConfigManager) SetAPIKey(provider, apiKey string) error {
-	func() {
-		cm.mu.Lock()
-		defer cm.mu.Unlock()
-		agentConfig := cm.config.Agents[provider]
-		agentConfig.APIKey = apiKey
-		cm.config.Agents[provider] = agentConfig
-	}()
-
-	return cm.Save()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	agentConfig := cm.config.Agents[provider]
+	agentConfig.APIKey = apiKey
+	cm.config.Agents[provider] = agentConfig
+	return cm.saveLocked()
 }
 
-// SetModel stores a model preference for a provider
+// SetModel stores a model preference for a provider.
 func (cm *ConfigManager) SetModel(provider, model string) error {
-	func() {
-		cm.mu.Lock()
-		defer cm.mu.Unlock()
-		agentConfig := cm.config.Agents[provider]
-		agentConfig.Model = model
-		cm.config.Agents[provider] = agentConfig
-	}()
-
-	return cm.Save()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	agentConfig := cm.config.Agents[provider]
+	agentConfig.Model = model
+	cm.config.Agents[provider] = agentConfig
+	return cm.saveLocked()
 }
 
-// RemoveAPIKey removes the API key for a provider
+// GetBaseURL returns the configured base URL for a provider. Env var takes
+// precedence over the config file so operators can always override from the
+// shell that launches kc-agent. An empty return value means "no override —
+// use the provider's compiled-in default".
+func (cm *ConfigManager) GetBaseURL(provider string) string {
+	envKey := getBaseURLEnvKeyForProvider(provider)
+	if envKey != "" {
+		if envVal := os.Getenv(envKey); envVal != "" {
+			return envVal
+		}
+	}
+
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	if cm.config != nil {
+		if agentConfig, ok := cm.config.Agents[provider]; ok && agentConfig.BaseURL != "" {
+			return agentConfig.BaseURL
+		}
+	}
+	return ""
+}
+
+// SetBaseURL stores a base URL override for a provider. The lock is held
+// across both the map mutation and the disk write to prevent lost updates.
+func (cm *ConfigManager) SetBaseURL(provider, baseURL string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	agentConfig := cm.config.Agents[provider]
+	agentConfig.BaseURL = baseURL
+	cm.config.Agents[provider] = agentConfig
+	return cm.saveLocked()
+}
+
+// RemoveBaseURL clears the base URL override for a provider, reverting to
+// the compiled-in default.
+func (cm *ConfigManager) RemoveBaseURL(provider string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	agentConfig := cm.config.Agents[provider]
+	agentConfig.BaseURL = ""
+	cm.config.Agents[provider] = agentConfig
+	return cm.saveLocked()
+}
+
+// RemoveAPIKey removes the API key for a provider.
 func (cm *ConfigManager) RemoveAPIKey(provider string) error {
-	func() {
-		cm.mu.Lock()
-		defer cm.mu.Unlock()
-		delete(cm.config.Agents, provider)
-	}()
-
-	return cm.Save()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	delete(cm.config.Agents, provider)
+	return cm.saveLocked()
 }
 
-// HasAPIKey checks if a provider has an API key configured (env or config)
+// HasAPIKey checks if a provider has a REAL API key configured in the
+// environment or on disk. In-memory placeholders (see SetAPIKeyInMemory)
+// are deliberately ignored so local LLM runners are not reported as
+// "configured" just because the sentinel was seeded at chat time (#8255).
 func (cm *ConfigManager) HasAPIKey(provider string) bool {
-	return cm.GetAPIKey(provider) != ""
+	envKey := getEnvKeyForProvider(provider)
+	if envVal := os.Getenv(envKey); envVal != "" {
+		return true
+	}
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	if cm.config != nil {
+		if agentConfig, ok := cm.config.Agents[provider]; ok && agentConfig.APIKey != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // IsFromEnv checks if the API key is from environment variable
@@ -252,19 +339,19 @@ func (cm *ConfigManager) GetDefaultAgent() string {
 	return cm.config.DefaultAgent
 }
 
-// SetDefaultAgent sets the default agent
+// SetDefaultAgent sets the default agent.
 func (cm *ConfigManager) SetDefaultAgent(agent string) error {
-	func() {
-		cm.mu.Lock()
-		defer cm.mu.Unlock()
-		cm.config.DefaultAgent = agent
-	}()
-
-	return cm.Save()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.config.DefaultAgent = agent
+	return cm.saveLocked()
 }
 
-// GetConfigPath returns the path to the config file
+// GetConfigPath returns the path to the config file.
+// Reads under lock to avoid a data race with SetConfigPath (#7246).
 func (cm *ConfigManager) GetConfigPath() string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	return cm.configPath
 }
 
@@ -304,8 +391,63 @@ func getEnvKeyForProvider(provider string) string {
 		return "RAYCAST_API_KEY"
 	case "open-webui":
 		return "OPEN_WEBUI_API_KEY"
+	case "openrouter":
+		return "OPENROUTER_API_KEY"
+	case "groq":
+		return "GROQ_API_KEY"
 	case "goose":
 		return "GOOSE_PROVIDER"
+	// Local LLM runners — the "API key" env var is only consulted when the
+	// operator has enabled authentication on the runner. Most local runners
+	// are unauthenticated and rely on the sentinel seeded by
+	// ensureLocalLLMPlaceholderKey in provider_local_openai_compat.go.
+	case "ollama":
+		return "OLLAMA_API_KEY"
+	case "llamacpp":
+		return "LLAMACPP_API_KEY"
+	case "localai":
+		return "LOCALAI_API_KEY"
+	case "vllm":
+		return "VLLM_API_KEY"
+	case "lm-studio":
+		return "LM_STUDIO_API_KEY"
+	case "rhaiis":
+		return "RHAIIS_API_KEY"
+	case "ramalama":
+		return "RAMALAMA_API_KEY"
+	default:
+		return ""
+	}
+}
+
+// getBaseURLEnvKeyForProvider maps a provider key to the environment
+// variable that overrides its base URL. Empty return means "no env var is
+// honored for this provider" — used by providers that do not support a base
+// URL override (Claude/OpenAI/Gemini vendor HTTP APIs).
+func getBaseURLEnvKeyForProvider(provider string) string {
+	switch provider {
+	// Local LLM runners — see pkg/agent/provider_local_openai_compat.go
+	case "ollama":
+		return "OLLAMA_URL"
+	case "llamacpp":
+		return "LLAMACPP_URL"
+	case "localai":
+		return "LOCALAI_URL"
+	case "vllm":
+		return "VLLM_URL"
+	case "lm-studio":
+		return "LM_STUDIO_URL"
+	case "rhaiis":
+		return "RHAIIS_URL"
+	case "ramalama":
+		return "RAMALAMA_URL"
+	// OpenAI-compatible gateways
+	case "groq":
+		return "GROQ_BASE_URL"
+	case "openrouter":
+		return "OPENROUTER_BASE_URL"
+	case "open-webui":
+		return "OPEN_WEBUI_URL"
 	default:
 		return ""
 	}
@@ -325,8 +467,26 @@ func getModelEnvKeyForProvider(provider string) string {
 		return "CODEIUM_MODEL"
 	case "open-webui":
 		return "OPEN_WEBUI_MODEL"
+	case "openrouter":
+		return "OPENROUTER_MODEL"
+	case "groq":
+		return "GROQ_MODEL"
 	case "goose":
 		return "GOOSE_MODEL"
+	case "ollama":
+		return "OLLAMA_MODEL"
+	case "llamacpp":
+		return "LLAMACPP_MODEL"
+	case "localai":
+		return "LOCALAI_MODEL"
+	case "vllm":
+		return "VLLM_MODEL"
+	case "lm-studio":
+		return "LM_STUDIO_MODEL"
+	case "rhaiis":
+		return "RHAIIS_MODEL"
+	case "ramalama":
+		return "RAMALAMA_MODEL"
 	default:
 		return ""
 	}

@@ -1,15 +1,20 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle,
   Eye,
   EyeOff,
-  Server } from 'lucide-react'
+  Server,
+  Bell,
+  BellOff } from 'lucide-react'
 import { useAlerts } from '../../hooks/useAlerts'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
+import { DEFAULT_PAGE_SIZE } from '../../lib/constants/ui'
 import { StatusBadge } from '../ui/StatusBadge'
 import { useGlobalFilters, type SeverityLevel } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { useMissions } from '../../hooks/useMissions'
+import { ALERT_SEVERITY_ORDER } from '../../types/alerts'
 import type { Alert, AlertSeverity } from '../../types/alerts'
 import { CardControls } from '../ui/CardControls'
 import { Pagination } from '../ui/Pagination'
@@ -20,12 +25,22 @@ import { useTranslation } from 'react-i18next'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { NotificationVerifyIndicator } from './NotificationVerifyIndicator'
 import { AlertListItem } from './AlertListItem'
+import { useDoNotDisturb, type TimedDuration } from '../../hooks/useDoNotDisturb'
+
+/** Format remaining DND time as "Xh Ym" or "Ym" */
+function formatRemaining(ms: number): string {
+  const totalMinutes = Math.ceil(ms / MS_PER_MINUTE)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
+}
 
 // Stats summary row shown at the top of the alerts card
 function AlertStatsRow({ critical, warning, acknowledged }: { critical: number; warning: number; acknowledged: number }) {
   const { t } = useTranslation('cards')
   return (
-    <div className="grid grid-cols-3 gap-2 mb-3">
+    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-3">
       <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/20">
         <div className="flex items-center gap-1.5 mb-1">
           <AlertTriangle className="w-3 h-3 text-red-400" />
@@ -51,30 +66,40 @@ function AlertStatsRow({ critical, warning, acknowledged }: { critical: number; 
   )
 }
 
-/** Default pagination size for the alerts list */
-const DEFAULT_PAGE_SIZE = 5
-
 type SortField = 'severity' | 'time'
 
 export function ActiveAlerts() {
   const { t } = useTranslation('cards')
-  const { activeAlerts, acknowledgedAlerts, stats, acknowledgeAlert, runAIDiagnosis } = useAlerts()
+  const {
+    activeAlerts,
+    acknowledgedAlerts,
+    stats,
+    acknowledgeAlert,
+    runAIDiagnosis,
+    isLoadingData,
+    dataError,
+  } = useAlerts()
   const { selectedSeverities, isAllSeveritiesSelected, customFilter } = useGlobalFilters()
   const { isDemoMode } = useDemoMode()
 
-  // Report state to CardWrapper for refresh animation and demo badge
+  // Report real fetch state so CardWrapper shows the refresh spinner on reload (#8011)
+  // and the error badge when the underlying MCP data bridge fails (#8014).
+  const hasAnyData = activeAlerts.length > 0 || acknowledgedAlerts.length > 0
   useCardLoadingState({
-    isLoading: false,
-    isRefreshing: false,
-    hasAnyData: activeAlerts.length > 0 || acknowledgedAlerts.length > 0,
+    isLoading: isLoadingData && !hasAnyData,
+    isRefreshing: isLoadingData && hasAnyData,
+    hasAnyData,
     isDemoData: isDemoMode,
-    isFailed: false,
-    consecutiveFailures: 0,
+    isFailed: Boolean(dataError),
+    consecutiveFailures: dataError ? 1 : 0,
+    errorMessage: dataError ?? undefined,
   })
   const { drillToAlert } = useDrillDownActions()
   const { missions, setActiveMission, openSidebar } = useMissions()
 
   const [showAcknowledged, setShowAcknowledged] = useState(false)
+  const [showDNDMenu, setShowDNDMenu] = useState(false)
+  const dnd = useDoNotDisturb()
 
   // Combine active and acknowledged alerts when toggle is on
   const allAlertsToShow = (() => {
@@ -119,8 +144,6 @@ export function ActiveAlerts() {
     return result
   })()
 
-  const severityOrder: Record<AlertSeverity, number> = { critical: 0, warning: 1, info: 2 }
-
   // Use shared card data hook for filtering, sorting, and pagination
   const {
     items: displayedAlerts,
@@ -155,12 +178,30 @@ export function ActiveAlerts() {
       defaultDirection: 'asc',
       comparators: {
         severity: (a, b) => {
-          const severityDiff = severityOrder[a.severity] - severityOrder[b.severity]
+          const severityDiff = ALERT_SEVERITY_ORDER[a.severity] - ALERT_SEVERITY_ORDER[b.severity]
           if (severityDiff !== 0) return severityDiff
           return new Date(b.firedAt).getTime() - new Date(a.firedAt).getTime()
         },
         time: (a, b) => new Date(b.firedAt).getTime() - new Date(a.firedAt).getTime() } },
     defaultLimit: DEFAULT_PAGE_SIZE })
+
+  // Issue 9257 — the global severity filter is applied before `useCardData`
+  // sees the items, so `useCardData`'s internal page-reset effect (which only
+  // fires on its own search/cluster filter changes) never triggered when the
+  // severity filter changed. That left users on a stale page (e.g. page 3 of
+  // a list that now has 1 page). Track the external filter inputs in a ref
+  // and reset to page 1 only on the cycle where they actually change, so we
+  // don't snap the page back to 1 on every render (useCardData recreates
+  // `goToPage` each render).
+  const RESET_TO_FIRST_PAGE = 1
+  const externalFilterKey = `${isAllSeveritiesSelected ? 'all' : selectedSeverities.join(',')}|${showAcknowledged}`
+  const lastExternalFilterKeyRef = useRef(externalFilterKey)
+  useEffect(() => {
+    if (lastExternalFilterKeyRef.current !== externalFilterKey) {
+      lastExternalFilterKeyRef.current = externalFilterKey
+      goToPage(RESET_TO_FIRST_PAGE)
+    }
+  })
 
   const handleAlertClick = (alert: Alert) => {
     if (alert.cluster) {
@@ -203,9 +244,10 @@ export function ActiveAlerts() {
 
   return (
     <div className="h-full flex flex-col">
-      {/* Header with controls */}
-      <div className="flex items-center justify-between mb-2 flex-shrink-0">
-        <div className="flex items-center gap-2">
+      {/* Header with controls — uses @container queries so layout
+           responds to card width, not viewport width */}
+      <div className="flex flex-wrap @lg:flex-nowrap items-center justify-between gap-y-2 mb-2 shrink-0">
+        <div className="flex items-center gap-2 @xs:flex-wrap">
           {stats.firing > 0 && (
             <StatusBadge color="red" variant="outline" rounded="full">
               {t('activeAlerts.firingCount', { count: stats.firing })}
@@ -219,9 +261,63 @@ export function ActiveAlerts() {
           )}
           {/* Browser notification verification indicator */}
           <NotificationVerifyIndicator />
+          {/* Do Not Disturb toggle */}
+          <div className="relative">
+            <button
+              onClick={() => dnd.isActive ? dnd.clearDND() : setShowDNDMenu(!showDNDMenu)}
+              className={`flex items-center gap-1 px-1.5 py-1 text-xs rounded-lg border transition-colors ${
+                dnd.isActive
+                  ? 'bg-yellow-500/20 border-yellow-500/30 text-yellow-400'
+                  : 'bg-secondary border-border text-muted-foreground hover:text-foreground'
+              }`}
+              title={dnd.isActive
+                ? `Notifications paused${dnd.remaining > 0 ? ` (${formatRemaining(dnd.remaining)})` : ''} — click to resume`
+                : 'Pause notifications'}
+            >
+              {dnd.isActive ? <BellOff className="w-3 h-3" /> : <Bell className="w-3 h-3" />}
+              {dnd.isActive && dnd.remaining > 0 && (
+                <span className="text-[10px]">{formatRemaining(dnd.remaining)}</span>
+              )}
+            </button>
+            {showDNDMenu && !dnd.isActive && (
+              // Issue 9257 — same hardcoded-dark-hex fix as the snooze menu:
+              // use the themed `bg-card` token so light mode isn't broken.
+              <div className="absolute top-full left-0 mt-1 z-50 bg-card border border-border rounded-lg shadow-xl py-1 min-w-[160px]"
+                onKeyDown={(e) => {
+                  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+                  e.preventDefault()
+                  const items = e.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled])')
+                  const idx = Array.from(items).indexOf(document.activeElement as HTMLElement)
+                  if (e.key === 'ArrowDown') items[Math.min(idx + 1, items.length - 1)]?.focus()
+                  else items[Math.max(idx - 1, 0)]?.focus()
+                }}
+              >
+                {([
+                  ['1h', 'For 1 hour'],
+                  ['4h', 'For 4 hours'],
+                  ['tomorrow', 'Until tomorrow 8am'],
+                ] as [TimedDuration, string][]).map(([duration, label]) => (
+                  <button
+                    key={duration}
+                    onClick={() => { dnd.setTimedDND(duration); setShowDNDMenu(false) }}
+                    className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted/50 transition-colors"
+                  >
+                    {label}
+                  </button>
+                ))}
+                <div className="border-t border-border my-1" />
+                <button
+                  onClick={() => { dnd.setManualDND(true); setShowDNDMenu(false) }}
+                  className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted/50 transition-colors"
+                >
+                  Until I turn it off
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 @xs:flex-wrap">
           {/* 1. Ack'd toggle */}
           <button
             onClick={() => setShowAcknowledged(!showAcknowledged)}

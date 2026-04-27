@@ -161,7 +161,7 @@ Please proceed step by step.`,
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="Search policies..."
-                  className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="w-full pl-9 pr-3 py-2 bg-secondary/50 border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-purple-500"
                 />
               </div>
               {status.totalPolicies === 0 && (
@@ -176,7 +176,7 @@ Please proceed step by step.`,
             </div>
 
             {/* Stats row */}
-            <div className="grid grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <StatBox label="Total" value={status.totalPolicies} color="text-foreground" />
               <StatBox label="Enforcing" value={status.enforcingCount} color="text-green-400" />
               <StatBox label="Audit" value={status.auditCount} color="text-yellow-400" />
@@ -274,14 +274,14 @@ function PolicyRow({
       tabIndex={0}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(policy) } }}
     >
-      <div className="flex items-center justify-between mb-1">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-sm font-medium text-foreground truncate">{policy.name}</span>
           <StatusBadge color={getStatusColor(policy.status)} size="xs">
             {policy.status}
           </StatusBadge>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           {policy.violations > 0 && (
             <span className="flex items-center gap-1 text-xs text-yellow-400">
               <AlertTriangle className="w-3 h-3" />
@@ -319,7 +319,7 @@ function ReportBar({ report }: { report: KyvernoPolicyReport }) {
 
   return (
     <div className="space-y-1">
-      <div className="flex items-center justify-between text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs">
         <span className="font-mono text-foreground">{report.namespace}</span>
         <span className="text-muted-foreground">
           {report.fail > REPORT_HIGHLIGHT_THRESHOLD && (

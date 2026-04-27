@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useDroppable } from '@dnd-kit/core'
 import {
   Server,
@@ -31,6 +31,8 @@ import { useDemoMode } from '../../hooks/useDemoMode'
 import { useTranslation } from 'react-i18next'
 import { StatusBadge } from '../ui/StatusBadge'
 import { ConfirmDialog } from '../../lib/modals'
+import { useFederationAwareness, getProviderLabel } from '../../hooks/useFederation'
+import { formatTimeAgo } from '../../lib/formatters'
 
 interface ClusterGroupsProps {
   config?: Record<string, unknown>
@@ -98,15 +100,6 @@ function formatFilter(f: ClusterFilter): string {
   return `${field} ${op} ${f.value}`
 }
 
-function relativeTime(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime()
-  const secs = Math.floor(diff / 1000)
-  if (secs < 60) return `${secs}s ago`
-  const mins = Math.floor(secs / 60)
-  if (mins < 60) return `${mins}m ago`
-  return `${Math.floor(mins / 60)}h ago`
-}
-
 // ============================================================================
 // Main Component
 // ============================================================================
@@ -114,8 +107,9 @@ function relativeTime(iso: string): string {
 export function ClusterGroups(_props: ClusterGroupsProps) {
   const { t } = useTranslation(['cards', 'common'])
   const { groups: liveGroups, createGroup, updateGroup, deleteGroup, isPersisted } = useClusterGroups()
-  const { deduplicatedClusters: clusters, isLoading, isRefreshing } = useClusters()
+  const { deduplicatedClusters: clusters, isLoading, isRefreshing, isFailed, consecutiveFailures } = useClusters()
   const { isDemoMode: demoMode } = useDemoMode()
+  const federation = useFederationAwareness()
 
   // Build the built-in "all-healthy-clusters" group from current cluster state for live mode
   const builtInGroup: ClusterGroup = {
@@ -126,7 +120,16 @@ export function ClusterGroups(_props: ClusterGroupsProps) {
     builtIn: true,
     query: { filters: [{ field: 'healthy', operator: 'eq', value: 'true' }] } }
 
-  const groups = demoMode ? DEMO_GROUPS : [builtInGroup, ...liveGroups]
+  const federationGroups: ClusterGroup[] = (federation.groups || []).map(fg => ({
+    name: `${getProviderLabel(fg.provider)}:${fg.hubContext}:${fg.name}`,
+    kind: 'dynamic' as ClusterGroupKind,
+    clusters: fg.members || [],
+    color: fg.kind === 'set' ? 'cyan' : fg.kind === 'peer' ? 'purple' : 'blue',
+    builtIn: true,
+    icon: fg.kind,
+  }))
+
+  const groups = demoMode ? DEMO_GROUPS : [builtInGroup, ...federationGroups, ...liveGroups]
   const [isCreating, setIsCreating] = useState(false)
   // Track which group is pending delete confirmation (#5197)
   const [deleteConfirmName, setDeleteConfirmName] = useState<string | null>(null)
@@ -137,9 +140,16 @@ export function ClusterGroups(_props: ClusterGroupsProps) {
     isLoading: isLoading && !hasData,
     isRefreshing,
     hasAnyData: hasData,
-    isDemoData: demoMode })
+    isDemoData: demoMode,
+    isFailed,
+    consecutiveFailures })
   const [editingGroup, setEditingGroup] = useState<string | null>(null)
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
+
+  const clusterHealthMap = useMemo(
+    () => new Map(clusters.map(c => [c.name, c.healthy])),
+    [clusters],
+  )
 
   const toggleExpanded = (name: string) => {
     setExpandedGroups(prev => {
@@ -155,7 +165,7 @@ export function ClusterGroups(_props: ClusterGroupsProps) {
   return (
     <div className="space-y-3">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <div className="flex items-center gap-2">
           <Layers className="w-4 h-4 text-blue-400" />
           <span className="text-sm font-medium text-foreground">
@@ -186,7 +196,7 @@ export function ClusterGroups(_props: ClusterGroupsProps) {
       {isCreating && (
         <CreateGroupForm
           availableClusters={availableClusterNames}
-          clusterHealthMap={new Map(clusters.map(c => [c.name, c.healthy]))}
+          clusterHealthMap={clusterHealthMap}
           onSave={(group) => {
             createGroup(group)
             setIsCreating(false)
@@ -212,7 +222,7 @@ export function ClusterGroups(_props: ClusterGroupsProps) {
                 key={group.name}
                 group={group}
                 availableClusters={availableClusterNames}
-                clusterHealthMap={new Map(clusters.map(c => [c.name, c.healthy]))}
+                clusterHealthMap={clusterHealthMap}
                 onSave={(updates) => {
                   updateGroup(group.name, updates)
                   setEditingGroup(null)
@@ -224,7 +234,7 @@ export function ClusterGroups(_props: ClusterGroupsProps) {
                 key={group.name}
                 group={group}
                 isExpanded={expandedGroups.has(group.name)}
-                clusterHealthMap={new Map(clusters.map(c => [c.name, c.healthy]))}
+                clusterHealthMap={clusterHealthMap}
                 onToggle={() => toggleExpanded(group.name)}
                 onEdit={() => setEditingGroup(group.name)}
                 onDelete={() => setDeleteConfirmName(group.name)}
@@ -314,8 +324,8 @@ function DroppableGroup({ group, isExpanded, clusterHealthMap, onToggle, onEdit,
         <div className={cn('w-2 h-2 rounded-full', color.dot)} />
 
         {/* Group name + dynamic badge */}
-        <span className={cn('text-sm font-medium flex-1 flex items-center gap-1.5', color.text)}>
-          {group.name}
+        <span className={cn('text-sm font-medium flex-1 min-w-0 flex items-center gap-1.5', color.text)}>
+          <span className="truncate">{group.name}</span>
           {isDynamic && (
             <StatusBadge color="purple" size="xs" variant="outline" rounded="full" icon={<Zap className="w-2.5 h-2.5" />}>
               {t('cards:clusterGroups.dynamic')}
@@ -324,7 +334,7 @@ function DroppableGroup({ group, isExpanded, clusterHealthMap, onToggle, onEdit,
         </span>
 
         {/* Compact cluster badges */}
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 shrink-0">
           {group.clusters.slice(0, MAX_INLINE_BADGES).map(cluster => (
             <div
               key={cluster}
@@ -343,7 +353,7 @@ function DroppableGroup({ group, isExpanded, clusterHealthMap, onToggle, onEdit,
         </div>
 
         {/* Cluster count + health */}
-        <span className="text-2xs text-muted-foreground">
+        <span className="text-2xs text-muted-foreground whitespace-nowrap shrink-0">
           {healthyCount}/{group.clusters.length} {t('common:common.healthy').toLowerCase()}
         </span>
 
@@ -359,6 +369,7 @@ function DroppableGroup({ group, isExpanded, clusterHealthMap, onToggle, onEdit,
             onClick={onEdit}
             className="p-1 rounded hover:bg-gray-900/10 dark:hover:bg-white/10 text-muted-foreground hover:text-foreground transition-colors"
             title={t('cards:clusterGroups.editGroup')}
+            aria-label={t('cards:clusterGroups.editGroup')}
           >
             <Edit2 className="w-3 h-3" />
           </button>
@@ -366,6 +377,7 @@ function DroppableGroup({ group, isExpanded, clusterHealthMap, onToggle, onEdit,
             onClick={onDelete}
             className="p-1 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors"
             title={t('cards:clusterGroups.deleteGroup')}
+            aria-label={t('cards:clusterGroups.deleteGroup')}
           >
             <Trash2 className="w-3 h-3" />
           </button>
@@ -392,7 +404,7 @@ function DroppableGroup({ group, isExpanded, clusterHealthMap, onToggle, onEdit,
                 </div>
               ))}
               {group.lastEvaluated && (
-                <div className="text-muted-foreground">{t('cards:clusterGroups.evaluated', { time: relativeTime(group.lastEvaluated) })}</div>
+                <div className="text-muted-foreground">{t('cards:clusterGroups.evaluated', { time: formatTimeAgo(group.lastEvaluated) })}</div>
               )}
             </div>
           )}
@@ -551,7 +563,7 @@ function CreateGroupForm({ availableClusters, clusterHealthMap, onSave, onCancel
 
   return (
     <div className="rounded-lg border border-blue-500/40 bg-blue-500/5 p-3 space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <span className="text-xs font-medium text-blue-400">{t('cards:clusterGroups.newClusterGroup')}</span>
         <button onClick={onCancel} aria-label={t('common:common.cancel')} className="p-2 hover:bg-gray-900/10 dark:hover:bg-white/10 rounded min-h-11 min-w-11 flex items-center justify-center">
           <X className="w-3.5 h-3.5 text-muted-foreground" />
@@ -564,7 +576,7 @@ function CreateGroupForm({ availableClusters, clusterHealthMap, onSave, onCancel
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder={t('cards:clusterGroups.groupNamePlaceholder')}
-        className="w-full px-2.5 py-1.5 text-sm rounded-md bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-blue-500"
+        className="w-full px-2.5 py-1.5 text-sm rounded-md bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-blue-500"
         autoFocus
       />
 
@@ -817,13 +829,13 @@ function QueryBuilder({
           value={labelSelector}
           onChange={(e) => onLabelSelectorChange(e.target.value)}
           placeholder="e.g. topology.kubernetes.io/zone in (us-east-1a)"
-          className="w-full px-2 py-1.5 text-xs font-mono rounded-md bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-purple-500"
+          className="w-full px-2 py-1.5 text-xs font-mono rounded-md bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-purple-500"
         />
       </div>
 
       {/* Resource filters */}
       <div>
-        <div className="flex items-center justify-between mb-1">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
           <label className="flex items-center gap-1 text-2xs text-muted-foreground">
             <Filter className="w-2.5 h-2.5" />
             {t('cards:clusterGroups.resourceFilters')}
@@ -855,7 +867,7 @@ function QueryBuilder({
                       onUpdateFilter(i, { field: e.target.value, operator: 'gte', value: '1' })
                     }
                   }}
-                  className="flex-1 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-none focus:border-purple-500"
+                  className="flex-1 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-hidden focus:border-purple-500"
                 >
                   {FILTER_FIELDS.map(ff => (
                     <option key={ff.field} value={ff.field}>{ff.label}</option>
@@ -867,7 +879,7 @@ function QueryBuilder({
                   <select
                     value={f.value}
                     onChange={(e) => onUpdateFilter(i, { value: e.target.value })}
-                    className="w-16 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-none focus:border-purple-500"
+                    className="w-16 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-hidden focus:border-purple-500"
                   >
                     <option value="true">true</option>
                     <option value="false">false</option>
@@ -878,7 +890,7 @@ function QueryBuilder({
                     <select
                       value={f.operator}
                       onChange={(e) => onUpdateFilter(i, { operator: e.target.value })}
-                      className="w-16 px-1 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-none focus:border-purple-500"
+                      className="w-16 px-1 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-hidden focus:border-purple-500"
                     >
                       {TEXT_OPERATORS.map(op => (
                         <option key={op.value} value={op.value}>{op.label}</option>
@@ -890,7 +902,7 @@ function QueryBuilder({
                       value={f.value}
                       onChange={(e) => onUpdateFilter(i, { value: e.target.value })}
                       placeholder="e.g. A100"
-                      className="w-20 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-purple-500"
+                      className="w-20 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-purple-500"
                     />
                   </>
                 ) : (
@@ -899,7 +911,7 @@ function QueryBuilder({
                     <select
                       value={f.operator}
                       onChange={(e) => onUpdateFilter(i, { operator: e.target.value })}
-                      className="w-12 px-1 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-none focus:border-purple-500"
+                      className="w-12 px-1 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-hidden focus:border-purple-500"
                     >
                       {NUM_OPERATORS.map(op => (
                         <option key={op.value} value={op.value}>{op.label}</option>
@@ -910,7 +922,7 @@ function QueryBuilder({
                       type="number"
                       value={f.value}
                       onChange={(e) => onUpdateFilter(i, { value: e.target.value })}
-                      className="w-14 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-none focus:border-purple-500"
+                      className="w-14 px-1.5 py-1 text-2xs rounded bg-gray-900/50 border border-border text-foreground focus:outline-hidden focus:border-purple-500"
                     />
                   </>
                 )}
@@ -963,7 +975,7 @@ function AIAssistant({
         onChange={(e) => onPromptChange(e.target.value)}
         placeholder='e.g. "Healthy clusters with at least 4 CPU cores"'
         rows={2}
-        className="w-full px-2.5 py-1.5 text-xs rounded-md bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-purple-500 resize-none"
+        className="w-full px-2.5 py-1.5 text-xs rounded-md bg-gray-900/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-purple-500 resize-none"
       />
       <button
         onClick={onGenerate}
@@ -1054,7 +1066,7 @@ function EditGroupForm({ group, availableClusters, clusterHealthMap, onSave, onC
 
   return (
     <div className="rounded-lg border border-yellow-500/40 bg-yellow-500/5 p-3 space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
         <span className="text-xs font-medium text-yellow-400">{t('common:common.edit')}: {group.name}</span>
         <button onClick={onCancel} aria-label={t('common:common.cancel')} className="p-2 hover:bg-gray-900/10 dark:hover:bg-white/10 rounded min-h-11 min-w-11 flex items-center justify-center">
           <X className="w-3.5 h-3.5 text-muted-foreground" />

@@ -13,6 +13,7 @@ import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
 import { useCardLoadingState } from './CardDataContext'
 import { DynamicCardErrorBoundary } from './DynamicCardErrorBoundary'
 import { useTranslation } from 'react-i18next'
+import { hasGPUResourceRequest, normalizeClusterName } from '../../lib/gpu'
 
 interface GPUNamespaceAllocationsProps {
   config?: Record<string, unknown>
@@ -31,19 +32,6 @@ interface NamespaceGPUAllocation {
   gpuRequested: number
   podCount: number
   clusters: string[]
-}
-
-// Check if any container in the pod requests GPUs
-function hasGPUResourceRequest(containers?: { gpuRequested?: number }[]): boolean {
-  if (!containers) return false
-  return containers.some(c => (c.gpuRequested ?? 0) > 0)
-}
-
-// Normalize cluster name for matching
-function normalizeClusterName(cluster: string): string {
-  if (!cluster) return ''
-  const parts = cluster.split('/')
-  return parts[parts.length - 1] || cluster
 }
 
 const NAMESPACE_SORT_COMPARATORS: Record<SortByOption, (a: NamespaceGPUAllocation, b: NamespaceGPUAllocation) => number> = {
@@ -141,7 +129,7 @@ function GPUNamespaceAllocationsInternal({ config: _config }: GPUNamespaceAlloca
   if (isLoading) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
           <Skeleton variant="text" width={120} height={16} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -171,7 +159,7 @@ function GPUNamespaceAllocationsInternal({ config: _config }: GPUNamespaceAlloca
   return (
     <div className="h-full flex flex-col content-loaded overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           <StatusBadge color="purple">
             {t('gpuNamespaceAllocations.gpusAcrossNamespaces', { gpus: totalGPUs, count: namespaceAllocations.length })}
@@ -241,11 +229,23 @@ function GPUNamespaceAllocationsInternal({ config: _config }: GPUNamespaceAlloca
         {displayItems.map((ns) => (
           <div
             key={ns.namespace}
+            role="button"
+            tabIndex={0}
             onClick={() => drillToGPUNamespace(ns.namespace, {
               gpuRequested: ns.gpuRequested,
               podCount: ns.podCount,
               clusters: ns.clusters })}
-            className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                drillToGPUNamespace(ns.namespace, {
+                  gpuRequested: ns.gpuRequested,
+                  podCount: ns.podCount,
+                  clusters: ns.clusters })
+              }
+            }}
+            className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group focus:outline-hidden focus-visible:ring-2 focus-visible:ring-purple-400"
+            aria-label={t('cards:gpuNamespaceAllocations.viewNamespaceAria', { namespace: ns.namespace })}
           >
             <div className="flex items-center gap-2 mb-2 min-w-0">
               <Box className="w-4 h-4 text-purple-400 shrink-0" />
@@ -254,7 +254,7 @@ function GPUNamespaceAllocationsInternal({ config: _config }: GPUNamespaceAlloca
               </span>
               <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
             </div>
-            <div className="flex items-center justify-between text-xs gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs gap-2">
               <div className="flex items-center gap-2">
                 {ns.clusters.slice(0, 2).map(c => (
                   <ClusterBadge key={c} cluster={c} size="sm" />

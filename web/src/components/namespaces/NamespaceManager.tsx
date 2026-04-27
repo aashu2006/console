@@ -24,7 +24,7 @@ import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { ClusterBadge } from '../ui/ClusterBadge'
 import { DashboardHeader } from '../shared/DashboardHeader'
 import { RotatingTip } from '../ui/RotatingTip'
-import { api } from '../../lib/api'
+import { api, authFetch } from '../../lib/api'
 import { useToast } from '../ui/Toast'
 import { useTranslation } from 'react-i18next'
 import { LOCAL_AGENT_HTTP_URL } from '../../lib/constants'
@@ -73,8 +73,8 @@ export function NamespaceManager() {
   // Get target clusters based on global filter selection
   // We don't check permissions upfront - let the API handle auth errors per-cluster
   const targetClusters = isAllClustersSelected
-      ? deduplicatedClusters.map(c => c.name)
-      : selectedClusters
+    ? deduplicatedClusters.map(c => c.name)
+    : selectedClusters
 
 
   // Filter namespaces from cache based on selected clusters (no refetch needed)
@@ -147,12 +147,13 @@ export function NamespaceManager() {
           if (response.ok) {
             const data = await response.json()
             if (data.namespaces && Array.isArray(data.namespaces)) {
-              clusterNamespaces = data.namespaces.map((ns: { name: string; status?: string; labels?: Record<string, string>; created_at?: string }) => ({
+              clusterNamespaces = data.namespaces.map((ns: { name: string; status?: string; labels?: Record<string, string>; createdAt?: string }) => ({
                 name: ns.name,
                 cluster,
                 status: ns.status || 'Active',
                 labels: ns.labels,
-                created_at: ns.created_at || new Date().toISOString() }))
+                createdAt: ns.createdAt || new Date().toISOString()
+              }))
             }
           }
         } catch {
@@ -163,7 +164,7 @@ export function NamespaceManager() {
         if (clusterNamespaces.length === 0) {
           try {
             const response = await api.get<{ pods: Array<{ namespace: string; status: string }> }>(
-              `/api/mcp/pods?cluster=${encodeURIComponent(cluster)}&limit=1000`
+              `${LOCAL_AGENT_HTTP_URL}/pods?cluster=${encodeURIComponent(cluster)}&limit=1000`
             )
 
             // Extract unique namespaces from pods
@@ -177,7 +178,8 @@ export function NamespaceManager() {
                 name: ns,
                 cluster,
                 status: 'Active',
-                created_at: new Date().toISOString() })
+                createdAt: new Date().toISOString()
+              })
             })
           } catch {
             // API also failed - cluster is likely unreachable
@@ -242,7 +244,7 @@ export function NamespaceManager() {
   const fetchAccess = useCallback(async (namespace: NamespaceDetails) => {
     setAccessLoading(true)
     try {
-      const response = await api.get<{ bindings: typeof accessEntries }>(`/api/namespaces/${namespace.name}/access?cluster=${namespace.cluster}`)
+      const response = await api.get<{ bindings: typeof accessEntries }>(`/api/namespaces/${encodeURIComponent(namespace.name)}/access?cluster=${encodeURIComponent(namespace.cluster)}`)
       setAccessEntries(response.data?.bindings || [])
     } catch (err) {
       console.error('Failed to fetch access:', err)
@@ -260,7 +262,7 @@ export function NamespaceManager() {
     if (clusters.length > 0) {
       fetchNamespaces()
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clusters.length])
 
   // Auto-refresh every 30 seconds
@@ -303,7 +305,24 @@ export function NamespaceManager() {
     if (!namespaceToDelete) return
 
     try {
-      await api.delete(`/api/namespaces/${namespaceToDelete.name}?cluster=${namespaceToDelete.cluster}`)
+      // #7993 Phase 2: namespace delete goes through kc-agent under the
+      // user's kubeconfig. kc-agent takes `name` as a query parameter since
+      // it uses the net/http mux (no URL path parameters).
+      const params = new URLSearchParams({
+        cluster: namespaceToDelete.cluster,
+        name: namespaceToDelete.name,
+      })
+      // #8034 Copilot followup: use authFetch() which already injects the
+      // Bearer token (skipping DEMO_TOKEN_VALUE) and applies the default
+      // fetch timeout, instead of a per-file agentAuthHeaders() helper.
+      const res = await authFetch(`${LOCAL_AGENT_HTTP_URL}/namespaces?${params}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: 'unknown error' }))
+        throw new Error(errorData.error || 'Failed to delete namespace')
+      }
       // Clear cache for this cluster and refresh
       namespaceCache.delete(namespaceToDelete.cluster)
       fetchNamespaces(true)
@@ -314,6 +333,7 @@ export function NamespaceManager() {
     } catch (err) {
       console.error('Failed to delete namespace:', err)
       setError('Failed to delete namespace')
+      showToast('Failed to delete namespace', 'error')
       setNamespaceToDelete(null)
     }
   }
@@ -326,11 +346,31 @@ export function NamespaceManager() {
     }
 
     try {
-      await api.delete(`/api/namespaces/${selectedNamespace.name}/access/${binding.bindingName}?cluster=${selectedNamespace.cluster}`)
+      // Revoking namespace access deletes a RoleBinding on a managed cluster,
+      // so it must run under the user's kubeconfig via kc-agent, not the
+      // backend pod ServiceAccount. See #7993 Phase 1.5 PR A. The backend
+      // DELETE /api/namespaces/:name/access/:binding route still exists and
+      // will be removed as part of Phase 2 once all frontend callers are
+      // migrated — this switches the only caller over.
+      const params = new URLSearchParams({
+        cluster: selectedNamespace.cluster,
+        namespace: selectedNamespace.name,
+        name: binding.bindingName,
+      })
+      // #8034 Copilot followup: use authFetch() which already injects the
+      // Bearer token and applies the default fetch timeout.
+      const res = await authFetch(`${LOCAL_AGENT_HTTP_URL}/rolebindings?${params}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: 'unknown error' }))
+        throw new Error(errorData.error || 'Failed to revoke access')
+      }
       fetchAccess(selectedNamespace)
     } catch (err) {
       console.error('Failed to revoke access:', err)
       setError('Failed to revoke access')
+      showToast('Failed to revoke access', 'error')
     }
   }
 
@@ -404,17 +444,16 @@ export function NamespaceManager() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder={t('common.searchNamespaces')}
-            className="w-full pl-10 pr-4 py-2 rounded-lg bg-secondary border border-border text-white placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            className="w-full pl-10 pr-4 py-2 rounded-lg bg-secondary border border-border text-white placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           />
         </div>
         <div className="flex items-center gap-1 p-1 rounded-lg bg-secondary/30">
           <button
             onClick={() => setGroupBy('cluster')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${
-              groupBy === 'cluster'
-                ? 'bg-blue-500/20 text-blue-400'
-                : 'text-muted-foreground hover:text-white'
-            }`}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${groupBy === 'cluster'
+              ? 'bg-blue-500/20 text-blue-400'
+              : 'text-muted-foreground hover:text-white'
+              }`}
             title="Group by cluster"
           >
             <Server className="w-4 h-4" />
@@ -422,11 +461,10 @@ export function NamespaceManager() {
           </button>
           <button
             onClick={() => setGroupBy('type')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${
-              groupBy === 'type'
-                ? 'bg-blue-500/20 text-blue-400'
-                : 'text-muted-foreground hover:text-white'
-            }`}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${groupBy === 'type'
+              ? 'bg-blue-500/20 text-blue-400'
+              : 'text-muted-foreground hover:text-white'
+              }`}
             title="Group by type (user/system)"
           >
             <Layers className="w-4 h-4" />
@@ -469,6 +507,7 @@ export function NamespaceManager() {
                       }}
                       className="flex items-center gap-2 w-full text-left mb-2 group"
                       title={isCollapsed ? 'Expand cluster' : isUnreachable ? `Cluster offline - check network connection` : 'Collapse cluster'}
+                      aria-label={`${isCollapsed ? 'Expand' : 'Collapse'} ${clusterName}`}
                     >
                       {isCollapsed ? (
                         <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-white transition-colors" />

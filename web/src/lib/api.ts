@@ -3,6 +3,7 @@ import {
   BACKEND_HEALTH_CHECK_TIMEOUT_MS,
   STORAGE_KEY_TOKEN,
   STORAGE_KEY_USER_CACHE,
+  STORAGE_KEY_HAS_SESSION,
   DEMO_TOKEN_VALUE,
   FETCH_DEFAULT_TIMEOUT_MS,
 } from './constants'
@@ -20,7 +21,7 @@ const TOKEN_REFRESH_HEADER = 'X-Token-Refresh' // server signals when token shou
 const AUTH_LOGOUT_ENDPOINT = '/auth/logout'
 
 // Public API paths that don't require authentication (served without JWT on the backend)
-const PUBLIC_API_PREFIXES = ['/api/missions/browse', '/api/missions/file']
+const PUBLIC_API_PREFIXES = ['/api/missions/browse', '/api/missions/file', '/api/compliance/']
 
 // Error class for unauthenticated requests
 export class UnauthenticatedError extends Error {
@@ -38,17 +39,57 @@ export class UnauthorizedError extends Error {
   }
 }
 
+/** localStorage key for global API rate-limit backoff deadline (epoch ms). */
+const STORAGE_KEY_RATE_LIMIT_UNTIL = 'kc-api-rate-limit-until'
+/** Default Retry-After when the header is missing or unparseable. */
+const DEFAULT_RATE_LIMIT_RETRY_AFTER_S = 60
+
+export class RateLimitError extends Error {
+  retryAfter: number
+  constructor(retryAfter: number) {
+    super(`Rate limited. Try again in ${retryAfter} seconds.`)
+    this.name = 'RateLimitError'
+    this.retryAfter = retryAfter
+  }
+}
+
+function handle429(response: Response): never {
+  const retryAfterRaw = response.headers.get('Retry-After')
+  const retryAfter = retryAfterRaw ? parseInt(retryAfterRaw, 10) : DEFAULT_RATE_LIMIT_RETRY_AFTER_S
+  const effectiveRetry = Number.isFinite(retryAfter) && retryAfter > 0
+    ? retryAfter : DEFAULT_RATE_LIMIT_RETRY_AFTER_S
+  try {
+    localStorage.setItem(STORAGE_KEY_RATE_LIMIT_UNTIL,
+      String(Date.now() + effectiveRetry * 1000))
+  } catch { /* storage quota / private browsing */ }
+  throw new RateLimitError(effectiveRetry)
+}
+
 // Debounce 401 handling to avoid multiple simultaneous logouts
 let handling401 = false
 /** Safety cap: reset the 401 debounce flag after this many ms so future
  *  auth failures aren't permanently silenced if the redirect doesn't fire (#3899). */
 const HANDLING_401_RESET_MS = 10_000
+/** Short timeout on the session-verify probe so a hung backend doesn't block
+ *  the session-expired UI indefinitely (#8372). */
+const SESSION_VERIFY_TIMEOUT_MS = 3_000
+/** Endpoint used to verify the HttpOnly cookie is still valid. A 200 here
+ *  means the cookie still authenticates, so a 401 from another endpoint was
+ *  endpoint-specific (not a session expiry). */
+const AUTH_VERIFY_ENDPOINT = '/api/me'
 
 /**
  * Handle 401 Unauthorized responses by clearing auth state and redirecting to login.
  * This is debounced to avoid multiple simultaneous logouts from parallel API calls.
  * The flag auto-resets after HANDLING_401_RESET_MS so a failed redirect doesn't
  * permanently block all API calls.
+ *
+ * Before nuking the session we re-verify via /api/me. If the cookie-based
+ * session is still valid, the 401 was specific to the originating endpoint
+ * (e.g. a route that requires elevated scope, or a backend race) and we must
+ * NOT show "Session expired" nor redirect — doing so would bounce the user
+ * through /login?reason=session_expired and leave a stale `?reason=…` query
+ * param on the landing page (#8372).
  */
 function handle401(): void {
   if (handling401) return
@@ -60,6 +101,33 @@ function handle401(): void {
     handling401 = false
   }, HANDLING_401_RESET_MS)
 
+  // Verify the cookie-based session before treating this as an expiry. If
+  // /api/me comes back 200, the session is still valid — abort the
+  // session-expired flow entirely (#8372).
+  fetch(`${API_BASE}${AUTH_VERIFY_ENDPOINT}`, {
+    credentials: 'include',
+    signal: AbortSignal.timeout(SESSION_VERIFY_TIMEOUT_MS),
+  }).then(verifyResponse => {
+    if (verifyResponse.ok) {
+      console.warn('[API] 401 received but /api/me still 200 — endpoint-specific failure, keeping session')
+      handling401 = false
+      return
+    }
+    if (verifyResponse.status === 429) {
+      console.warn('[API] 401 received but /api/me returned 429 (rate-limited) — keeping session')
+      handling401 = false
+      return
+    }
+    performSessionExpiry()
+  }).catch(() => {
+    // Verify probe failed (network error / timeout / no backend). Treat the
+    // 401 as authoritative and run the normal expiry flow.
+    performSessionExpiry()
+  })
+}
+
+/** Second half of handle401: banner + cookie invalidation + redirect. */
+function performSessionExpiry(): void {
   console.warn('[API] Received 401 Unauthorized - token invalid or expired, logging out')
 
   // Show an in-page notification before redirecting (DOM-injected, no React dependency)
@@ -92,6 +160,7 @@ function handle401(): void {
   // Clear auth state
   localStorage.removeItem(STORAGE_KEY_TOKEN)
   localStorage.removeItem(STORAGE_KEY_USER_CACHE)
+  localStorage.removeItem(STORAGE_KEY_HAS_SESSION)
 
   // Redirect to login after a delay so the user sees the banner
   setTimeout(() => {
@@ -174,12 +243,12 @@ try {
  * @param forceCheck - If true, ignores cache and always checks (used by login)
  */
 export async function checkBackendAvailability(forceCheck = false): Promise<boolean> {
-  // If we already know the status and it was checked recently, return it
+  // If we already know the status and it was checked recently, return it.
+  // The TTL gate must always run so a previously-available backend is
+  // re-probed periodically instead of being cached forever.
   if (!forceCheck && backendAvailable !== null) {
     const now = Date.now()
-    // If backend was already determined available, return immediately
-    // If unavailable, allow re-check after interval
-    if (backendAvailable || now - backendLastCheckTime < BACKEND_CHECK_INTERVAL) {
+    if (now - backendLastCheckTime < BACKEND_CHECK_INTERVAL) {
       return backendAvailable
     }
   }
@@ -206,7 +275,7 @@ export async function checkBackendAvailability(forceCheck = false): Promise<bool
           available: backendAvailable,
           timestamp: backendLastCheckTime,
         }))
-      } catch { /* ignore */ }
+      } catch (e) { console.warn('[api] failed to cache backend status:', e) }
       return backendAvailable
     } catch {
       backendAvailable = false
@@ -286,7 +355,7 @@ function markBackendFailure(): void {
   // Persisting false causes fresh page loads to inherit stale "backend down" state.
   try {
     localStorage.removeItem(BACKEND_STATUS_KEY)
-  } catch { /* ignore */ }
+  } catch (e) { console.warn('[api] failed to clear backend status cache:', e) }
 }
 
 function markBackendSuccess(): void {
@@ -297,7 +366,7 @@ function markBackendSuccess(): void {
       available: true,
       timestamp: backendLastCheckTime,
     }))
-  } catch { /* ignore */ }
+  } catch (e) { console.warn('[api] failed to cache backend success:', e) }
 }
 
 /**
@@ -330,21 +399,33 @@ class ApiClient {
     if (this.refreshInProgress) return
     this.refreshInProgress = (async () => {
       try {
+        // #8108 — /auth/refresh must NOT receive the Authorization header.
+        // Backend RefreshToken revokes the JTI of whatever bearer is presented
+        // before minting the replacement. Sending the stale localStorage token
+        // would revoke a token we still rely on for the rest of the session
+        // and race against the cookie delivery. Cookie-only flow: send the
+        // HttpOnly kc_auth cookie via credentials + CSRF header only.
         const response = await fetch(`${API_BASE}/auth/refresh`, {
           method: 'POST',
-          headers: this.getHeaders(),
+          headers: {
+            'Content-Type': 'application/json',
+            // #6588 — CSRF gate on /auth/refresh
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          credentials: 'same-origin',
           signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
         })
         if (response.ok) {
-          const data = await response.json().catch(() => null)
-          if (data?.token) {
-            localStorage.setItem(STORAGE_KEY_TOKEN, data.token)
-            // Notify AuthProvider (and other tabs) that the token changed
-            window.dispatchEvent(new StorageEvent('storage', {
-              key: STORAGE_KEY_TOKEN,
-              newValue: data.token,
-              storageArea: localStorage,
-            }))
+          // #6590 — /auth/refresh delivers the new JWT exclusively via the
+          // HttpOnly kc_auth cookie; the JSON body carries only
+          // { refreshed: true, onboarded }. There is no token to copy into
+          // localStorage. The browser sends the refreshed cookie automatically
+          // on subsequent requests, and the JWTAuth middleware reads it.
+          // Nothing else to do here on success.
+          try {
+            localStorage.setItem(STORAGE_KEY_HAS_SESSION, 'true')
+          } catch {
+            // localStorage quota — best-effort hint
           }
         }
       } catch {
@@ -368,6 +449,9 @@ class ApiClient {
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
+      // #8830 — the /api group middleware rejects state-changing requests
+      // (POST/PUT/DELETE/PATCH) without this header. Harmless on GET.
+      'X-Requested-With': 'XMLHttpRequest',
     }
     const token = localStorage.getItem(STORAGE_KEY_TOKEN)
     if (token) {
@@ -378,8 +462,17 @@ class ApiClient {
 
   private hasToken(): boolean {
     const token = localStorage.getItem(STORAGE_KEY_TOKEN)
-    // Demo token doesn't count as a real token for backend API calls
-    return !!token && token !== DEMO_TOKEN_VALUE
+    if (token && token !== DEMO_TOKEN_VALUE) return true
+    // #6590 / #8087 — A cookie-only session has no JS-readable token, only
+    // the HttpOnly kc_auth cookie. The kc-has-session marker is set after
+    // /auth/refresh succeeds; treat its presence as a real session so API
+    // calls go through (the cookie is sent automatically same-origin and
+    // JWTAuth middleware accepts it).
+    try {
+      return localStorage.getItem(STORAGE_KEY_HAS_SESSION) === 'true'
+    } catch {
+      return false
+    }
   }
 
   private createAbortController(timeout: number): { controller: AbortController; timeoutId: ReturnType<typeof setTimeout> } {
@@ -392,6 +485,9 @@ class ApiClient {
     // Skip API calls to protected endpoints when not authenticated
     const isPublicPath = PUBLIC_API_PREFIXES.some(prefix => path.startsWith(prefix))
     if (options?.requiresAuth !== false && !isPublicPath && !this.hasToken()) {
+      // Do NOT emit a GA4 error here — this is expected behavior when an
+      // unauthenticated user visits a protected page. Emitting it caused
+      // false-positive monitoring alerts (#9968, #9979, #9980, #9984).
       throw new UnauthenticatedError()
     }
 
@@ -413,10 +509,23 @@ class ApiClient {
       clearTimeout(timeoutId)
 
       if (!response.ok) {
-        // Handle 401 Unauthorized - token is invalid or expired
-        if (response.status === 401) {
+        // Handle 401 Unauthorized - token is invalid or expired.
+        // EXCLUDE per-feature endpoints whose 401 means a third-party token
+        // (e.g. GitHub OAuth) is missing/expired, NOT that the user's app
+        // session is dead. Logging the user out of the whole console because
+        // their GitHub token expired is a confusing dead end (e.g. clicking
+        // the "kubara" repo in the Mission Browser triggered a full logout).
+        // For these paths, surface the 401 to the caller so the feature can
+        // show its own auth prompt.
+        if (response.status === 401 && !path.startsWith('/api/github/')) {
           handle401()
           throw new UnauthorizedError()
+        }
+        if (response.status === 401) {
+          throw new UnauthorizedError()
+        }
+        if (response.status === 429) {
+          handle429(response)
         }
         const errorText = await response.text().catch(() => '')
         // Note: We don't mark backend as failed on 500 responses here.
@@ -442,7 +551,7 @@ class ApiClient {
     }
   }
 
-  async post<T = unknown>(path: string, body?: unknown, options?: { timeout?: number }): Promise<{ data: T }> {
+  async post<T = unknown>(path: string, body?: unknown, options?: { timeout?: number; headers?: Record<string, string> }): Promise<{ data: T }> {
     // Check backend availability
     const available = await checkBackendAvailability()
     if (!available) {
@@ -454,17 +563,26 @@ class ApiClient {
     try {
       const response = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
-        headers: this.getHeaders(),
+        headers: { ...this.getHeaders(), ...options?.headers },
         body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       })
       clearTimeout(timeoutId)
 
       if (!response.ok) {
-        // Handle 401 Unauthorized - token is invalid or expired
-        if (response.status === 401) {
+        // Handle 401 Unauthorized - token is invalid or expired.
+        // EXCLUDE per-feature endpoints (see GET handler comment) so a
+        // GitHub-OAuth-token expiry on /api/github/* doesn't log the user
+        // out of the entire console.
+        if (response.status === 401 && !path.startsWith('/api/github/')) {
           handle401()
           throw new UnauthorizedError()
+        }
+        if (response.status === 401) {
+          throw new UnauthorizedError()
+        }
+        if (response.status === 429) {
+          handle429(response)
         }
         const errorText = await response.text().catch(() => '')
         // Note: Don't mark backend as failed on 500s - health check is source of truth
@@ -507,10 +625,19 @@ class ApiClient {
       clearTimeout(timeoutId)
 
       if (!response.ok) {
-        // Handle 401 Unauthorized - token is invalid or expired
-        if (response.status === 401) {
+        // Handle 401 Unauthorized - token is invalid or expired.
+        // EXCLUDE per-feature endpoints (see GET handler comment) so a
+        // GitHub-OAuth-token expiry on /api/github/* doesn't log the user
+        // out of the entire console.
+        if (response.status === 401 && !path.startsWith('/api/github/')) {
           handle401()
           throw new UnauthorizedError()
+        }
+        if (response.status === 401) {
+          throw new UnauthorizedError()
+        }
+        if (response.status === 429) {
+          handle429(response)
         }
         const errorText = await response.text().catch(() => '')
         // Note: Don't mark backend as failed on 500s - health check is source of truth
@@ -552,10 +679,19 @@ class ApiClient {
       clearTimeout(timeoutId)
 
       if (!response.ok) {
-        // Handle 401 Unauthorized - token is invalid or expired
-        if (response.status === 401) {
+        // Handle 401 Unauthorized - token is invalid or expired.
+        // EXCLUDE per-feature endpoints (see GET handler comment) so a
+        // GitHub-OAuth-token expiry on /api/github/* doesn't log the user
+        // out of the entire console.
+        if (response.status === 401 && !path.startsWith('/api/github/')) {
           handle401()
           throw new UnauthorizedError()
+        }
+        if (response.status === 401) {
+          throw new UnauthorizedError()
+        }
+        if (response.status === 429) {
+          handle429(response)
         }
         const errorText = await response.text().catch(() => '')
         // Note: Don't mark backend as failed on 500s - health check is source of truth
@@ -586,12 +722,39 @@ export const api = new ApiClient()
  *
  * Existing callers only need to change `fetch(url, init)` -> `authFetch(url, init)`.
  */
+/**
+ * Safely parse a Response as JSON, guarding against HTML responses.
+ *
+ * On Netlify, unmatched API routes fall through to the SPA catch-all which
+ * returns index.html (200 OK, text/html). Calling `.json()` on that response
+ * throws "Unexpected token '<'" (#9797). This helper checks the Content-Type
+ * header first and throws a descriptive error instead of a cryptic parse error.
+ *
+ * Usage:
+ *   const data = await safeJson<MyType>(response)
+ */
+export async function safeJson<T = unknown>(response: Response): Promise<T> {
+  const contentType = response.headers.get('content-type') || ''
+  if (!contentType.includes('application/json')) {
+    throw new Error(
+      `Expected JSON response but received ${contentType || 'unknown content-type'} (status ${response.status})`,
+    )
+  }
+  return response.json() as Promise<T>
+}
+
 export function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const token = localStorage.getItem(STORAGE_KEY_TOKEN)
   const headers = new Headers(init?.headers)
 
   if (token && token !== DEMO_TOKEN_VALUE && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`)
+  }
+  // #8830 — /api group RequireCSRF middleware rejects state-changing requests
+  // without this header; safeHTTPMethods pass through unconditionally, so
+  // setting it on every authFetch is correct and harmless for GET/HEAD.
+  if (!headers.has('X-Requested-With')) {
+    headers.set('X-Requested-With', 'XMLHttpRequest')
   }
 
   // Use caller-provided signal if present, otherwise apply default timeout

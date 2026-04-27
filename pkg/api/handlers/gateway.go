@@ -30,7 +30,7 @@ func NewGatewayHandlers(k8sClient *k8s.MultiClusterClient, hub *Hub) *GatewayHan
 // GET /api/gateway/gateways
 func (h *GatewayHandlers) ListGateways(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	// Optional filters
@@ -58,7 +58,7 @@ func (h *GatewayHandlers) ListGateways(c *fiber.Ctx) error {
 	if err != nil {
 		// If we got partial results alongside errors, log and return what we have
 		if list != nil && len(list.Items) > 0 {
-			slog.Info("partial gateway list failure", "error", err)
+			slog.Warn("partial gateway list failure", "error", err)
 			return c.JSON(list)
 		}
 		return handleK8sError(c, err)
@@ -71,7 +71,7 @@ func (h *GatewayHandlers) ListGateways(c *fiber.Ctx) error {
 // GET /api/gateway/httproutes
 func (h *GatewayHandlers) ListHTTPRoutes(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	// Optional filters
@@ -99,7 +99,7 @@ func (h *GatewayHandlers) ListHTTPRoutes(c *fiber.Ctx) error {
 	if err != nil {
 		// If we got partial results alongside errors, log and return what we have
 		if list != nil && len(list.Items) > 0 {
-			slog.Info("partial httproute list failure", "error", err)
+			slog.Warn("partial httproute list failure", "error", err)
 			return c.JSON(list)
 		}
 		return handleK8sError(c, err)
@@ -112,7 +112,7 @@ func (h *GatewayHandlers) ListHTTPRoutes(c *fiber.Ctx) error {
 // GET /api/gateway/status
 func (h *GatewayHandlers) GetGatewayAPIStatus(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), gatewayDefaultTimeout)
@@ -146,7 +146,7 @@ func (h *GatewayHandlers) GetGatewayAPIStatus(c *fiber.Ctx) error {
 // GET /api/gateway/gateways/:cluster/:namespace/:name
 func (h *GatewayHandlers) GetGateway(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")
@@ -174,7 +174,7 @@ func (h *GatewayHandlers) GetGateway(c *fiber.Ctx) error {
 // GET /api/gateway/httproutes/:cluster/:namespace/:name
 func (h *GatewayHandlers) GetHTTPRoute(c *fiber.Ctx) error {
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "Kubernetes client not available"})
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Params("cluster")

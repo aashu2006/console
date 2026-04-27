@@ -8,6 +8,8 @@ import {
   DragStartEvent } from '@dnd-kit/core'
 import { arrayMove, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { dashboardSync } from './dashboardSync'
+import { hasUnifiedConfig } from '../../config/cards'
+import { isCardTypeRegistered } from '../../components/cards/cardRegistry'
 import { DashboardCard, DashboardCardPlacement, NewCardInput } from './types'
 import { useDashboardUndoRedo } from '../../hooks/useUndoRedo'
 import { setAutoRefreshPaused } from '../cache'
@@ -99,6 +101,8 @@ export interface UseDashboardCardsResult {
   configureCard: (id: string, config: Record<string, unknown>) => void
   /** Update card width */
   updateCardWidth: (id: string, width: number) => void
+  /** Update card height (#6463) */
+  updateCardHeight: (id: string, height: number) => void
   /** Reset to default cards */
   reset: () => void
   /** Whether layout has been customized from defaults */
@@ -139,8 +143,16 @@ export function useDashboardCards(
       const stored = localStorage.getItem(storageKey)
       if (stored) {
         const parsed = JSON.parse(stored) as DashboardCard[]
+        // Filter out card types that were removed from the registry (e.g.
+        // acmm_balance after #8426). Without this, users who visited
+        // before the removal keep a ghost card in their saved layout.
+        // Check both UnifiedCardConfig AND the component registry so
+        // component-only cards (e.g. benchmark_hero) are not pruned.
+        const valid = parsed.filter(c =>
+          hasUnifiedConfig(c.card_type) || isCardTypeRegistered(c.card_type)
+        )
         // Ensure every card has a position object (guards against old/corrupt data)
-        return parsed.map(c => ({
+        return valid.map(c => ({
           ...c,
           position: c.position || { w: 4, h: 2 } }))
       }
@@ -152,12 +164,12 @@ export function useDashboardCards(
 
   const [isSyncing, setIsSyncing] = useState(false)
 
-  // Compute isCustomized by comparing current card types to defaults
+  // Compute isCustomized by comparing current card types AND order to defaults (#7255).
+  // Previous implementation sorted types before comparing, so pure reorder was invisible.
   const isCustomized = (() => {
     if (cards.length !== defaultCardInstances.length) return true
-    const currentTypes = cards.map(c => c.card_type).sort()
-    const defaultTypes = defaultCardInstances.map(c => c.card_type).sort()
-    return currentTypes.some((t, i) => t !== defaultTypes[i])
+    // Compare in order — reordering is a customization
+    return cards.some((c, i) => c.card_type !== defaultCardInstances[i].card_type)
   })()
 
   // On mount, sync with backend if authenticated
@@ -171,7 +183,9 @@ export function useDashboardCards(
       setIsSyncing(true)
       try {
         const backendCards = await dashboardSync.fullSync(storageKey)
-        if (backendCards && backendCards.length > 0) {
+        // null means fetch failed — leave local state alone.
+        // An array (even empty) means backend responded — accept it (#7254).
+        if (backendCards !== null) {
           setCards(backendCards)
         }
       } catch (err) {
@@ -277,6 +291,15 @@ export function useDashboardCards(
     ))
   }
 
+  const updateCardHeight = (id: string, height: number) => {
+    snapshot(cardsRef.current)
+    setCards(prev => prev.map(c =>
+      c.id === id
+        ? { ...c, position: { ...(c.position || { w: 4, h: 2 }), h: height } }
+        : c
+    ))
+  }
+
   const reset = () => {
     snapshot(cardsRef.current)
     setCards(defaultCardInstances)
@@ -289,7 +312,9 @@ export function useDashboardCards(
     setIsSyncing(true)
     try {
       const backendCards = await dashboardSync.fullSync(storageKey)
-      if (backendCards && backendCards.length > 0) {
+      // null means fetch failed — leave local state alone.
+      // An array (even empty) means backend responded — accept it (#7254).
+      if (backendCards !== null) {
         setCards(backendCards)
       }
     } catch (err) {
@@ -306,6 +331,7 @@ export function useDashboardCards(
     removeCard,
     configureCard,
     updateCardWidth,
+    updateCardHeight,
     reset,
     isCustomized,
     isSyncing,

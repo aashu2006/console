@@ -2,12 +2,16 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
+	"github.com/kubestellar/console/pkg/api/audit"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/k8s"
 	"github.com/kubestellar/console/pkg/models"
@@ -16,12 +20,6 @@ import (
 
 // rbacAnalysisTimeout is the timeout for RBAC analysis queries on large clusters.
 const rbacAnalysisTimeout = 60 * time.Second
-
-// rbacDefaultTimeout is the per-cluster timeout for standard RBAC queries.
-const rbacDefaultTimeout = 15 * time.Second
-
-// rbacWriteTimeout is the timeout for RBAC write operations.
-const rbacWriteTimeout = 15 * time.Second
 
 // parseUUID parses a UUID string
 func parseUUID(s string) (uuid.UUID, error) {
@@ -39,24 +37,33 @@ func NewRBACHandler(s store.Store, k8sClient *k8s.MultiClusterClient) *RBACHandl
 	return &RBACHandler{store: s, k8sClient: k8sClient}
 }
 
-// ListConsoleUsers returns all console users.
+// ListConsoleUsers returns a page of console users. Supports limit/offset
+// query params via parsePageParams (#6595); a response may therefore be a
+// partial page. Absent limit yields the store default page size.
+//
 // SECURITY: Restricted to admin users to prevent non-admin users from
 // enumerating all user records (#5458).
 func (h *RBACHandler) ListConsoleUsers(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
 	}
 
 	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to list all users",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
+		audit.Log(c, audit.ActionUnauthorizedAttempt, "endpoint", "/api/users", "non-admin list attempt")
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
 
-	users, err := h.store.ListUsers()
+	// #6595: bound the read. ?limit=&offset= follow the same contract as the
+	// feedback list endpoints (see parsePageParams). Absent limit → store
+	// default; malformed/oversized limit → HTTP 400.
+	limit, offset, err := parsePageParams(c)
+	if err != nil {
+		return err
+	}
+
+	users, err := h.store.ListUsers(c.UserContext(), limit, offset)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to list users")
 	}
@@ -67,7 +74,7 @@ func (h *RBACHandler) ListConsoleUsers(c *fiber.Ctx) error {
 func (h *RBACHandler) UpdateUserRole(c *fiber.Ctx) error {
 	// Check if current user is admin
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
@@ -98,9 +105,18 @@ func (h *RBACHandler) UpdateUserRole(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Cannot remove your own admin role")
 	}
 
-	if err := h.store.UpdateUserRole(targetID, string(req.Role)); err != nil {
+	// Fetch old role for audit trail before mutating.
+	oldRole := "unknown"
+	if target, err := h.store.GetUser(c.UserContext(), targetID); err == nil && target != nil {
+		oldRole = string(target.Role)
+	}
+
+	if err := h.store.UpdateUserRole(c.UserContext(), targetID, string(req.Role)); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to update user role")
 	}
+
+	audit.Log(c, audit.ActionUpdateRole, "user", targetUserID,
+		fmt.Sprintf("%s->%s", oldRole, string(req.Role)))
 
 	return c.JSON(fiber.Map{"success": true})
 }
@@ -109,7 +125,7 @@ func (h *RBACHandler) UpdateUserRole(c *fiber.Ctx) error {
 func (h *RBACHandler) DeleteConsoleUser(c *fiber.Ctx) error {
 	// Check if current user is admin
 	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
+	currentUser, err := h.store.GetUser(c.UserContext(), currentUserID)
 	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
@@ -129,9 +145,11 @@ func (h *RBACHandler) DeleteConsoleUser(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Cannot delete your own account")
 	}
 
-	if err := h.store.DeleteUser(targetID); err != nil {
+	if err := h.store.DeleteUser(c.UserContext(), targetID); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to delete user")
 	}
+
+	audit.Log(c, audit.ActionDeleteUser, "user", targetUserID)
 
 	return c.JSON(fiber.Map{"success": true})
 }
@@ -141,22 +159,20 @@ func (h *RBACHandler) DeleteConsoleUser(c *fiber.Ctx) error {
 // reading user counts and permission summaries (#5459).
 func (h *RBACHandler) GetUserManagementSummary(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
 	}
 
 	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to read user-management summary",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
+		audit.Log(c, audit.ActionUnauthorizedAttempt, "endpoint", "/api/users/summary", "non-admin summary attempt")
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
 
 	summary := models.UserManagementSummary{}
 
 	// Count console users by role
-	admins, editors, viewers, err := h.store.CountUsersByRole()
+	admins, editors, viewers, err := h.store.CountUsersByRole(c.UserContext())
 	if err == nil {
 		summary.ConsoleUsers.Total = admins + editors + viewers
 		summary.ConsoleUsers.Admins = admins
@@ -166,7 +182,7 @@ func (h *RBACHandler) GetUserManagementSummary(c *fiber.Ctx) error {
 
 	// Count K8s service accounts (if k8s client is available)
 	if h.k8sClient != nil {
-		ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
+		ctx, cancel := context.WithTimeout(c.Context(), k8s.RBACDefaultTimeout)
 		defer cancel()
 
 		total, clusters, err := h.k8sClient.CountServiceAccountsAllClusters(ctx)
@@ -191,26 +207,26 @@ func (h *RBACHandler) GetUserManagementSummary(c *fiber.Ctx) error {
 func (h *RBACHandler) ListK8sServiceAccounts(c *fiber.Ctx) error {
 	// Require admin role to list service accounts across clusters
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required to list service accounts")
 	}
 
 	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Query("cluster")
 	namespace := c.Query("namespace")
 
-	ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), k8s.RBACDefaultTimeout)
 	defer cancel()
 
 	if cluster != "" {
 		// Get SAs from specific cluster
 		sas, err := h.k8sClient.ListServiceAccounts(ctx, cluster, namespace)
 		if err != nil {
-			slog.Error("[RBAC] failed to list service accounts", "error", err)
+			slog.Warn("[RBAC] failed to list service accounts", "error", err)
 			return fiber.NewError(fiber.StatusInternalServerError, "internal server error")
 		}
 		return c.JSON(sas)
@@ -223,15 +239,50 @@ func (h *RBACHandler) ListK8sServiceAccounts(c *fiber.Ctx) error {
 	}
 
 	allSAs := make([]models.K8sServiceAccount, 0)
-	for _, cl := range clusters {
-		sas, err := h.k8sClient.ListServiceAccounts(ctx, cl.Name, namespace)
-		if err != nil {
-			continue // Skip clusters we can't access
-		}
-		allSAs = append(allSAs, sas...)
-	}
+	clusterErrors := make(map[string]string)
+	var mu sync.Mutex
 
-	return c.JSON(allSAs)
+	// Fan out across clusters in parallel (#7969). Concurrency is bounded by
+	// the shared per-cluster HTTP/1.1 connection budget established in
+	// PR #7765 so we do not oversubscribe the transport pool.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(defaultClusterFanoutConcurrency)
+
+	for _, cl := range clusters {
+		clusterName := cl.Name
+		g.Go(func() error {
+			sas, err := h.k8sClient.ListServiceAccounts(gctx, clusterName, namespace)
+			if err != nil {
+				mu.Lock()
+				clusterErrors[clusterName] = err.Error()
+				mu.Unlock()
+				return nil
+			}
+			mu.Lock()
+			allSAs = append(allSAs, sas...)
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait() // per-cluster errors are non-fatal and collected in clusterErrors.
+
+	// Match the WebhookListResponse shape from admission_webhooks.go (#7967):
+	// include per-cluster errors alongside successful results so the UI can
+	// surface partial failures instead of silently dropping clusters.
+	return c.JSON(fiber.Map{
+		"serviceAccounts": allSAs,
+		"errors":          clusterErrorsOrNil(clusterErrors),
+	})
+}
+
+// clusterErrorsOrNil returns nil when the map is empty so JSON callers get
+// `null` (omitted by `omitempty`) instead of `{}`, matching the
+// WebhookListResponse.Errors convention in admission_webhooks.go.
+func clusterErrorsOrNil(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // ListK8sRoles returns roles from clusters.
@@ -239,27 +290,25 @@ func (h *RBACHandler) ListK8sServiceAccounts(c *fiber.Ctx) error {
 // enumerating Kubernetes roles (#5460).
 func (h *RBACHandler) ListK8sRoles(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
 	}
 
 	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to list Kubernetes roles",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
+		audit.Log(c, audit.ActionUnauthorizedAttempt, "endpoint", "/api/k8s/roles", "non-admin role list attempt")
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
 
 	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Query("cluster")
 	namespace := c.Query("namespace")
 	includeSystem := c.Query("includeSystem") == "true"
 
-	ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), k8s.RBACDefaultTimeout)
 	defer cancel()
 
 	if cluster != "" {
@@ -289,27 +338,25 @@ func (h *RBACHandler) ListK8sRoles(c *fiber.Ctx) error {
 // enumerating role bindings (#5461).
 func (h *RBACHandler) ListK8sRoleBindings(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
 	}
 
 	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to list role bindings",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
+		audit.Log(c, audit.ActionUnauthorizedAttempt, "endpoint", "/api/k8s/rolebindings", "non-admin role-binding list attempt")
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
 
 	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Query("cluster")
 	namespace := c.Query("namespace")
 	includeSystem := c.Query("includeSystem") == "true"
 
-	ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), k8s.RBACDefaultTimeout)
 	defer cancel()
 
 	if cluster == "" {
@@ -335,117 +382,37 @@ func (h *RBACHandler) ListK8sRoleBindings(c *fiber.Ctx) error {
 	return c.JSON(bindings)
 }
 
-// GetClusterPermissions returns current user's permissions on clusters
-func (h *RBACHandler) GetClusterPermissions(c *fiber.Ctx) error {
-	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
-	}
+// NOTE: GetClusterPermissions moved to kc-agent (#7993 Phase 6). The frontend
+// now GETs ${LOCAL_AGENT_HTTP_URL}/rbac/permissions so the
+// SelfSubjectAccessReview runs under the user's kubeconfig instead of the
+// backend pod ServiceAccount when console is deployed in-cluster. Route in
+// pkg/agent/server_rbac.go.
 
-	ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
-	defer cancel()
-
-	cluster := c.Query("cluster")
-
-	if cluster != "" {
-		perms, err := h.k8sClient.GetClusterPermissions(ctx, cluster)
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "Failed to get permissions")
-		}
-		return c.JSON(perms)
-	}
-
-	// Get permissions for all clusters
-	perms, err := h.k8sClient.GetAllClusterPermissions(ctx)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to get permissions")
-	}
-	return c.JSON(perms)
-}
-
-// CreateServiceAccount creates a new service account (cluster-admin only)
-func (h *RBACHandler) CreateServiceAccount(c *fiber.Ctx) error {
-	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
-	}
-
-	var req models.CreateServiceAccountRequest
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
-	}
-
-	if req.Name == "" || req.Namespace == "" || req.Cluster == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "Name, namespace, and cluster are required")
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), rbacWriteTimeout)
-	defer cancel()
-
-	// Check if user has cluster-admin access
-	isAdmin, err := h.k8sClient.CheckClusterAdminAccess(ctx, req.Cluster)
-	if err != nil || !isAdmin {
-		return fiber.NewError(fiber.StatusForbidden, "Cluster admin access required")
-	}
-
-	sa, err := h.k8sClient.CreateServiceAccount(ctx, req.Cluster, req.Namespace, req.Name)
-	if err != nil {
-		slog.Error("[RBAC] failed to create service account", "error", err)
-		return fiber.NewError(fiber.StatusInternalServerError, "internal server error")
-	}
-
-	return c.JSON(sa)
-}
-
-// CreateRoleBinding creates a new role binding (cluster-admin only)
-func (h *RBACHandler) CreateRoleBinding(c *fiber.Ctx) error {
-	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
-	}
-
-	var req models.CreateRoleBindingRequest
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
-	}
-
-	if req.Name == "" || req.Cluster == "" || req.RoleName == "" || req.SubjectName == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "Missing required fields")
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), rbacWriteTimeout)
-	defer cancel()
-
-	// Check if user has cluster-admin access
-	isAdmin, err := h.k8sClient.CheckClusterAdminAccess(ctx, req.Cluster)
-	if err != nil || !isAdmin {
-		return fiber.NewError(fiber.StatusForbidden, "Cluster admin access required")
-	}
-
-	if err := h.k8sClient.CreateRoleBinding(ctx, req); err != nil {
-		slog.Error("[RBAC] failed to create role binding", "error", err)
-		return fiber.NewError(fiber.StatusInternalServerError, "internal server error")
-	}
-
-	return c.JSON(fiber.Map{"success": true})
-}
+// NOTE: CreateServiceAccount and CreateRoleBinding moved to kc-agent
+// (#7993 Phase 1.5 PR A). The frontend now POSTs to
+// ${LOCAL_AGENT_HTTP_URL}/serviceaccounts and
+// ${LOCAL_AGENT_HTTP_URL}/rolebindings so these mutations run under the
+// user's kubeconfig instead of the backend pod's ServiceAccount. The shared
+// pkg/k8s MultiClusterClient.CreateServiceAccount and
+// MultiClusterClient.CreateRoleBinding methods stay — kc-agent uses them.
 
 // ListK8sUsers returns all unique users/subjects from role bindings.
 // SECURITY: Restricted to admin users to prevent non-admin users from
 // enumerating Kubernetes subjects (#5462).
 func (h *RBACHandler) ListK8sUsers(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
 	}
 
 	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to list Kubernetes subjects",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
+		audit.Log(c, audit.ActionUnauthorizedAttempt, "endpoint", "/api/k8s/users", "non-admin subject list attempt")
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
 
 	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Query("cluster")
@@ -453,7 +420,7 @@ func (h *RBACHandler) ListK8sUsers(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Cluster parameter required")
 	}
 
-	ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), k8s.RBACDefaultTimeout)
 	defer cancel()
 
 	users, err := h.k8sClient.GetAllK8sUsers(ctx, cluster)
@@ -469,20 +436,18 @@ func (h *RBACHandler) ListK8sUsers(c *fiber.Ctx) error {
 // enumerating OpenShift users (#5463).
 func (h *RBACHandler) ListOpenShiftUsers(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
+	currentUser, err := h.store.GetUser(c.UserContext(), userID)
 	if err != nil || currentUser == nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
 	}
 
 	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to list OpenShift users",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
+		audit.Log(c, audit.ActionUnauthorizedAttempt, "endpoint", "/api/k8s/openshift-users", "non-admin OpenShift user list attempt")
 		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
 	}
 
 	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
+		return errNoClusterAccess(c)
 	}
 
 	cluster := c.Query("cluster")
@@ -490,95 +455,20 @@ func (h *RBACHandler) ListOpenShiftUsers(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Cluster parameter required")
 	}
 
-	// Use a longer timeout for this query as large clusters can be slow
-	ctx, cancel := context.WithTimeout(context.Background(), rbacAnalysisTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), rbacAnalysisTimeout)
 	defer cancel()
 
 	users, err := h.k8sClient.ListOpenShiftUsers(ctx, cluster)
 	if err != nil {
-		slog.Error("[RBAC] failed to list openshift users", "error", err)
+		slog.Warn("[RBAC] failed to list openshift users", "error", err)
 		return fiber.NewError(fiber.StatusInternalServerError, "internal server error")
 	}
 
 	return c.JSON(users)
 }
 
-// GetPermissionsSummary returns permission summaries for all clusters.
-// SECURITY: Restricted to admin users to prevent non-admin users from
-// reading per-cluster permission summaries (#5465).
-func (h *RBACHandler) GetPermissionsSummary(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(userID)
-	if err != nil || currentUser == nil {
-		return fiber.NewError(fiber.StatusUnauthorized, "Unauthorized")
-	}
-
-	if currentUser.Role != models.UserRoleAdmin {
-		slog.Warn("[rbac] SECURITY: non-admin attempted to read permissions summary",
-			"user_id", currentUser.ID,
-			"github_login", currentUser.GitHubLogin)
-		return fiber.NewError(fiber.StatusForbidden, "Admin access required")
-	}
-
-	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), rbacAnalysisTimeout)
-	defer cancel()
-
-	summaries, err := h.k8sClient.GetAllPermissionsSummaries(ctx)
-	if err != nil {
-		slog.Error("[RBAC] failed to get permissions summary", "error", err)
-		return fiber.NewError(fiber.StatusInternalServerError, "internal server error")
-	}
-
-	// Convert to map format for API response
-	response := models.PermissionsSummaryResponse{
-		Clusters: make(map[string]models.ClusterPermissionsSummary),
-	}
-
-	for _, summary := range summaries {
-		response.Clusters[summary.Cluster] = models.ClusterPermissionsSummary{
-			IsClusterAdmin:       summary.IsClusterAdmin,
-			CanListNodes:         summary.CanListNodes,
-			CanListNamespaces:    summary.CanListNamespaces,
-			CanCreateNamespaces:  summary.CanCreateNamespaces,
-			CanManageRBAC:        summary.CanManageRBAC,
-			CanViewSecrets:       summary.CanViewSecrets,
-			AccessibleNamespaces: summary.AccessibleNamespaces,
-		}
-	}
-
-	return c.JSON(response)
-}
-
-// CheckCanI checks if the current user can perform an action
-func (h *RBACHandler) CheckCanI(c *fiber.Ctx) error {
-	if h.k8sClient == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "Kubernetes client not available")
-	}
-
-	var req models.CanIRequest
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
-	}
-
-	if req.Cluster == "" || req.Verb == "" || req.Resource == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "Cluster, verb, and resource are required")
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), rbacDefaultTimeout)
-	defer cancel()
-
-	result, err := h.k8sClient.CheckCanI(ctx, req.Cluster, req)
-	if err != nil {
-		slog.Error("[RBAC] failed to check permission", "error", err)
-		return fiber.NewError(fiber.StatusInternalServerError, "internal server error")
-	}
-
-	return c.JSON(models.CanIResponse{
-		Allowed: result.Allowed,
-		Reason:  result.Reason,
-	})
-}
+// NOTE: GetPermissionsSummary and CheckCanI moved to kc-agent (#7993 Phase 6).
+// The frontend now calls ${LOCAL_AGENT_HTTP_URL}/permissions/summary and
+// ${LOCAL_AGENT_HTTP_URL}/rbac/can-i so SelfSubjectAccessReviews run under
+// the user's kubeconfig instead of the backend pod ServiceAccount when
+// console is deployed in-cluster. Routes in pkg/agent/server_rbac.go.

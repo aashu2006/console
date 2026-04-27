@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/joho/godotenv"
+
 	"github.com/kubestellar/console/pkg/api"
 )
 
@@ -29,32 +30,15 @@ func main() {
 	devMode := flag.Bool("dev", false, "Run in development mode")
 	port := flag.Int("port", 0, "Server port (default: 8080)")
 	dbPath := flag.String("db", "", "Database path (default: ./data/console.db)")
-	watchdog := flag.Bool("watchdog", false, "Run as watchdog reverse proxy (serves fallback page when backend is down)")
-	backendPort := flag.Int("backend-port", watchdogDefaultBackendPort, "Backend port for watchdog to proxy to")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
 	if *version {
-		fmt.Printf("console version %s\n", api.Version)
+		fmt.Printf("console version %s\n", api.Version) //nolint:forbidigo // CLI --version flag output
 		os.Exit(0)
 	}
 
-	// Watchdog mode: lightweight reverse proxy, no DB/k8s/MCP initialization
-	if *watchdog {
-		listenPort := watchdogDefaultListenPort
-		if *port > 0 {
-			listenPort = *port
-		}
-		cfg := WatchdogConfig{
-			ListenPort:  listenPort,
-			BackendPort: *backendPort,
-		}
-		if err := runWatchdog(cfg); err != nil {
-			slog.Error("watchdog error", "error", err)
-			os.Exit(1)
-		}
-		return
-	}
+	slog.Info("console starting", "version", api.Version)
 
 	// Load config from environment
 	cfg := api.LoadConfigFromEnv()

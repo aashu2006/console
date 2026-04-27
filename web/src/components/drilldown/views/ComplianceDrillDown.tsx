@@ -11,6 +11,7 @@ import { useTranslation } from 'react-i18next'
 import {
   Shield, CheckCircle, XCircle, AlertCircle, Info,
   ChevronUp, ChevronDown, ChevronLeft, ChevronRight,
+  ChevronsLeft, ChevronsRight,
   Search, X, Filter } from 'lucide-react'
 import { useTrestle, type OscalControlResult } from '../../../hooks/useTrestle'
 import { useGlobalFilters } from '../../../hooks/useGlobalFilters'
@@ -173,10 +174,10 @@ export function ComplianceDrillDown({ data }: Props) {
       : <ChevronDown className="w-3 h-3" />
   }
 
-  // Summary stats
-  const passCount = filteredRows.filter(r => r.status === 'pass').length
-  const failCount = filteredRows.filter(r => r.status === 'fail').length
-  const otherCount = filteredRows.filter(r => r.status === 'other' || r.status === 'not-applicable').length
+  // Summary stats — always computed from allRows so they are unaffected by filters
+  const passCount = allRows.filter(r => r.status === 'pass').length
+  const failCount = allRows.filter(r => r.status === 'fail').length
+  const otherCount = allRows.filter(r => r.status === 'other' || r.status === 'not-applicable').length
   const activeFilters = [statusFilter, severityFilter, clusterFilter, profileFilter, searchQuery].filter(Boolean).length
 
   return (
@@ -202,7 +203,7 @@ export function ComplianceDrillDown({ data }: Props) {
               !statusFilter ? 'border-teal-500/40 bg-teal-500/10' : 'border-border bg-card/50 hover:border-border/80'
             )}
           >
-            <div className="text-xl font-bold text-foreground">{filteredRows.length}</div>
+            <div className="text-xl font-bold text-foreground">{allRows.length}</div>
             <div className="text-xs text-muted-foreground">Total Controls</div>
           </button>
           <button
@@ -246,7 +247,7 @@ export function ComplianceDrillDown({ data }: Props) {
               placeholder="Search by control ID, title, or description..."
               value={searchQuery}
               onChange={e => { setSearchQuery(e.target.value); resetPage() }}
-              className="w-full pl-9 pr-8 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              className="w-full pl-9 pr-8 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
             {searchQuery && (
               <button
@@ -282,7 +283,7 @@ export function ComplianceDrillDown({ data }: Props) {
             <select
               value={statusFilter}
               onChange={e => { setStatusFilter(e.target.value); resetPage() }}
-              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               <option value="">{t('drilldown.compliance.allStatuses')}</option>
               {uniqueStatuses.map(s => (
@@ -292,7 +293,7 @@ export function ComplianceDrillDown({ data }: Props) {
             <select
               value={severityFilter}
               onChange={e => { setSeverityFilter(e.target.value); resetPage() }}
-              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               <option value="">{t('drilldown.compliance.allSeverities')}</option>
               <option value="critical">{t('drilldown.compliance.critical')}</option>
@@ -303,7 +304,7 @@ export function ComplianceDrillDown({ data }: Props) {
             <select
               value={clusterFilter}
               onChange={e => { setClusterFilter(e.target.value); resetPage() }}
-              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               <option value="">{t('drilldown.compliance.allClusters')}</option>
               {uniqueClusters.map(c => (
@@ -313,7 +314,7 @@ export function ComplianceDrillDown({ data }: Props) {
             <select
               value={profileFilter}
               onChange={e => { setProfileFilter(e.target.value); resetPage() }}
-              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              className="px-3 py-2 rounded-lg border border-border bg-card/50 text-sm text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               <option value="">{t('drilldown.compliance.allProfiles')}</option>
               {uniqueProfiles.map(p => (
@@ -418,20 +419,24 @@ export function ComplianceDrillDown({ data }: Props) {
             Showing {page * PAGE_SIZE + 1}--{Math.min((page + 1) * PAGE_SIZE, sortedRows.length)} of {sortedRows.length} controls
           </span>
           <div className="flex items-center gap-1">
+            {/* First/Last use the single-glyph ChevronsLeft/ChevronsRight (double-chevron)
+                instead of two overlapping single chevrons — reads as one control instead of
+                two arrows side-by-side. */}
             <button
               onClick={() => setPage(0)}
               disabled={page === 0}
               className="p-1.5 rounded hover:bg-card/50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               title="First page"
+              aria-label="First page"
             >
-              <ChevronLeft className="w-4 h-4" />
-              <ChevronLeft className="w-4 h-4 -ml-3" />
+              <ChevronsLeft className="w-4 h-4" />
             </button>
             <button
               onClick={() => setPage(p => Math.max(0, p - 1))}
               disabled={page === 0}
               className="p-1.5 rounded hover:bg-card/50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               title="Previous page"
+              aria-label="Previous page"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
@@ -443,6 +448,7 @@ export function ComplianceDrillDown({ data }: Props) {
               disabled={page >= totalPages - 1}
               className="p-1.5 rounded hover:bg-card/50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               title="Next page"
+              aria-label="Next page"
             >
               <ChevronRight className="w-4 h-4" />
             </button>
@@ -451,9 +457,9 @@ export function ComplianceDrillDown({ data }: Props) {
               disabled={page >= totalPages - 1}
               className="p-1.5 rounded hover:bg-card/50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               title="Last page"
+              aria-label="Last page"
             >
-              <ChevronRight className="w-4 h-4" />
-              <ChevronRight className="w-4 h-4 -ml-3" />
+              <ChevronsRight className="w-4 h-4" />
             </button>
           </div>
         </div>

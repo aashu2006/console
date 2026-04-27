@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useRef } from 'react'
 import { CheckCircle, AlertTriangle, Clock, Server } from 'lucide-react'
-import ReactECharts from 'echarts-for-react'
+import { LazyEChart } from '../charts/LazyEChart'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedPodIssues } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
@@ -8,14 +8,18 @@ import { useCardLoadingState } from './CardDataContext'
 import { CardClusterFilter } from '../../lib/cards/CardComponents'
 import { isDemoMode } from '../../lib/demoMode'
 import { useTranslation } from 'react-i18next'
+import { MS_PER_MINUTE } from '../../lib/constants/time'
 import {
   CHART_HEIGHT_STANDARD,
   CHART_GRID_STROKE,
   CHART_AXIS_STROKE,
   CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TICK_COLOR } from '../../lib/constants'
+  CHART_TICK_COLOR,
+  CHART_AXIS_FONT_SIZE,
+  CHART_BODY_FONT_SIZE } from '../../lib/constants'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { safeGet, safeSet } from '../../lib/safeLocalStorage'
+import { ORANGE_500, YELLOW_500, GREEN_500_BRIGHT, hexToRgba } from '../../lib/theme/chartColors'
 
 interface HealthPoint {
   time: string
@@ -26,11 +30,24 @@ interface HealthPoint {
 
 type TimeRange = '15m' | '1h' | '6h' | '24h'
 
+/** Opacity at the top of area-fill gradients */
+const AREA_GRADIENT_TOP_ALPHA = 0.4
+/** Opacity at the bottom of area-fill gradients (fully transparent) */
+const AREA_GRADIENT_BOTTOM_ALPHA = 0
+
+/** Maximum data points to display per time range selection */
+const TIME_RANGE_MAX_POINTS: Record<TimeRange, number> = {
+  '15m': 15,
+  '1h': 20,
+  '6h': 24,
+  '24h': 24,
+}
+
 const TIME_RANGE_OPTIONS: { value: TimeRange; label: string; points: number }[] = [
-  { value: '15m', label: '15 min', points: 15 },
-  { value: '1h', label: '1 hour', points: 20 },
-  { value: '6h', label: '6 hours', points: 24 },
-  { value: '24h', label: '24 hours', points: 24 },
+  { value: '15m', label: '15 min', points: TIME_RANGE_MAX_POINTS['15m'] },
+  { value: '1h', label: '1 hour', points: TIME_RANGE_MAX_POINTS['1h'] },
+  { value: '6h', label: '6 hours', points: TIME_RANGE_MAX_POINTS['6h'] },
+  { value: '24h', label: '24 hours', points: TIME_RANGE_MAX_POINTS['24h'] },
 ]
 
 export function PodHealthTrend() {
@@ -43,11 +60,9 @@ export function PodHealthTrend() {
 
   // hasData should be true once loading completes (even with empty data)
   const hasData = clusters.length > 0 || issues.length > 0
-  const isLoadingData = (clustersLoading || issuesLoading) && !hasData
-
   // Report state to CardWrapper for refresh animation
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading: isLoadingData,
+    isLoading: (clustersLoading || issuesLoading) && !hasData,
     isRefreshing: clustersRefreshing || issuesRefreshing,
     hasAnyData: hasData,
     isDemoData: isDemoModeActive || isDemoFallback,
@@ -71,7 +86,7 @@ export function PodHealthTrend() {
 
   // Track historical data points with persistence
   const STORAGE_KEY = 'pod-health-trend-history'
-  const MAX_AGE_MS = 30 * 60 * 1000 // 30 minutes - discard older data
+  const MAX_AGE_MS = 30 * MS_PER_MINUTE // 30 minutes - discard older data
 
   // Load from localStorage on mount
   const loadSavedHistory = (): HealthPoint[] => {
@@ -204,7 +219,7 @@ export function PodHealthTrend() {
       if (isDemoMode()) {
         // Seed 8 historical points so the time-series chart renders immediately
         const DEMO_SEED_POINTS = 8
-        const DEMO_INTERVAL_MS = 5 * 60000 // 5-min intervals
+        const DEMO_INTERVAL_MS = 5 * MS_PER_MINUTE
         const MAX_JITTER = 3
         const points: HealthPoint[] = []
         for (let i = DEMO_SEED_POINTS - 1; i >= 0; i--) {
@@ -235,20 +250,26 @@ export function PodHealthTrend() {
     }
   }, [currentStats, history.length])
 
+  // Slice history to the number of points allowed by the selected time range
+  const visibleHistory = useMemo(() => {
+    const maxPoints = TIME_RANGE_MAX_POINTS[timeRange]
+    return history.slice(-maxPoints)
+  }, [history, timeRange])
+
   const chartOption = useMemo(() => ({
     backgroundColor: 'transparent',
     grid: { left: 40, right: 5, top: 5, bottom: 25 },
     xAxis: {
       type: 'category' as const,
-      data: history.map(d => d.time),
-      axisLabel: { color: CHART_TICK_COLOR, fontSize: 10 },
+      data: visibleHistory.map(d => d.time),
+      axisLabel: { color: CHART_TICK_COLOR, fontSize: CHART_AXIS_FONT_SIZE },
       axisLine: { lineStyle: { color: CHART_AXIS_STROKE } },
       axisTick: { show: false },
     },
     yAxis: {
       type: 'value' as const,
       minInterval: 1,
-      axisLabel: { color: CHART_TICK_COLOR, fontSize: 10 },
+      axisLabel: { color: CHART_TICK_COLOR, fontSize: CHART_AXIS_FONT_SIZE },
       axisLine: { show: false },
       axisTick: { show: false },
       splitLine: { lineStyle: { color: CHART_GRID_STROKE, type: 'dashed' as const } },
@@ -257,7 +278,7 @@ export function PodHealthTrend() {
       trigger: 'axis' as const,
       backgroundColor: (CHART_TOOLTIP_CONTENT_STYLE as Record<string, unknown>).backgroundColor as string,
       borderColor: (CHART_TOOLTIP_CONTENT_STYLE as Record<string, unknown>).borderColor as string,
-      textStyle: { color: CHART_TICK_COLOR, fontSize: 12 },
+      textStyle: { color: CHART_TICK_COLOR, fontSize: CHART_BODY_FONT_SIZE },
     },
     series: [
       {
@@ -265,12 +286,12 @@ export function PodHealthTrend() {
         type: 'line',
         stack: 'total',
         smooth: true,
-        data: history.map(d => d.issues),
-        lineStyle: { color: '#f97316', width: 2 },
-        itemStyle: { color: '#f97316' },
+        data: visibleHistory.map(d => d.issues),
+        lineStyle: { color: ORANGE_500, width: 2 },
+        itemStyle: { color: ORANGE_500 },
         areaStyle: {
           color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: 'rgba(249,115,22,0.4)' }, { offset: 1, color: 'rgba(249,115,22,0)' }] },
+            colorStops: [{ offset: 0, color: hexToRgba(ORANGE_500, AREA_GRADIENT_TOP_ALPHA) }, { offset: 1, color: hexToRgba(ORANGE_500, AREA_GRADIENT_BOTTOM_ALPHA) }] },
         },
         showSymbol: false,
       },
@@ -279,12 +300,12 @@ export function PodHealthTrend() {
         type: 'line',
         stack: 'total',
         smooth: true,
-        data: history.map(d => d.pending),
-        lineStyle: { color: '#eab308', width: 2 },
-        itemStyle: { color: '#eab308' },
+        data: visibleHistory.map(d => d.pending),
+        lineStyle: { color: YELLOW_500, width: 2 },
+        itemStyle: { color: YELLOW_500 },
         areaStyle: {
           color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: 'rgba(234,179,8,0.4)' }, { offset: 1, color: 'rgba(234,179,8,0)' }] },
+            colorStops: [{ offset: 0, color: hexToRgba(YELLOW_500, AREA_GRADIENT_TOP_ALPHA) }, { offset: 1, color: hexToRgba(YELLOW_500, AREA_GRADIENT_BOTTOM_ALPHA) }] },
         },
         showSymbol: false,
       },
@@ -293,27 +314,27 @@ export function PodHealthTrend() {
         type: 'line',
         stack: 'total',
         smooth: true,
-        data: history.map(d => d.healthy),
-        lineStyle: { color: '#22c55e', width: 2 },
-        itemStyle: { color: '#22c55e' },
+        data: visibleHistory.map(d => d.healthy),
+        lineStyle: { color: GREEN_500_BRIGHT, width: 2 },
+        itemStyle: { color: GREEN_500_BRIGHT },
         areaStyle: {
           color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: 'rgba(34,197,94,0.4)' }, { offset: 1, color: 'rgba(34,197,94,0)' }] },
+            colorStops: [{ offset: 0, color: hexToRgba(GREEN_500_BRIGHT, AREA_GRADIENT_TOP_ALPHA) }, { offset: 1, color: hexToRgba(GREEN_500_BRIGHT, AREA_GRADIENT_BOTTOM_ALPHA) }] },
         },
         showSymbol: false,
       },
       {
         name: 'Issues (trend)',
         type: 'line',
-        data: history.map(d => d.issues),
+        data: visibleHistory.map(d => d.issues),
         smooth: true,
-        lineStyle: { color: '#f97316', width: 2, type: 'dashed' as const },
-        itemStyle: { color: '#f97316' },
+        lineStyle: { color: ORANGE_500, width: 2, type: 'dashed' as const },
+        itemStyle: { color: ORANGE_500 },
         showSymbol: false,
         silent: true,
       },
     ],
-  }), [history])
+  }), [visibleHistory])
 
   if (showSkeleton && history.length === 0) {
     return (
@@ -335,7 +356,7 @@ export function PodHealthTrend() {
   return (
     <div className="h-full flex flex-col">
       {/* Controls - single row: Time Range -> Cluster Filter -> Refresh */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3">
         <div className="flex items-center gap-2">
           {/* Cluster count indicator */}
           {localClusterFilter.length > 0 && (
@@ -377,7 +398,7 @@ export function PodHealthTrend() {
       </div>
 
       {/* Stats row */}
-      <div className="grid grid-cols-3 gap-2 mb-4">
+      <div className="grid grid-cols-2 @md:grid-cols-3 gap-2 mb-4">
         <div className="p-2 rounded-lg bg-green-500/10 border border-green-500/20" title={hasReachableClusters ? `${currentStats.healthy} healthy pods` : 'No reachable clusters'}>
           <div className="flex items-center gap-1.5 mb-1">
             <CheckCircle className="w-3 h-3 text-green-400" />
@@ -409,7 +430,7 @@ export function PodHealthTrend() {
           </div>
         ) : (
           <div style={{ width: '100%', minHeight: CHART_HEIGHT_STANDARD, height: CHART_HEIGHT_STANDARD }}>
-            <ReactECharts
+            <LazyEChart
               option={chartOption}
               style={{ height: CHART_HEIGHT_STANDARD, width: '100%' }}
               notMerge={true}

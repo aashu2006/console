@@ -8,6 +8,8 @@ import { useToast } from '../../ui/Toast'
 import type { Policy, Violation, StartMissionFn } from './types'
 import { POLICY_TEMPLATES } from './types'
 import { copyToClipboard } from '../../../lib/clipboard'
+import { KUBECTL_MEDIUM_TIMEOUT_MS, KUBECTL_EXTENDED_TIMEOUT_MS } from '../../../lib/constants/network'
+import { ALERT_SEVERITY_ORDER } from '../../../types/alerts'
 
 // Tab type for ClusterOPAModal
 type OPAModalTab = 'policies' | 'violations'
@@ -143,7 +145,7 @@ What would you like to modify about this policy?`,
 
     try {
       // Use priority: true to bypass the queue for immediate execution (interactive user action)
-      const result = await kubectlProxy.exec(cmd, { context: clusterName, timeout: 30000, priority: true })
+      const result = await kubectlProxy.exec(cmd, { context: clusterName, timeout: KUBECTL_EXTENDED_TIMEOUT_MS, priority: true })
 
       if (result.output && result.output.trim()) {
         setYamlContent(result.output)
@@ -193,7 +195,7 @@ Please proceed with applying this policy.`,
     try {
       await kubectlProxy.exec(
         ['patch', policy.kind.toLowerCase(), policy.name, '--type=merge', '-p', `{"spec":{"enforcementAction":"${newMode}"}}`],
-        { context: clusterName, timeout: 15000 }
+        { context: clusterName, timeout: KUBECTL_MEDIUM_TIMEOUT_MS }
       )
       showToast('Policy mode updated successfully', 'success')
       onRefresh()
@@ -208,7 +210,7 @@ Please proceed with applying this policy.`,
     try {
       await kubectlProxy.exec(
         ['delete', policy.kind.toLowerCase(), policy.name],
-        { context: clusterName, timeout: 15000 }
+        { context: clusterName, timeout: KUBECTL_MEDIUM_TIMEOUT_MS }
       )
       setDeleteConfirm(null)
       showToast('Policy deleted successfully', 'success')
@@ -235,7 +237,7 @@ Please proceed with applying this policy.`,
 
         <BaseModal.Content className="max-h-[60vh]">
           {/* Tabs */}
-          <div className="flex items-center justify-between mb-4 pb-3 border-b border-border">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4 pb-3 border-b border-border">
             <div className="flex gap-1">
               <button
                 onClick={() => setActiveTab('policies')}
@@ -322,7 +324,7 @@ Please proceed with applying this policy.`,
                     onClick={() => handleEditYaml(policy)}
                     className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors cursor-pointer group"
                   >
-                    <div className="flex items-center justify-between mb-2">
+                    <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium text-foreground group-hover:text-purple-400 transition-colors">{policy.name}</span>
                         <span className="text-xs text-muted-foreground">({policy.kind})</span>
@@ -337,7 +339,7 @@ Please proceed with applying this policy.`,
                         </button>
                       </div>
                     </div>
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-y-2">
                       <div className="flex items-center gap-3 text-xs">
                         {policy.violations > 0 ? (
                           <span className="flex items-center gap-1 text-yellow-400">
@@ -385,7 +387,7 @@ Please proceed with applying this policy.`,
           {activeTab === 'violations' && (
             <>
               {/* Summary */}
-              <div className="grid grid-cols-3 gap-3 mb-4 pb-4 border-b border-border">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4 pb-4 border-b border-border">
                 <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-center">
                   <p className="text-2xl font-bold text-red-400">{severityCounts.critical}</p>
                   <p className="text-xs text-muted-foreground">{t('common:common.critical')}</p>
@@ -411,8 +413,7 @@ Please proceed with applying this policy.`,
                 ) : (
                   [...violations]
                     .sort((a, b) => {
-                      const severityOrder = { critical: 0, warning: 1, info: 2 }
-                      return severityOrder[a.severity] - severityOrder[b.severity]
+                      return (ALERT_SEVERITY_ORDER as Record<string, number>)[a.severity] - (ALERT_SEVERITY_ORDER as Record<string, number>)[b.severity]
                     })
                     .map((violation, idx) => (
                     <div
@@ -479,7 +480,7 @@ Please proceed with applying this policy.`,
                 onClick={() => handleUseTemplate(template)}
                 className="w-full p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors text-left"
               >
-                <div className="flex items-center justify-between mb-1">
+                <div className="flex flex-wrap items-center justify-between gap-y-2 mb-1">
                   <span className="text-sm font-medium text-foreground">{template.name}</span>
                   <span className="text-xs text-muted-foreground">{template.kind}</span>
                 </div>
@@ -499,9 +500,9 @@ Please proceed with applying this policy.`,
           onClose={() => setShowYamlEditor(false)}
           showBack={false}
         />
-        <BaseModal.Content className="!overflow-visible">
+        <BaseModal.Content className="overflow-visible!">
           <div className="space-y-3">
-            <div className="flex items-center justify-between text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs">
               <span className="text-muted-foreground">YAML will be applied to: <span className="text-foreground">{clusterName}</span></span>
               <button
                 onClick={() => copyToClipboard(yamlContent)}
@@ -514,7 +515,7 @@ Please proceed with applying this policy.`,
             <textarea
               value={yamlContent}
               onChange={(e) => setYamlContent(e.target.value)}
-              className="w-full h-[60vh] p-3 bg-secondary/50 border border-border rounded-lg font-mono text-sm text-foreground resize-none focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+              className="w-full h-[60vh] p-3 bg-secondary/50 border border-border rounded-lg font-mono text-sm text-foreground resize-none focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
               placeholder="# Paste or write your ConstraintTemplate and Constraint YAML here..."
               spellCheck={false}
             />

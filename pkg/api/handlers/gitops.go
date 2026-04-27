@@ -4,12 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -18,6 +15,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/kubestellar/console/pkg/api/v1alpha1"
 	"github.com/kubestellar/console/pkg/k8s"
@@ -265,6 +263,13 @@ func (h *GitOpsHandlers) ListDrifts(c *fiber.Ctx) error {
 func (h *GitOpsHandlers) ListHelmReleases(c *fiber.Ctx) error {
 	cluster := c.Query("cluster")
 
+	// SECURITY: Validate cluster name before passing to helm CLI
+	if cluster != "" {
+		if err := validateK8sName(cluster, "cluster"); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// If specific cluster requested, query only that cluster
 	if cluster != "" {
 		return h.listHelmReleasesForCluster(c, cluster)
@@ -277,7 +282,7 @@ func (h *GitOpsHandlers) ListHelmReleases(c *fiber.Ctx) error {
 
 		clusters, _, err := h.k8sClient.HealthyClusters(hcCtx)
 		if err != nil {
-			slog.Info("[GitOps] error listing healthy clusters for releases", "error", err)
+			slog.Warn("[GitOps] error listing healthy clusters for releases", "error", err)
 			return c.Status(500).JSON(fiber.Map{"error": "internal server error", "releases": []HelmRelease{}})
 		}
 
@@ -333,13 +338,13 @@ func (h *GitOpsHandlers) getHelmReleasesForCluster(ctx context.Context, cluster 
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] helm ls failed", "cluster", cluster, "error", err, "stderr", stderr.String())
+		slog.Warn("[GitOps] helm ls failed", "cluster", cluster, "error", err, "stderr", stderr.String())
 		return []HelmRelease{}
 	}
 
 	releases := make([]HelmRelease, 0)
 	if err := json.Unmarshal(stdout.Bytes(), &releases); err != nil {
-		slog.Error("[GitOps] failed to parse helm ls output", "cluster", cluster, "error", err)
+		slog.Warn("[GitOps] failed to parse helm ls output", "cluster", cluster, "error", err)
 		return []HelmRelease{}
 	}
 
@@ -355,6 +360,13 @@ func (h *GitOpsHandlers) getHelmReleasesForCluster(ctx context.Context, cluster 
 func (h *GitOpsHandlers) ListKustomizations(c *fiber.Ctx) error {
 	cluster := c.Query("cluster")
 
+	// SECURITY: Validate cluster name before passing to kubectl CLI
+	if cluster != "" {
+		if err := validateK8sName(cluster, "cluster"); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// If specific cluster requested, query only that cluster
 	if cluster != "" {
 		ctx, cancel := context.WithTimeout(c.Context(), helmStreamPerClusterTimeout)
@@ -368,7 +380,7 @@ func (h *GitOpsHandlers) ListKustomizations(c *fiber.Ctx) error {
 	if h.k8sClient != nil {
 		clusters, _, err := h.k8sClient.HealthyClusters(c.Context())
 		if err != nil {
-			slog.Info("[GitOps] error listing healthy clusters for kustomizations", "error", err)
+			slog.Warn("[GitOps] error listing healthy clusters for kustomizations", "error", err)
 			return c.Status(500).JSON(fiber.Map{"error": "internal server error", "kustomizations": []Kustomization{}})
 		}
 
@@ -423,7 +435,7 @@ func (h *GitOpsHandlers) getKustomizationsForCluster(ctx context.Context, cluste
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] kubectl get kustomizations failed", "cluster", cluster, "error", err, "stderr", stderr.String())
+		slog.Warn("[GitOps] kubectl get kustomizations failed", "cluster", cluster, "error", err, "stderr", stderr.String())
 		return []Kustomization{}
 	}
 
@@ -452,7 +464,7 @@ func (h *GitOpsHandlers) getKustomizationsForCluster(ctx context.Context, cluste
 	}
 
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		slog.Error("[GitOps] failed to parse kustomizations", "cluster", cluster, "error", err)
+		slog.Warn("[GitOps] failed to parse kustomizations", "cluster", cluster, "error", err)
 		return []Kustomization{}
 	}
 
@@ -493,7 +505,10 @@ type OperatorSubscription struct {
 	InstallPlanApproval string `json:"installPlanApproval"`
 	CurrentCSV          string `json:"currentCSV"`
 	InstalledCSV        string `json:"installedCSV,omitempty"`
-	Cluster             string `json:"cluster,omitempty"`
+	// PendingUpgrade is set when installedCSV differs from currentCSV,
+	// indicating an upgrade is waiting for approval (#7548).
+	PendingUpgrade string `json:"pendingUpgrade,omitempty"`
+	Cluster        string `json:"cluster,omitempty"`
 }
 
 // Operator/subscription timeouts — CSV queries take 90-100s for clusters with
@@ -511,6 +526,11 @@ const (
 	gitopsDefaultTimeout          = 30 * time.Second
 )
 
+// operatorCacheEmptyTTL is a shorter cache TTL used for empty results from
+// permanent errors (e.g. "no OLM"). This ensures that after installing OLM
+// the operators appear within 30s instead of waiting the full 5-minute TTL (#7549).
+const operatorCacheEmptyTTL = 30 * time.Second
+
 // operatorCacheEntry holds cached operators for a single cluster.
 type operatorCacheEntry struct {
 	operators []Operator
@@ -520,21 +540,36 @@ type operatorCacheEntry struct {
 // operatorCache is a per-cluster in-memory cache for slow CSV queries.
 // Protected by operatorCacheMu. Background refresh populates the cache
 // so that subsequent page loads are instant.
+// operatorFetchGroup coalesces concurrent cache-miss fetches for the same
+// cluster into a single request, preventing the check-then-act race where
+// two goroutines both see an empty cache and fetch in parallel (#7783).
 var (
-	operatorCacheMu   sync.RWMutex
-	operatorCacheData = make(map[string]*operatorCacheEntry)
+	operatorCacheMu    sync.RWMutex
+	operatorCacheData  = make(map[string]*operatorCacheEntry)
+	operatorFetchGroup singleflight.Group
 )
 
 // ListOperators returns OLM-managed operators (ClusterServiceVersions)
 func (h *GitOpsHandlers) ListOperators(c *fiber.Ctx) error {
 	cluster := c.Query("cluster")
 
+	// SECURITY: Validate cluster name before passing to kubectl CLI
+	if cluster != "" {
+		if err := validateK8sName(cluster, "cluster"); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// If specific cluster requested, query only that cluster
 	if cluster != "" {
 		ctx, cancel := context.WithTimeout(c.Context(), operatorPerClusterTimeout)
 		defer cancel()
-		operators := h.getOperatorsForCluster(ctx, cluster)
-		return c.JSON(fiber.Map{"operators": operators})
+		operators, fetchErr := h.getOperatorsForClusterWithError(ctx, cluster)
+		resp := fiber.Map{"operators": operators}
+		if fetchErr != nil {
+			resp["clusterErrors"] = []string{fmt.Sprintf("%s: %v", cluster, fetchErr)}
+		}
+		return c.JSON(resp)
 	}
 
 	// Query all clusters in parallel — operators are slow, so we wait for all
@@ -542,13 +577,16 @@ func (h *GitOpsHandlers) ListOperators(c *fiber.Ctx) error {
 	if h.k8sClient != nil {
 		clusters, _, err := h.k8sClient.HealthyClusters(c.Context())
 		if err != nil {
-			slog.Info("[GitOps] error listing healthy clusters for operators", "error", err)
+			slog.Warn("[GitOps] error listing healthy clusters for operators", "error", err)
 			return c.Status(500).JSON(fiber.Map{"error": "internal server error", "operators": []Operator{}})
 		}
 
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		allOperators := make([]Operator, 0)
+		// #7544: Surface per-cluster errors so the frontend can indicate
+		// which clusters failed rather than showing a silent empty state.
+		var clusterErrors []string
 
 		overallCtx, overallCancel := context.WithTimeout(c.Context(), operatorRestOverallTimeout)
 		defer overallCancel()
@@ -562,17 +600,24 @@ func (h *GitOpsHandlers) ListOperators(c *fiber.Ctx) error {
 				ctx, cancel := context.WithTimeout(overallCtx, operatorPerClusterTimeout)
 				defer cancel()
 
-				operators := h.getOperatorsForCluster(ctx, clusterName)
-				if len(operators) > 0 {
-					mu.Lock()
-					allOperators = append(allOperators, operators...)
-					mu.Unlock()
+				operators, fetchErr := h.getOperatorsForClusterWithError(ctx, clusterName)
+				mu.Lock()
+				if fetchErr != nil {
+					clusterErrors = append(clusterErrors, fmt.Sprintf("%s: %v", clusterName, fetchErr))
 				}
+				if len(operators) > 0 {
+					allOperators = append(allOperators, operators...)
+				}
+				mu.Unlock()
 			}(cl.Name)
 		}
 
 		wg.Wait()
-		return c.JSON(fiber.Map{"operators": allOperators})
+		resp := fiber.Map{"operators": allOperators}
+		if len(clusterErrors) > 0 {
+			resp["clusterErrors"] = clusterErrors
+		}
+		return c.JSON(resp)
 	}
 
 	// Fallback to default context
@@ -591,8 +636,12 @@ func (h *GitOpsHandlers) StreamOperators(c *fiber.Ctx) error {
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
+		return errNoClusterAccess(c)
 	}
+
+	// Capture request context before entering the stream writer so client
+	// disconnect propagates to per-cluster goroutines (#6480).
+	requestCtx := c.UserContext()
 
 	// Single cluster — return as single SSE event
 	if cluster != "" {
@@ -602,7 +651,7 @@ func (h *GitOpsHandlers) StreamOperators(c *fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 			writeSSEEvent(w, "connected", fiber.Map{"status": "streaming"})
-			ctx, cancel := context.WithTimeout(context.Background(), operatorPerClusterTimeout)
+			ctx, cancel := context.WithTimeout(requestCtx, operatorPerClusterTimeout)
 			defer cancel()
 			operators := h.getOperatorsForCluster(ctx, cluster)
 			writeSSEEvent(w, "cluster_data", fiber.Map{
@@ -639,19 +688,26 @@ func (h *GitOpsHandlers) StreamOperators(c *fiber.Ctx) error {
 				defer wg.Done()
 				subprocessSem <- struct{}{}        // acquire
 				defer func() { <-subprocessSem }() // release
-				ctx, cancel := context.WithTimeout(context.Background(), operatorPerClusterTimeout)
+				ctx, cancel := context.WithTimeout(requestCtx, operatorPerClusterTimeout)
 				defer cancel()
 
-				operators := h.getOperatorsForCluster(ctx, clusterName)
+				operators, fetchErr := h.getOperatorsForClusterWithError(ctx, clusterName)
 				mu.Lock()
 				completedClusters++
-				// Always send cluster_data — even for empty clusters so the
-				// frontend sees progress and knows the stream is alive.
-				writeSSEEvent(w, "cluster_data", fiber.Map{
-					"cluster":   clusterName,
-					"operators": operators,
-					"source":    "k8s",
-				})
+				// #7546: Emit cluster_error when a fetch fails so the frontend
+				// can distinguish "no operators" from "query failed".
+				if fetchErr != nil {
+					writeSSEEvent(w, sseEventClusterError, fiber.Map{
+						"cluster": clusterName,
+						"error":   fetchErr.Error(),
+					})
+				} else {
+					writeSSEEvent(w, "cluster_data", fiber.Map{
+						"cluster":   clusterName,
+						"operators": operators,
+						"source":    "k8s",
+					})
+				}
 				mu.Unlock()
 			}(cl.Name)
 		}
@@ -675,50 +731,167 @@ func (h *GitOpsHandlers) getOperatorsForCluster(ctx context.Context, cluster str
 		cacheKey = "__default__"
 	}
 
-	// Check cache first
+	// Check cache first. Use shorter TTL for empty results so that newly
+	// installed OLM operators appear quickly (#7549, #7550).
 	operatorCacheMu.RLock()
-	if entry, ok := operatorCacheData[cacheKey]; ok && time.Since(entry.fetchedAt) < operatorCacheTTL {
-		operators := entry.operators
-		operatorCacheMu.RUnlock()
-		return operators
+	if entry, ok := operatorCacheData[cacheKey]; ok {
+		ttl := operatorCacheTTL
+		if len(entry.operators) == 0 {
+			ttl = operatorCacheEmptyTTL
+		}
+		if time.Since(entry.fetchedAt) < ttl {
+			// #7748: Return a defensive copy so callers cannot mutate
+			// the cache's backing array.
+			result := make([]Operator, len(entry.operators))
+			copy(result, entry.operators)
+			operatorCacheMu.RUnlock()
+			return result
+		}
 	}
 	operatorCacheMu.RUnlock()
 
-	// Cache miss — fetch from cluster with retry for transient errors
-	operators, err := h.fetchOperatorsFromCluster(ctx, cluster)
-	if err != nil {
-		// Permanent errors (cluster lacks OLM) — cache empty result
-		if _, ok := err.(errPermanent); ok {
-			operatorCacheMu.Lock()
-			operatorCacheData[cacheKey] = &operatorCacheEntry{
-				operators: []Operator{},
-				fetchedAt: time.Now(),
+	// Cache miss — use singleflight to coalesce concurrent fetches for the
+	// same cluster, preventing the check-then-act race (#7783).
+	type fetchResult struct {
+		operators []Operator
+	}
+	val, _, _ := operatorFetchGroup.Do(cacheKey, func() (interface{}, error) {
+		// Double-check cache inside singleflight in case another goroutine
+		// populated it between our RUnlock and the singleflight call.
+		operatorCacheMu.RLock()
+		if entry, ok := operatorCacheData[cacheKey]; ok {
+			ttl := operatorCacheTTL
+			if len(entry.operators) == 0 {
+				ttl = operatorCacheEmptyTTL
 			}
-			operatorCacheMu.Unlock()
-			return []Operator{}
+			if time.Since(entry.fetchedAt) < ttl {
+				result := make([]Operator, len(entry.operators))
+				copy(result, entry.operators)
+				operatorCacheMu.RUnlock()
+				return &fetchResult{operators: result}, nil
+			}
 		}
-		// Retry once for transient errors (HTTP/2 stream errors, connection resets)
-		if ctx.Err() == nil {
-			slog.Error("[GitOps] retrying operator fetch after transient error", "cluster", cluster)
-			time.Sleep(gitopsRetryDelay)
-			operators, err = h.fetchOperatorsFromCluster(ctx, cluster)
+		operatorCacheMu.RUnlock()
+
+		// Detach from the caller's ctx so client disconnect does not abort the
+		// shared fetch for other waiters stuck in singleflight (#7855).
+		// WithoutCancel preserves values but strips cancellation; we then
+		// apply our own timeout so the fetch can't hang forever.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), operatorPerClusterTimeout)
+		defer cancel()
+
+		operators, err := h.fetchOperatorsFromCluster(fetchCtx, cluster)
+		if err != nil {
+			if _, ok := err.(errPermanent); ok {
+				operatorCacheMu.Lock()
+				operatorCacheData[cacheKey] = &operatorCacheEntry{
+					operators: []Operator{},
+					fetchedAt: time.Now(),
+				}
+				operatorCacheMu.Unlock()
+				return &fetchResult{operators: []Operator{}}, nil
+			}
+			if fetchCtx.Err() == nil {
+				slog.Warn("[GitOps] retrying operator fetch after transient error", "cluster", cluster)
+				time.Sleep(gitopsRetryDelay)
+				operators, err = h.fetchOperatorsFromCluster(fetchCtx, cluster)
+			}
+		}
+		if err != nil {
+			return &fetchResult{operators: []Operator{}}, nil
+		}
+
+		operatorCacheMu.Lock()
+		operatorCacheData[cacheKey] = &operatorCacheEntry{
+			operators: operators,
+			fetchedAt: time.Now(),
+		}
+		operatorCacheMu.Unlock()
+		return &fetchResult{operators: operators}, nil
+	})
+
+	return val.(*fetchResult).operators
+}
+
+// getOperatorsForClusterWithError returns operators plus any fetch error so
+// callers can surface per-cluster failures (#7544, #7546).
+// Uses singleflight to prevent check-then-act double-fetch race (#7783).
+func (h *GitOpsHandlers) getOperatorsForClusterWithError(ctx context.Context, cluster string) ([]Operator, error) {
+	cacheKey := cluster
+	if cacheKey == "" {
+		cacheKey = "__default__"
+	}
+
+	operatorCacheMu.RLock()
+	if entry, ok := operatorCacheData[cacheKey]; ok {
+		ttl := operatorCacheTTL
+		if len(entry.operators) == 0 {
+			ttl = operatorCacheEmptyTTL
+		}
+		if time.Since(entry.fetchedAt) < ttl {
+			// #7748: Return a defensive copy so callers cannot mutate
+			// the cache's backing array.
+			result := make([]Operator, len(entry.operators))
+			copy(result, entry.operators)
+			operatorCacheMu.RUnlock()
+			return result, nil
 		}
 	}
+	operatorCacheMu.RUnlock()
 
-	if err != nil {
-		// Transient failure — do NOT cache so next request retries
-		return []Operator{}
+	// Use singleflight to coalesce concurrent cache-miss fetches (#7783).
+	type fetchResult struct {
+		operators []Operator
+		err       error
 	}
+	val, _, _ := operatorFetchGroup.Do("err:"+cacheKey, func() (interface{}, error) {
+		// Double-check cache inside singleflight.
+		operatorCacheMu.RLock()
+		if entry, ok := operatorCacheData[cacheKey]; ok {
+			ttl := operatorCacheTTL
+			if len(entry.operators) == 0 {
+				ttl = operatorCacheEmptyTTL
+			}
+			if time.Since(entry.fetchedAt) < ttl {
+				result := make([]Operator, len(entry.operators))
+				copy(result, entry.operators)
+				operatorCacheMu.RUnlock()
+				return &fetchResult{operators: result}, nil
+			}
+		}
+		operatorCacheMu.RUnlock()
 
-	// Store in cache
-	operatorCacheMu.Lock()
-	operatorCacheData[cacheKey] = &operatorCacheEntry{
-		operators: operators,
-		fetchedAt: time.Now(),
-	}
-	operatorCacheMu.Unlock()
+		// Detach from the caller's ctx so client disconnect does not abort the
+		// shared fetch for other waiters stuck in singleflight (#7855).
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), operatorPerClusterTimeout)
+		defer cancel()
 
-	return operators
+		operators, err := h.fetchOperatorsFromCluster(fetchCtx, cluster)
+		if err != nil {
+			if _, ok := err.(errPermanent); ok {
+				operatorCacheMu.Lock()
+				operatorCacheData[cacheKey] = &operatorCacheEntry{operators: []Operator{}, fetchedAt: time.Now()}
+				operatorCacheMu.Unlock()
+				return &fetchResult{operators: []Operator{}}, nil
+			}
+			if fetchCtx.Err() == nil {
+				slog.Warn("[GitOps] retrying operator fetch after transient error", "cluster", cluster)
+				time.Sleep(gitopsRetryDelay)
+				operators, err = h.fetchOperatorsFromCluster(fetchCtx, cluster)
+			}
+		}
+		if err != nil {
+			return &fetchResult{operators: []Operator{}, err: err}, nil
+		}
+
+		operatorCacheMu.Lock()
+		operatorCacheData[cacheKey] = &operatorCacheEntry{operators: operators, fetchedAt: time.Now()}
+		operatorCacheMu.Unlock()
+		return &fetchResult{operators: operators}, nil
+	})
+
+	result := val.(*fetchResult)
+	return result.operators, result.err
 }
 
 // errPermanent wraps an error to indicate it should be cached (e.g., cluster lacks OLM).
@@ -741,7 +914,7 @@ func (h *GitOpsHandlers) fetchOperatorsFromCluster(ctx context.Context, cluster 
 	if err := cmd.Run(); err != nil {
 		stderrStr := stderr.String()
 		if ctx.Err() == nil {
-			slog.Error("[GitOps] kubectl get csv failed", "cluster", cluster, "error", err, "stderr", stderrStr)
+			slog.Warn("[GitOps] kubectl get csv failed", "cluster", cluster, "error", err, "stderr", stderrStr)
 		} else {
 			slog.Info("[GitOps] kubectl get csv timed out", "cluster", cluster)
 		}
@@ -770,7 +943,7 @@ func (h *GitOpsHandlers) fetchOperatorsFromCluster(ctx context.Context, cluster 
 	}
 
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		slog.Error("[GitOps] failed to parse operators JSON", "cluster", cluster, "error", err)
+		slog.Warn("[GitOps] failed to parse operators JSON", "cluster", cluster, "error", err)
 		return nil, err
 	}
 
@@ -797,23 +970,37 @@ func (h *GitOpsHandlers) fetchOperatorsFromCluster(ctx context.Context, cluster 
 func (h *GitOpsHandlers) ListOperatorSubscriptions(c *fiber.Ctx) error {
 	cluster := c.Query("cluster")
 
+	// SECURITY: Validate cluster name before passing to kubectl CLI
+	if cluster != "" {
+		if err := validateK8sName(cluster, "cluster"); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	if cluster != "" {
 		ctx, cancel := context.WithTimeout(c.Context(), subscriptionPerClusterTimeout)
 		defer cancel()
-		subs := h.getSubscriptionsForCluster(ctx, cluster)
-		return c.JSON(fiber.Map{"subscriptions": subs})
+		subs, fetchErr := h.getSubscriptionsForClusterWithError(ctx, cluster)
+		resp := fiber.Map{"subscriptions": subs}
+		if fetchErr != nil {
+			resp["clusterErrors"] = []string{fmt.Sprintf("%s: %v", cluster, fetchErr)}
+		}
+		return c.JSON(resp)
 	}
 
 	if h.k8sClient != nil {
 		clusters, _, err := h.k8sClient.HealthyClusters(c.Context())
 		if err != nil {
-			slog.Info("[GitOps] error listing healthy clusters for subscriptions", "error", err)
+			slog.Warn("[GitOps] error listing healthy clusters for subscriptions", "error", err)
 			return c.Status(500).JSON(fiber.Map{"error": "internal server error", "subscriptions": []OperatorSubscription{}})
 		}
 
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		allSubs := make([]OperatorSubscription, 0)
+		// #7545: Surface per-cluster errors so the frontend can indicate
+		// which clusters failed rather than showing a silent empty state.
+		var clusterErrors []string
 
 		for _, cl := range clusters {
 			wg.Add(1)
@@ -824,17 +1011,24 @@ func (h *GitOpsHandlers) ListOperatorSubscriptions(c *fiber.Ctx) error {
 				ctx, cancel := context.WithTimeout(c.Context(), subscriptionPerClusterTimeout)
 				defer cancel()
 
-				subs := h.getSubscriptionsForCluster(ctx, clusterName)
-				if len(subs) > 0 {
-					mu.Lock()
-					allSubs = append(allSubs, subs...)
-					mu.Unlock()
+				subs, fetchErr := h.getSubscriptionsForClusterWithError(ctx, clusterName)
+				mu.Lock()
+				if fetchErr != nil {
+					clusterErrors = append(clusterErrors, fmt.Sprintf("%s: %v", clusterName, fetchErr))
 				}
+				if len(subs) > 0 {
+					allSubs = append(allSubs, subs...)
+				}
+				mu.Unlock()
 			}(cl.Name)
 		}
 
 		wg.Wait()
-		return c.JSON(fiber.Map{"subscriptions": allSubs})
+		resp := fiber.Map{"subscriptions": allSubs}
+		if len(clusterErrors) > 0 {
+			resp["clusterErrors"] = clusterErrors
+		}
+		return c.JSON(resp)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), subscriptionPerClusterTimeout)
@@ -852,8 +1046,10 @@ func (h *GitOpsHandlers) StreamOperatorSubscriptions(c *fiber.Ctx) error {
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
+		return errNoClusterAccess(c)
 	}
+
+	requestCtx := c.UserContext()
 
 	if cluster != "" {
 		c.Set("Content-Type", "text/event-stream")
@@ -862,7 +1058,7 @@ func (h *GitOpsHandlers) StreamOperatorSubscriptions(c *fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 			writeSSEEvent(w, "connected", fiber.Map{"status": "streaming"})
-			ctx, cancel := context.WithTimeout(context.Background(), subscriptionPerClusterTimeout)
+			ctx, cancel := context.WithTimeout(requestCtx, subscriptionPerClusterTimeout)
 			defer cancel()
 			subs := h.getSubscriptionsForCluster(ctx, cluster)
 			writeSSEEvent(w, "cluster_data", fiber.Map{
@@ -899,17 +1095,26 @@ func (h *GitOpsHandlers) StreamOperatorSubscriptions(c *fiber.Ctx) error {
 				defer wg.Done()
 				subprocessSem <- struct{}{}        // acquire
 				defer func() { <-subprocessSem }() // release
-				ctx, cancel := context.WithTimeout(context.Background(), subscriptionPerClusterTimeout)
+				ctx, cancel := context.WithTimeout(requestCtx, subscriptionPerClusterTimeout)
 				defer cancel()
 
-				subs := h.getSubscriptionsForCluster(ctx, clusterName)
+				subs, fetchErr := h.getSubscriptionsForClusterWithError(ctx, clusterName)
 				mu.Lock()
 				completedClusters++
-				writeSSEEvent(w, "cluster_data", fiber.Map{
-					"cluster":       clusterName,
-					"subscriptions": subs,
-					"source":        "k8s",
-				})
+				// #7546: Emit cluster_error when a fetch fails so the frontend
+				// can distinguish "no subscriptions" from "query failed".
+				if fetchErr != nil {
+					writeSSEEvent(w, sseEventClusterError, fiber.Map{
+						"cluster": clusterName,
+						"error":   fetchErr.Error(),
+					})
+				} else {
+					writeSSEEvent(w, "cluster_data", fiber.Map{
+						"cluster":       clusterName,
+						"subscriptions": subs,
+						"source":        "k8s",
+					})
+				}
 				mu.Unlock()
 			}(cl.Name)
 		}
@@ -924,8 +1129,30 @@ func (h *GitOpsHandlers) StreamOperatorSubscriptions(c *fiber.Ctx) error {
 	return nil
 }
 
-// getSubscriptionsForCluster gets OLM subscriptions for a specific cluster using jsonpath
+// getSubscriptionsForClusterWithError wraps getSubscriptionsForCluster and
+// surfaces the fetch error so callers can report per-cluster failures (#7545).
+func (h *GitOpsHandlers) getSubscriptionsForClusterWithError(ctx context.Context, cluster string) ([]OperatorSubscription, error) {
+	subs, err := h.fetchSubscriptionsFromCluster(ctx, cluster)
+	if err != nil {
+		return []OperatorSubscription{}, err
+	}
+	return subs, nil
+}
+
+// getSubscriptionsForCluster gets OLM subscriptions for a specific cluster using jsonpath.
+// #7749: Errors are logged instead of silently discarded so cluster failures
+// are distinguishable from empty results in server logs.
 func (h *GitOpsHandlers) getSubscriptionsForCluster(ctx context.Context, cluster string) []OperatorSubscription {
+	subs, err := h.fetchSubscriptionsFromCluster(ctx, cluster)
+	if err != nil {
+		slog.Warn("[GitOps] subscription fetch failed for cluster", "cluster", cluster, "error", err)
+	}
+	return subs
+}
+
+// fetchSubscriptionsFromCluster is the underlying implementation that returns
+// both the subscription list and any error encountered.
+func (h *GitOpsHandlers) fetchSubscriptionsFromCluster(ctx context.Context, cluster string) ([]OperatorSubscription, error) {
 	jsonpathExpr := `{range .items[*]}{.metadata.name}{"\t"}{.metadata.namespace}{"\t"}{.spec.channel}{"\t"}{.spec.source}{"\t"}{.spec.installPlanApproval}{"\t"}{.status.currentCSV}{"\t"}{.status.installedCSV}{"\n"}{end}`
 	args := []string{"get", "subscriptions.operators.coreos.com", "-A", "-o", "jsonpath=" + jsonpathExpr}
 	if cluster != "" {
@@ -939,14 +1166,14 @@ func (h *GitOpsHandlers) getSubscriptionsForCluster(ctx context.Context, cluster
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == nil {
-			slog.Error("[GitOps] kubectl get subscriptions failed", "cluster", cluster, "error", err)
+			slog.Warn("[GitOps] kubectl get subscriptions failed", "cluster", cluster, "error", err)
 		}
-		return []OperatorSubscription{}
+		return []OperatorSubscription{}, err
 	}
 
 	output := strings.TrimSpace(stdout.String())
 	if output == "" {
-		return []OperatorSubscription{}
+		return []OperatorSubscription{}, nil
 	}
 
 	lines := strings.Split(output, "\n")
@@ -971,11 +1198,16 @@ func (h *GitOpsHandlers) getSubscriptionsForCluster(ctx context.Context, cluster
 		}
 		if len(fields) > 6 {
 			sub.InstalledCSV = fields[6]
+			// #7548: When installedCSV lags behind currentCSV, there is a
+			// pending upgrade waiting for approval (Manual installPlanApproval).
+			if sub.InstalledCSV != "" && sub.InstalledCSV != sub.CurrentCSV {
+				sub.PendingUpgrade = sub.CurrentCSV
+			}
 		}
 		subs = append(subs, sub)
 	}
 
-	return subs
+	return subs, nil
 }
 
 // StreamHelmReleases streams helm releases per cluster via SSE
@@ -987,8 +1219,10 @@ func (h *GitOpsHandlers) StreamHelmReleases(c *fiber.Ctx) error {
 	}
 
 	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{"error": "No cluster access"})
+		return errNoClusterAccess(c)
 	}
+
+	requestCtx := c.UserContext()
 
 	if cluster != "" {
 		c.Set("Content-Type", "text/event-stream")
@@ -997,7 +1231,7 @@ func (h *GitOpsHandlers) StreamHelmReleases(c *fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 			writeSSEEvent(w, "connected", fiber.Map{"status": "streaming"})
-			ctx, cancel := context.WithTimeout(context.Background(), helmStreamPerClusterTimeout)
+			ctx, cancel := context.WithTimeout(requestCtx, helmStreamPerClusterTimeout)
 			defer cancel()
 			releases := h.getHelmReleasesForCluster(ctx, cluster)
 			writeSSEEvent(w, "cluster_data", fiber.Map{
@@ -1034,7 +1268,7 @@ func (h *GitOpsHandlers) StreamHelmReleases(c *fiber.Ctx) error {
 				defer wg.Done()
 				subprocessSem <- struct{}{}        // acquire
 				defer func() { <-subprocessSem }() // release
-				ctx, cancel := context.WithTimeout(context.Background(), helmStreamPerClusterTimeout)
+				ctx, cancel := context.WithTimeout(requestCtx, helmStreamPerClusterTimeout)
 				defer cancel()
 
 				releases := h.getHelmReleasesForCluster(ctx, clusterName)
@@ -1076,58 +1310,12 @@ func getDemoHelmReleasesForStreaming() []HelmRelease {
 	}
 }
 
-// DetectDrift detects drift between git and cluster state
-func (h *GitOpsHandlers) DetectDrift(c *fiber.Ctx) error {
-	// #6022 — drift detection is read-oriented (it diffs git vs. live cluster)
-	// so it is gated as "viewer-or-above" rather than admin-only. This still
-	// blocks anonymous/unknown callers and any user who isn't registered in
-	// the console user store, but allows editors and viewers to see drift
-	// reports without needing the admin role.
-	if err := requireViewerOrAbove(c, h.userStore); err != nil {
-		return err
-	}
-
-	var req DetectDriftRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.RepoURL == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "repoUrl is required"})
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), gitopsDefaultTimeout)
-	defer cancel()
-
-	// Try MCP bridge first (detect_drift tool from kubestellar-ops)
-	if h.bridge != nil {
-		result, err := h.detectDriftViaMCP(ctx, req)
-		if err == nil {
-			h.rememberDrift(req, result)
-			return c.JSON(result)
-		}
-		slog.Error("[GitOps] MCP detect_drift failed, falling back to kubectl", "error", err)
-	}
-
-	// Fall back to kubectl diff
-	result, err := h.detectDriftViaKubectl(ctx, req)
-	if err != nil {
-		// #5959 — Invalid YAML in the GitOps repo was previously masked as a
-		// generic "internal error". Surface a structured parse error with the
-		// raw kubectl stderr so users can fix their manifests.
-		if yamlErr := extractYAMLParseError(err); yamlErr != "" {
-			return c.Status(422).JSON(fiber.Map{
-				"error":     "invalid YAML in GitOps source",
-				"errorType": "yaml_parse",
-				"details":   yamlErr,
-			})
-		}
-		return handleK8sError(c, err)
-	}
-
-	h.rememberDrift(req, result)
-	return c.JSON(result)
-}
+// DetectDrift was removed in #7993 Phase 4 — this user-initiated operation
+// now runs through kc-agent at POST /gitops/detect-drift under the user's
+// kubeconfig. See pkg/agent/server_gitops.go. The read-only GET ListDrifts
+// endpoint that backs the UI drift card stays, but the cache it reads from
+// is no longer populated by this backend process (kc-agent instances populate
+// their own local caches where applicable).
 
 // extractYAMLParseError pattern-matches kubectl/yaml parser error messages
 // and returns a cleaned-up description, or "" if the error does not look
@@ -1236,6 +1424,11 @@ func (h *GitOpsHandlers) detectDriftViaKubectl(ctx context.Context, req DetectDr
 		}
 	}
 
+	// Validate path parameter to prevent path traversal attacks
+	if err := validatePath(req.Path); err != nil {
+		return nil, fmt.Errorf("invalid path: %w", err)
+	}
+
 	// Clone the repo to a temp directory
 	tempDir, err := cloneRepo(ctx, req.RepoURL, req.Branch)
 	if err != nil {
@@ -1297,46 +1490,9 @@ func (h *GitOpsHandlers) detectDriftViaKubectl(ctx context.Context, req DetectDr
 	return response, nil
 }
 
-// Sync applies manifests from git to the cluster
-func (h *GitOpsHandlers) Sync(c *fiber.Ctx) error {
-	// #6022 — GitOps sync mutates cluster state via kubectl apply (or MCP
-	// deploy). Viewers must be blocked, but editors are expected to drive
-	// day-to-day sync operations so the gate is editor-or-admin (not
-	// admin-only). Anonymous callers and users missing from the store are
-	// rejected with 403 by the shared helper.
-	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
-		return err
-	}
-
-	var req SyncRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.RepoURL == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "repoUrl is required"})
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), gitopsDefaultTimeout)
-	defer cancel()
-
-	// Try MCP bridge first
-	if h.bridge != nil {
-		result, err := h.syncViaMCP(ctx, req)
-		if err == nil {
-			return c.JSON(result)
-		}
-		slog.Error("[GitOps] MCP sync failed, falling back to kubectl", "error", err)
-	}
-
-	// Fall back to kubectl apply
-	result, err := h.syncViaKubectl(ctx, req)
-	if err != nil {
-		return handleK8sError(c, err)
-	}
-
-	return c.JSON(result)
-}
+// Sync was removed in #7993 Phase 4 — this user-initiated operation now runs
+// through kc-agent at POST /gitops/sync under the user's kubeconfig. See
+// pkg/agent/server_gitops.go#handleGitopsSync.
 
 // syncViaMCP uses kubestellar-deploy for sync
 func (h *GitOpsHandlers) syncViaMCP(ctx context.Context, req SyncRequest) (*SyncResponse, error) {
@@ -1404,6 +1560,11 @@ func (h *GitOpsHandlers) syncViaKubectl(ctx context.Context, req SyncRequest) (*
 		if err := validateK8sName(val, field); err != nil {
 			return nil, fmt.Errorf("invalid %s: %w", field, err)
 		}
+	}
+
+	// Validate path parameter to prevent path traversal attacks
+	if err := validatePath(req.Path); err != nil {
+		return nil, fmt.Errorf("invalid path: %w", err)
 	}
 
 	// Clone the repo
@@ -1603,6 +1764,35 @@ func validateBranchName(branch string) error {
 	return nil
 }
 
+// validatePath validates a repository path parameter.
+// SECURITY: Prevents path traversal attacks and flag injection.
+func validatePath(path string) error {
+	if path == "" {
+		return nil // Empty path is OK - refers to repo root
+	}
+	// Block null bytes
+	if strings.ContainsRune(path, 0) {
+		return fmt.Errorf("path contains null bytes")
+	}
+	// Only allow alphanumeric, -, _, /, . (common in git repo paths)
+	for _, char := range path {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '/' || char == '.') {
+			return fmt.Errorf("invalid character in path: %c", char)
+		}
+	}
+	// Block dangerous patterns
+	if strings.HasPrefix(path, "-") {
+		return fmt.Errorf("path cannot start with '-'")
+	}
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("path traversal (..) is not allowed")
+	}
+	return nil
+}
+
 func cloneRepo(ctx context.Context, repoURL, branch string) (string, error) {
 	// SECURITY: Validate inputs before executing
 	if err := validateRepoURL(repoURL); err != nil {
@@ -1658,7 +1848,7 @@ func cleanupTempDir(dir string) {
 
 	// Use os.RemoveAll instead of shell command for safety
 	if err := os.RemoveAll(dir); err != nil {
-		slog.Error("[GitOps] failed to cleanup temp directory", "dir", dir, "error", err)
+		slog.Warn("[GitOps] failed to cleanup temp directory", "dir", dir, "error", err)
 	}
 }
 
@@ -1869,13 +2059,13 @@ func (h *GitOpsHandlers) ListHelmHistory(c *fiber.Ctx) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] helm history failed", "release", release, "error", err, "stderr", stderr.String())
+		slog.Warn("[GitOps] helm history failed", "release", release, "error", err, "stderr", stderr.String())
 		return c.JSON(fiber.Map{"history": []HelmHistoryEntry{}, "error": stderr.String()})
 	}
 
 	history := make([]HelmHistoryEntry, 0)
 	if err := json.Unmarshal(stdout.Bytes(), &history); err != nil {
-		slog.Error("[GitOps] failed to parse helm history output", "release", release, "error", err)
+		slog.Warn("[GitOps] failed to parse helm history output", "release", release, "error", err)
 		return c.JSON(fiber.Map{"history": []HelmHistoryEntry{}, "error": "failed to parse history"})
 	}
 
@@ -1923,7 +2113,7 @@ func (h *GitOpsHandlers) GetHelmValues(c *fiber.Ctx) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] helm get values failed", "release", release, "error", err, "stderr", stderr.String())
+		slog.Warn("[GitOps] helm get values failed", "release", release, "error", err, "stderr", stderr.String())
 		return c.JSON(fiber.Map{"values": map[string]interface{}{}, "error": stderr.String()})
 	}
 
@@ -1956,229 +2146,54 @@ func (h *GitOpsHandlers) findReleaseNamespace(ctx context.Context, cluster, rele
 // Helm Write Operations
 // ============================================================================
 
-/** helmWriteTimeout is the timeout for helm write operations (rollback, uninstall, upgrade). */
-const helmWriteTimeout = 60 * time.Second
+// helmOperationTimeout is the server-side ceiling for detached helm write
+// operations. #6592: helm install/upgrade/uninstall/rollback must complete
+// even when the HTTP client disconnects mid-flight, so we run them in a
+// context that's decoupled from the Fiber request context. Must be generous
+// enough for large charts with many hooks/CRDs to finish, yet bounded so a
+// wedged helm subprocess can't run forever.
+const helmOperationTimeout = 10 * time.Minute
 
-// HelmRollbackRequest is the request body for rolling back a release
-type HelmRollbackRequest struct {
-	Release   string `json:"release"`
-	Namespace string `json:"namespace"`
-	Cluster   string `json:"cluster"`
-	Revision  int    `json:"revision"`
+// detachedHelmContext returns a context suitable for state-mutating helm
+// subprocesses (install, upgrade, uninstall, rollback). The returned context
+// has these semantics:
+//
+//   - Values (trace IDs, logging tags, any other ctx.Value lookups) are
+//     inherited from the request context via context.WithoutCancel.
+//   - Cancellation is NOT inherited: when the client disconnects and the
+//     request context is cancelled, the helm subprocess keeps running.
+//     Otherwise a user closing their browser tab mid-install would SIGKILL
+//     the helm process and orphan the release in `pending-install`,
+//     deadlocking future operations on that namespace until the release
+//     lock is cleared manually.
+//   - The request context's deadline is NOT inherited either — context.WithoutCancel
+//     strips both cancellation and deadline. We then wrap the detached
+//     context in context.WithTimeout(helmOperationTimeout) so the detached
+//     operation still has a server-side ceiling independent of whatever
+//     deadline the client set.
+//
+// #6600: an earlier version of this comment incorrectly claimed WithoutCancel
+// preserves "deadlines-as-values" from the request context. It does not —
+// WithoutCancel preserves only Value lookups and explicitly drops both
+// cancellation and any deadline.
+//
+// Read-only operations (helm ls, helm get, helm history, helm template) must
+// NOT use this helper — they should remain bound to the request context so a
+// disconnected client cancels the work promptly. See #6592.
+func detachedHelmContext(c *fiber.Ctx) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(
+		context.WithoutCancel(c.UserContext()),
+		helmOperationTimeout,
+	)
 }
 
-// HelmUninstallRequest is the request body for uninstalling a release
-type HelmUninstallRequest struct {
-	Release   string `json:"release"`
-	Namespace string `json:"namespace"`
-	Cluster   string `json:"cluster"`
-}
-
-// HelmUpgradeRequest is the request body for upgrading a release
-type HelmUpgradeRequest struct {
-	Release     string `json:"release"`
-	Namespace   string `json:"namespace"`
-	Cluster     string `json:"cluster"`
-	Chart       string `json:"chart"`
-	Version     string `json:"version,omitempty"`
-	Values      string `json:"values,omitempty"` // YAML string of override values
-	ReuseValues bool   `json:"reuseValues,omitempty"`
-}
-
-// RollbackHelmRelease rolls back a Helm release to a specific revision
-func (h *GitOpsHandlers) RollbackHelmRelease(c *fiber.Ctx) error {
-	// Helm rollback mutates cluster state; gated as editor-or-admin (#6022).
-	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
-		return err
-	}
-	var req HelmRollbackRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.Release == "" || req.Namespace == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "release and namespace are required"})
-	}
-	if req.Revision <= 0 {
-		return c.Status(400).JSON(fiber.Map{"error": "revision must be a positive integer"})
-	}
-
-	// SECURITY: Validate all user-supplied params before passing to helm CLI
-	for field, val := range map[string]string{"cluster": req.Cluster, "release": req.Release, "namespace": req.Namespace} {
-		if err := validateK8sName(val, field); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-		}
-	}
-
-	args := []string{"rollback", req.Release, fmt.Sprintf("%d", req.Revision), "-n", req.Namespace}
-	if req.Cluster != "" {
-		args = append(args, "--kube-context", req.Cluster)
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), helmWriteTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "helm", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	slog.Info("[GitOps] helm rollback", "release", req.Release, "revision", req.Revision, "cluster", req.Cluster, "namespace", req.Namespace)
-
-	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] helm rollback failed", "release", req.Release, "error", err, "stderr", stderr.String())
-		return c.Status(500).JSON(fiber.Map{
-			"error":  "rollback failed",
-			"detail": stderr.String(),
-		})
-	}
-
-	slog.Info("[GitOps] helm rollback succeeded", "release", req.Release, "revision", req.Revision)
-	return c.JSON(fiber.Map{
-		"success": true,
-		"message": fmt.Sprintf("Rolled back %s to revision %d", req.Release, req.Revision),
-		"output":  stdout.String(),
-	})
-}
-
-// UninstallHelmRelease uninstalls a Helm release
-func (h *GitOpsHandlers) UninstallHelmRelease(c *fiber.Ctx) error {
-	// Helm uninstall destroys cluster resources; gated as editor-or-admin (#6022).
-	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
-		return err
-	}
-	var req HelmUninstallRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.Release == "" || req.Namespace == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "release and namespace are required"})
-	}
-
-	// SECURITY: Validate all user-supplied params before passing to helm CLI
-	for field, val := range map[string]string{"cluster": req.Cluster, "release": req.Release, "namespace": req.Namespace} {
-		if err := validateK8sName(val, field); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-		}
-	}
-
-	args := []string{"uninstall", req.Release, "-n", req.Namespace}
-	if req.Cluster != "" {
-		args = append(args, "--kube-context", req.Cluster)
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), helmWriteTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "helm", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	slog.Info("[GitOps] helm uninstall", "release", req.Release, "cluster", req.Cluster, "namespace", req.Namespace)
-
-	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] helm uninstall failed", "release", req.Release, "error", err, "stderr", stderr.String())
-		return c.Status(500).JSON(fiber.Map{
-			"error":  "uninstall failed",
-			"detail": stderr.String(),
-		})
-	}
-
-	slog.Info("[GitOps] helm uninstall succeeded", "release", req.Release)
-	return c.JSON(fiber.Map{
-		"success": true,
-		"message": fmt.Sprintf("Uninstalled release %s", req.Release),
-		"output":  stdout.String(),
-	})
-}
-
-// UpgradeHelmRelease upgrades a Helm release
-func (h *GitOpsHandlers) UpgradeHelmRelease(c *fiber.Ctx) error {
-	// Helm upgrade mutates cluster state; gated as editor-or-admin (#6022).
-	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
-		return err
-	}
-	var req HelmUpgradeRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.Release == "" || req.Namespace == "" || req.Chart == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "release, namespace, and chart are required"})
-	}
-
-	// SECURITY: Validate all user-supplied params before passing to helm CLI
-	for field, val := range map[string]string{"cluster": req.Cluster, "release": req.Release, "namespace": req.Namespace} {
-		if err := validateK8sName(val, field); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-		}
-	}
-	if err := validateHelmChart(req.Chart); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-	}
-	if err := validateHelmVersion(req.Version); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	args := []string{"upgrade", req.Release, req.Chart, "-n", req.Namespace}
-	if req.Version != "" {
-		args = append(args, "--version", req.Version)
-	}
-	if req.ReuseValues {
-		args = append(args, "--reuse-values")
-	}
-	if req.Cluster != "" {
-		args = append(args, "--kube-context", req.Cluster)
-	}
-
-	ctx, cancel := context.WithTimeout(c.Context(), helmWriteTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "helm", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	// If values provided, write to temp file and pass via -f
-	if req.Values != "" {
-		tmpFile, err := os.CreateTemp("", "helm-values-*.yaml")
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "failed to create temp values file"})
-		}
-		defer os.Remove(tmpFile.Name())
-
-		if _, err := tmpFile.WriteString(req.Values); err != nil {
-			tmpFile.Close()
-			return c.Status(500).JSON(fiber.Map{"error": "failed to write values"})
-		}
-		tmpFile.Close()
-
-		args = append(args, "-f", tmpFile.Name())
-		// Rebuild command with values file
-		cmd = exec.CommandContext(ctx, "helm", args...)
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-	}
-
-	slog.Info("[GitOps] helm upgrade", "release", req.Release, "chart", req.Chart, "cluster", req.Cluster, "namespace", req.Namespace)
-
-	if err := cmd.Run(); err != nil {
-		slog.Error("[GitOps] helm upgrade failed", "release", req.Release, "error", err, "stderr", stderr.String())
-		return c.Status(500).JSON(fiber.Map{
-			"error":  "upgrade failed",
-			"detail": stderr.String(),
-		})
-	}
-
-	slog.Info("[GitOps] helm upgrade succeeded", "release", req.Release)
-	return c.JSON(fiber.Map{
-		"success": true,
-		"message": fmt.Sprintf("Upgraded release %s", req.Release),
-		"output":  stdout.String(),
-	})
-}
+// RollbackHelmRelease, UninstallHelmRelease, and UpgradeHelmRelease were
+// removed in #7993 Phase 4 — these user-initiated helm operations now run
+// through kc-agent at /helm/rollback, /helm/uninstall, /helm/upgrade under
+// the user's kubeconfig instead of the backend pod ServiceAccount. See
+// pkg/agent/server_helm.go. The associated request-body types
+// (HelmRollbackRequest, HelmUninstallRequest, HelmUpgradeRequest) were
+// backend-private and went with the handlers.
 
 // ============================================================================
 // ArgoCD Endpoints
@@ -2328,191 +2343,15 @@ func (h *GitOpsHandlers) GetArgoSyncSummary(c *fiber.Ctx) error {
 	})
 }
 
-// TriggerArgoSync triggers a sync operation for an ArgoCD Application.
-// Tries ArgoCD REST API first (if ARGOCD_AUTH_TOKEN is set), then CLI, then annotation patching.
-// POST /api/gitops/argocd/sync
-func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {
-	// #6022 — ArgoCD sync forces reconciliation against the target cluster
-	// and is equivalent to any other mutating sync operation. Gated as
-	// editor-or-admin: editors drive routine sync operations, viewers are
-	// blocked because they should only observe state, not force changes.
-	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
-		return err
-	}
-
-	var req struct {
-		AppName   string `json:"appName"`
-		Namespace string `json:"namespace"`
-		Cluster   string `json:"cluster"`
-	}
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{
-			"error":   "Invalid request body",
-			"success": false,
-		})
-	}
-
-	// Body-shape validation runs BEFORE the k8s client availability check
-	// so RBAC + body-shape errors surface to the caller even when the
-	// cluster connection is unavailable. Mirrors the Sync /
-	// UpgradeHelmRelease ordering and is what the #6022 RBAC tests assume.
-	if req.AppName == "" || req.Cluster == "" {
-		return c.Status(400).JSON(fiber.Map{
-			"error":   "appName and cluster are required",
-			"success": false,
-		})
-	}
-
-	if err := validateK8sName(req.AppName, "appName"); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": err.Error(), "success": false})
-	}
-	if err := validateK8sName(req.Cluster, "cluster"); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": err.Error(), "success": false})
-	}
-
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"error":   "Kubernetes client not configured",
-			"success": false,
-		})
-	}
-
-	// Default namespace for ArgoCD applications
-	namespace := req.Namespace
-	if namespace == "" {
-		namespace = "argocd"
-	} else if err := validateK8sName(namespace, "namespace"); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": err.Error(), "success": false})
-	}
-
-	slog.Info("[ArgoCD] triggering sync", "namespace", namespace, "app", req.AppName, "cluster", req.Cluster)
-
-	// Strategy 1: Try ArgoCD REST API if auth token is configured
-	argoToken := os.Getenv("ARGOCD_AUTH_TOKEN")
-	if argoToken != "" {
-		argoServerURL := h.discoverArgoServerURL(c.Context(), req.Cluster)
-		if argoServerURL != "" {
-			syncURL := fmt.Sprintf("%s/api/v1/applications/%s/sync", argoServerURL, url.PathEscape(req.AppName))
-			syncBody := []byte(`{"prune":true}`)
-
-			httpReq, err := http.NewRequestWithContext(c.Context(), "POST", syncURL, bytes.NewReader(syncBody))
-			if err == nil {
-				httpReq.Header.Set("Authorization", "Bearer "+argoToken)
-				httpReq.Header.Set("Content-Type", "application/json")
-
-				skipVerify := os.Getenv("ARGOCD_TLS_INSECURE") == "true"
-				if skipVerify {
-					argoInsecureWarning.Do(func() {
-						slog.Warn("WARNING: ARGOCD_TLS_INSECURE=true — TLS certificate verification disabled for ArgoCD API calls. " +
-							"This should only be used in development/test environments with self-signed certificates.")
-					})
-				}
-				client := &http.Client{
-					Timeout: argocdQueryTimeout,
-					Transport: &http.Transport{
-						TLSClientConfig: &tls.Config{InsecureSkipVerify: skipVerify}, // #nosec G402 -- intentionally env-var-gated (ARGOCD_TLS_INSECURE) for self-signed certs in dev/test
-					},
-				}
-				resp, err := client.Do(httpReq)
-				if err == nil {
-					defer resp.Body.Close()
-					if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-						return c.JSON(fiber.Map{
-							"success": true,
-							"message": "Sync triggered via ArgoCD REST API",
-							"method":  "api",
-						})
-					}
-					slog.Info("[ArgoCD] API sync returned error status, falling back", "status", resp.StatusCode)
-				} else {
-					slog.Error("[ArgoCD] API sync failed, falling back", "error", err)
-				}
-			}
-		}
-	}
-
-	// Strategy 2: Use argocd CLI if available
-	if _, err := exec.LookPath("argocd"); err == nil {
-		cmd := exec.CommandContext(c.Context(), "argocd", "app", "sync", req.AppName,
-			"--namespace", namespace,
-			"--prune",
-			"--timeout", "30",
-		)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			slog.Error("[ArgoCD] CLI sync failed, falling back to annotation patching", "error", err, "output", string(output))
-		} else {
-			return c.JSON(fiber.Map{
-				"success": true,
-				"message": "Sync triggered via ArgoCD CLI",
-				"method":  "cli",
-			})
-		}
-	}
-
-	// Strategy 3: Fallback — annotate the Application to trigger a refresh
-	dynamicClient, err := h.k8sClient.GetDynamicClient(req.Cluster)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"error":   fmt.Sprintf("Failed to get dynamic client: %v", err),
-			"success": false,
-		})
-	}
-
-	// Fetch the current Application to patch it
-	ctx, cancel := context.WithTimeout(c.Context(), argocdQueryTimeout)
-	defer cancel()
-
-	app, err := dynamicClient.Resource(v1alpha1.ArgoApplicationGVR).Namespace(namespace).Get(ctx, req.AppName, metav1.GetOptions{})
-	if err != nil {
-		return c.Status(404).JSON(fiber.Map{
-			"error":   fmt.Sprintf("Application %s not found in %s/%s: %v", req.AppName, req.Cluster, namespace, err),
-			"success": false,
-		})
-	}
-
-	// Set the refresh annotation to trigger ArgoCD's reconciliation
-	annotations := app.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-	annotations["argocd.argoproj.io/refresh"] = "hard"
-	app.SetAnnotations(annotations)
-
-	// Also set the operation field to trigger a sync
-	content := app.UnstructuredContent()
-	operation := map[string]interface{}{
-		"initiatedBy": map[string]interface{}{
-			"username":  "kubestellar-console",
-			"automated": false,
-		},
-		"sync": map[string]interface{}{
-			"prune": true,
-		},
-	}
-	content["operation"] = operation
-	app.SetUnstructuredContent(content)
-
-	_, err = dynamicClient.Resource(v1alpha1.ArgoApplicationGVR).Namespace(namespace).Update(ctx, app, metav1.UpdateOptions{})
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"error":   fmt.Sprintf("Failed to trigger sync: %v", err),
-			"success": false,
-		})
-	}
-
-	return c.JSON(fiber.Map{
-		"success": true,
-		"message": "Sync triggered via Application resource annotation",
-		"method":  "annotation",
-	})
-}
+// TriggerArgoSync was removed in #7993 Phase 4 — this user-initiated
+// operation now runs through kc-agent at POST /argocd/sync under the user's
+// kubeconfig. See pkg/agent/server_argocd.go#handleArgoCDSync.
 
 // discoverArgoServerURL discovers the ArgoCD API server URL via K8s Service lookup
 func (h *GitOpsHandlers) discoverArgoServerURL(ctx context.Context, cluster string) string {
 	clientset, err := h.k8sClient.GetClient(cluster)
 	if err != nil {
-		slog.Error("[ArgoCD] server discovery failed: cannot get client", "cluster", cluster, "error", err)
+		slog.Warn("[ArgoCD] server discovery failed: cannot get client", "cluster", cluster, "error", err)
 		return ""
 	}
 

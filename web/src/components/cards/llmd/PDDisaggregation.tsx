@@ -5,6 +5,12 @@
  * with animated token transfer between stages.
  *
  * Uses live stack data when available, demo data when in demo mode.
+ *
+ * Issue 9071 (dark-mode pass): inline `style={{ backgroundColor }}` uses in
+ * this file are data-driven load-indicator colors (amber `#f59e0b` when
+ * `server.load > 70`, otherwise the prefill/decode brand `color`). These are
+ * accent indicators that read on both light and dark backgrounds — not
+ * candidates for `dark:` variants.
  */
 import { useState, useEffect, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -113,7 +119,7 @@ function ServerCard({ server, isHighlighted }: ServerCardProps) {
       animate={{ opacity: 1, y: 0 }}
       whileHover={{ scale: 1.02 }}
     >
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
         <span className="font-medium text-white text-sm">{server.name}</span>
         <div
           className="w-2 h-2 rounded-full"
@@ -332,7 +338,7 @@ export function PDDisaggregation() {
   return (
     <div className={`p-4 h-full flex-1 flex flex-col ${isExpanded ? 'min-h-[500px]' : ''}`}>
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
         <div className="flex items-center gap-2">
           <Split size={18} className="text-cyan-400" />
           <span className="font-medium text-white">{t('llmd.pdDisaggregation')}</span>
@@ -445,7 +451,7 @@ export function PDDisaggregation() {
             {/* Transfer zone */}
             <div className="w-20 flex flex-col items-center justify-center relative">
               <div className="absolute inset-0 flex items-center justify-center">
-                <div className="w-px h-full bg-gradient-to-b from-purple-500/20 via-cyan-500/40 to-green-500/20" />
+                <div className="w-px h-full bg-linear-to-b from-purple-500/20 via-cyan-500/40 to-green-500/20" />
               </div>
 
               {/* Animated packets */}

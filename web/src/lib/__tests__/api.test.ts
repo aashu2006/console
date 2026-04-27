@@ -4,6 +4,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 // Mocks — must be declared before importing the module under test
 // ---------------------------------------------------------------------------
 
+import { STORAGE_KEY_HAS_SESSION } from '../constants/storage'
+
 vi.mock('../constants', async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>
   return {
@@ -18,6 +20,7 @@ vi.mock('../constants', async (importOriginal) => {
 })
 
 vi.mock('../analytics', () => ({
+  emitError: vi.fn(),
   emitSessionExpired: vi.fn(),
 }))
 
@@ -354,12 +357,36 @@ describe('api.ts', () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health
         .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // 401
+        .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // /api/me verify probe (#8372)
 
       const { api, UnauthorizedError } = await importFresh()
       await expect(api.get('/api/data')).rejects.toThrow(UnauthorizedError)
 
-      expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBeNull()
+      // The 401 handler verifies the session via /api/me before clearing —
+      // wait for that microtask chain to resolve before asserting cleanup.
+      await vi.waitFor(() => {
+        expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBeNull()
+      })
       expect(localStorage.getItem(STORAGE_KEY_USER_CACHE)).toBeNull()
+    })
+
+    // A 401 from /api/github/* means the GitHub OAuth token is missing or
+    // expired — NOT that the user's console session is dead. The caller
+    // (e.g. Mission Browser) needs to handle it with a feature-local prompt
+    // instead of the whole app logging out. See api.ts:418-427.
+    it('does not clear auth state on 401 from /api/github/*', async () => {
+      localStorage.setItem(STORAGE_KEY_TOKEN, 'valid-token')
+      localStorage.setItem(STORAGE_KEY_USER_CACHE, '{"id":1}')
+
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health
+        .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // 401 on github path
+
+      const { api, UnauthorizedError } = await importFresh()
+      await expect(api.get('/api/github/repos/foo/bar/contents/x')).rejects.toThrow(UnauthorizedError)
+
+      expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBe('valid-token')
+      expect(localStorage.getItem(STORAGE_KEY_USER_CACHE)).toBe('{"id":1}')
     })
 
     it('handles 500 with error text', async () => {
@@ -393,20 +420,28 @@ describe('api.ts', () => {
       expect(isBackendUnavailable()).toBe(true)
     })
 
-    it('triggers token refresh when X-Token-Refresh header is present', async () => {
+    it('triggers silent token refresh when X-Token-Refresh header is present', async () => {
       localStorage.setItem(STORAGE_KEY_TOKEN, 'old-token')
       vi.mocked(fetch)
         .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health
         .mockResolvedValueOnce(makeResponse({ data: 'ok' }, { headers: { 'X-Token-Refresh': 'true' } })) // response with refresh header
-        .mockResolvedValueOnce(makeResponse({ token: 'new-token' })) // refresh endpoint
+        .mockResolvedValueOnce(makeResponse({ refreshed: true, onboarded: true })) // refresh endpoint (#6590 — no token in body)
 
       const { api } = await importFresh()
       await api.get('/api/data')
 
       // Wait for the async refresh to complete
       await vi.runAllTimersAsync()
-      // The token should be updated (refresh call happens in background)
-      expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBe('new-token')
+      // #6590 — /auth/refresh delivers the new JWT exclusively via the
+      // HttpOnly kc_auth cookie (not visible to this test's localStorage
+      // mock). The Bearer token in localStorage intentionally stays put —
+      // subsequent API requests send the fresh cookie automatically, and
+      // the stale-bearer-fallback in the auth middleware (#6026) handles
+      // the transition until localStorage catches up on next page load.
+      expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBe('old-token')
+      // Silent refresh also marks the persistent session hint so reloads
+      // know to attempt cookie restoration.
+      expect(localStorage.getItem(STORAGE_KEY_HAS_SESSION)).toBe('true')
     })
   })
 
@@ -434,6 +469,7 @@ describe('api.ts', () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health
         .mockResolvedValueOnce(makeResponse({}, { status: 401 }))
+        .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // /api/me verify probe (#8372)
 
       const { api, UnauthorizedError } = await importFresh()
       await expect(api.post('/api/items', {})).rejects.toThrow(UnauthorizedError)
@@ -479,6 +515,7 @@ describe('api.ts', () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health
         .mockResolvedValueOnce(makeResponse({}, { status: 401 }))
+        .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // /api/me verify probe (#8372)
 
       const { api, UnauthorizedError } = await importFresh()
       await expect(api.delete('/api/items/1')).rejects.toThrow(UnauthorizedError)
@@ -547,6 +584,7 @@ describe('api.ts', () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health for req 1
         .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // 401 for req 1
+        .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // /api/me verify probe (#8372)
         .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health for req 2
         .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // 401 for req 2
 
@@ -555,8 +593,33 @@ describe('api.ts', () => {
       // Both should throw but only one handle401 should fire
       await expect(api.get('/api/a')).rejects.toThrow()
 
-      // Token already cleared by first 401
-      expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBeNull()
+      // Token clearing is async (waits for /api/me verify probe) — poll.
+      await vi.waitFor(() => {
+        expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBeNull()
+      })
+    })
+
+    // #8372 — a 401 from one endpoint must NOT nuke the session if /api/me
+    // still returns 200. Otherwise the user gets bounced to /login with a
+    // stale ?reason=session_expired param on refresh, even though their
+    // cookie is still valid.
+    it('does NOT clear auth state when /api/me still returns 200', async () => {
+      localStorage.setItem(STORAGE_KEY_TOKEN, 'still-valid-token')
+      localStorage.setItem(STORAGE_KEY_USER_CACHE, '{"id":1}')
+
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(makeResponse({ status: 'ok' })) // health
+        .mockResolvedValueOnce(makeResponse({}, { status: 401 })) // endpoint 401
+        .mockResolvedValueOnce(makeResponse({ id: 1 }, { status: 200 })) // /api/me OK
+
+      const { api, UnauthorizedError } = await importFresh()
+      await expect(api.get('/api/some-scoped-route')).rejects.toThrow(UnauthorizedError)
+
+      // Drain microtasks so the verify-probe promise chain settles under
+      // fake timers. Token should remain because /api/me returned 200.
+      await vi.advanceTimersByTimeAsync(100)
+      expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBe('still-valid-token')
+      expect(localStorage.getItem(STORAGE_KEY_USER_CACHE)).toBe('{"id":1}')
     })
   })
 })

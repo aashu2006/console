@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { ChevronRight, ChevronDown, Server, Box, Layers, Database, Network, HardDrive, Search, AlertTriangle, XCircle } from 'lucide-react'
 import { StatusBadge } from '../../ui/StatusBadge'
-import { useClusterHealth, usePodIssues, useDeploymentIssues, useGPUNodes, useNodes, useNamespaces, useDeployments, useServices, usePVCs, useEvents } from '../../../hooks/useMCP'
+import { useClusterHealth, usePodIssues, useDeploymentIssues, useGPUNodes, useNodes, useNamespaces, useDeployments, useServices, useEvents } from '../../../hooks/useMCP'
+import { useCachedPVCs } from '../../../hooks/useCachedData'
 import { useDrillDownActions } from '../../../hooks/useDrillDown'
 import { StatusIndicator } from '../../charts/StatusIndicator'
 import { Gauge } from '../../charts/Gauge'
@@ -13,6 +14,9 @@ import { LOADING_TIMEOUT_MS } from '../../../lib/constants/network'
 type TreeLens = 'all' | 'issues' | 'nodes' | 'workloads' | 'storage' | 'network'
 type ClusterTab = 'events' | 'resources'
 
+/** Scroll delay (ms) to let the DOM update after switching tabs */
+const SCROLL_AFTER_TAB_SWITCH_MS = 100
+
 interface Props {
   data: Record<string, unknown>
 }
@@ -20,13 +24,37 @@ interface Props {
 export function ClusterDrillDown({ data }: Props) {
   const { t } = useTranslation()
   const clusterName = (data.cluster as string) || ''
-  const { drillToNamespace, drillToPod, drillToGPUNode, drillToEvents } = useDrillDownActions()
+  const { drillToNamespace, drillToPod, drillToGPUNode, drillToEvents, drillToNode } = useDrillDownActions()
 
   // Tree view state
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['cluster', 'nodes', 'namespaces']))
   const [searchFilter, setSearchFilter] = useState('')
   const [activeLens, setActiveLens] = useState<TreeLens>('all')
   const [activeTab, setActiveTab] = useState<ClusterTab>('events')
+  const resourceTreeRef = useRef<HTMLDivElement>(null)
+
+  /**
+   * Navigate to the Resource Tree tab with a given lens active.
+   *
+   * Scrolls the tab container (not an inner branch) into view so the user
+   * sees the lens buttons and the filtered branch together — keeping this
+   * flow consistent with clicking a lens button directly inside the tab.
+   */
+  const navigateToResourceTree = useCallback((lens: TreeLens) => {
+    setActiveTab('resources')
+    setActiveLens(lens)
+    setExpandedSections(prev => {
+      const next = new Set(prev)
+      next.add('cluster')
+      if (lens === 'nodes') next.add('nodes')
+      if (lens === 'workloads') next.add('namespaces')
+      return next
+    })
+    // Allow DOM to update before scrolling
+    setTimeout(() => {
+      resourceTreeRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }, SCROLL_AFTER_TAB_SWITCH_MS)
+  }, [])
 
   // Safeguard timeout to prevent infinite loading - show content after 5 seconds max
   const [loadingTimedOut, setLoadingTimedOut] = useState(false)
@@ -46,7 +74,7 @@ export function ClusterDrillDown({ data }: Props) {
   const { namespaces: allNamespaces } = useNamespaces(clusterName)
   const { deployments: allDeployments } = useDeployments(clusterName)
   const { services: allServices } = useServices(clusterName)
-  const { pvcs: allPVCs } = usePVCs(clusterName)
+  const { pvcs: allPVCs } = useCachedPVCs(clusterName)
   const { events: clusterEvents, isLoading: eventsLoading } = useEvents(clusterName, undefined, 10)
 
   // Toggle section expansion
@@ -240,23 +268,29 @@ export function ClusterDrillDown({ data }: Props) {
             <span className="text-sm text-muted-foreground">{t('common.status')}</span>
           </div>
           <div className="text-2xl font-bold text-foreground">
-            {health?.reachable === false ? 'Offline' :
+            {health?.reachable === false ? t('common.offline', 'Offline') :
               (health?.nodeCount && health.nodeCount > 0)
-                ? (health.readyNodes === health.nodeCount ? 'Healthy' : 'Degraded')
-                : (health?.healthy ? 'Healthy' : 'Unknown')}
+                ? (health.readyNodes === health.nodeCount ? t('common.healthy', 'Healthy') : t('common.degraded', 'Degraded'))
+                : (health?.healthy ? t('common.healthy', 'Healthy') : t('common.unknown', 'Unknown'))}
           </div>
         </div>
 
-        <div className="p-4 rounded-lg bg-card/50 border border-border">
+        <button
+          onClick={() => navigateToResourceTree('nodes')}
+          className="p-4 rounded-lg bg-card/50 border border-border text-left hover:bg-card hover:border-primary/50 transition-colors cursor-pointer w-full"
+        >
           <div className="text-sm text-muted-foreground mb-2">{t('common.nodes')}</div>
           <div className="text-2xl font-bold text-foreground">{health?.nodeCount || 0}</div>
           <div className="text-xs text-green-400">{health?.readyNodes || 0} ready</div>
-        </div>
+        </button>
 
-        <div className="p-4 rounded-lg bg-card/50 border border-border">
+        <button
+          onClick={() => navigateToResourceTree('workloads')}
+          className="p-4 rounded-lg bg-card/50 border border-border text-left hover:bg-card hover:border-primary/50 transition-colors cursor-pointer w-full"
+        >
           <div className="text-sm text-muted-foreground mb-2">{t('common.pods')}</div>
           <div className="text-2xl font-bold text-foreground">{health?.podCount || 0}</div>
-        </div>
+        </button>
 
         <div className="p-4 rounded-lg bg-card/50 border border-border">
           <div className="text-sm text-muted-foreground mb-2">{t('common.gpus')}</div>
@@ -311,7 +345,7 @@ export function ClusterDrillDown({ data }: Props) {
                           <div className="text-xs text-red-400 mt-1">{(issue.issues || []).join(', ')}</div>
                         )}
                       </div>
-                      <div className="flex items-center gap-2 flex-shrink-0 ml-2">
+                      <div className="flex items-center gap-2 shrink-0 ml-2">
                         <StatusBadge color="red" size="xs">{issue.status}</StatusBadge>
                         <ChevronRight className="w-4 h-4 text-muted-foreground" />
                       </div>
@@ -341,7 +375,7 @@ export function ClusterDrillDown({ data }: Props) {
                           <div className="text-xs text-orange-400 mt-1">{issue.message}</div>
                         )}
                       </div>
-                      <div className="flex items-center gap-2 flex-shrink-0 ml-2">
+                      <div className="flex items-center gap-2 shrink-0 ml-2">
                         <StatusBadge color="orange" size="xs">
                           {issue.readyReplicas}/{issue.replicas} ready
                         </StatusBadge>
@@ -415,7 +449,7 @@ export function ClusterDrillDown({ data }: Props) {
       )}
 
       {/* Tabs for Events and Resources */}
-      <div className="border-t border-border pt-4">
+      <div ref={resourceTreeRef} className="border-t border-border pt-4">
         <div className="border-b border-border mb-4">
           <div className="flex gap-0">
             {([
@@ -519,7 +553,7 @@ export function ClusterDrillDown({ data }: Props) {
                   value={searchFilter}
                   onChange={(e) => setSearchFilter(e.target.value)}
                   placeholder={t('common.searchResources')}
-                  className="w-full pl-10 pr-4 py-2 bg-secondary rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                  className="w-full pl-10 pr-4 py-2 bg-secondary rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                 />
               </div>
 
@@ -598,13 +632,15 @@ export function ClusterDrillDown({ data }: Props) {
 
                         {expandedSections.has('nodes') && (
                           <div className="ml-6 border-l-2 border-blue-500/30 pl-4 mt-1 space-y-1">
-                            {filteredNodes.slice(0, 20).map((node, i) => (
-                              <div
-                                key={i}
-                                className="flex items-center gap-2 p-2 rounded-lg hover:bg-secondary/50 cursor-pointer group"
+                            {filteredNodes.slice(0, 20).map((node) => (
+                              <button
+                                key={node.name}
+                                onClick={() => drillToNode(clusterName, node.name, { status: node.status, roles: node.roles, unschedulable: node.unschedulable })}
+                                type="button"
+                                className="flex items-center gap-2 p-2 rounded-lg hover:bg-secondary/50 cursor-pointer group w-full text-left bg-transparent border-none"
                               >
                                 <div className={`w-2 h-2 rounded-full ${node.status === 'Ready' ? 'bg-green-400' : 'bg-red-400'}`} />
-                                <span className="text-sm text-foreground">{node.name}</span>
+                                <span className="text-sm text-foreground group-hover:text-primary transition-colors">{node.name}</span>
                                 <span className={`text-xs ${node.status === 'Ready' ? 'text-green-400' : 'text-red-400'}`}>
                                   {node.status}
                                 </span>
@@ -614,7 +650,7 @@ export function ClusterDrillDown({ data }: Props) {
                                   </span>
                                 )}
                                 <ChevronRight className="w-3 h-3 text-muted-foreground opacity-0 group-hover:opacity-100 ml-auto" />
-                              </div>
+                              </button>
                             ))}
                             {filteredNodes.length > 20 && (
                               <div className="text-xs text-muted-foreground p-2">

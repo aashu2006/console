@@ -21,8 +21,12 @@ import { BACKEND_DEFAULT_URL, FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/cons
 import { POPUP_HIDE_DELAY_MS, TOOLTIP_HIDE_DELAY_MS } from '../../../lib/constants/network'
 import type { NightlyGuideStatus, NightlyRun } from '../../../lib/llmd/nightlyE2EDemoData'
 import { useTranslation } from 'react-i18next'
+import { formatTimeAgo } from '../../../lib/formatters'
 
 const PLATFORM_ORDER = ['OCP', 'GKE', 'CKS'] as const
+
+/** Minimum number of runs required before a guide's pass rate is considered meaningful */
+const MIN_RUNS_FOR_RATE = 3
 
 const PLATFORM_COLORS: Record<string, string> = {
   OCP: '#ef4444',  // red
@@ -54,16 +58,6 @@ function formatDuration(minutes: number): string {
   return m > 0 ? `${h}h ${m}m` : `${h}h`
 }
 
-function formatTimeAgo(iso: string): string {
-  const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
-  if (seconds < 60) return 'just now'
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
 
 function RunDot({ run, guide, isHighlighted, onMouseEnter, onMouseLeave }: {
   run: NightlyRun
@@ -116,6 +110,21 @@ function RunDot({ run, guide, isHighlighted, onMouseEnter, onMouseLeave }: {
   }
 
   useEffect(() => () => cancelHide(), [cancelHide])
+
+  // Close popup on Escape key
+  useEffect(() => {
+    if (!showPopup) return
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setShowPopup(false)
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [showPopup])
 
   const handleDotEnter = () => {
     cancelHide()
@@ -217,6 +226,7 @@ Please provide:
       </a>
       {showPopup && popupPos && createPortal(
         <div
+          role="tooltip"
           className="fixed z-dropdown"
           style={{ top: popupPos.top, left: popupPos.left, transform: 'translate(-50%, -100%)' }}
           onMouseEnter={cancelHide}
@@ -545,7 +555,7 @@ function generateNightlySummary(guides: NightlyGuideStatus[]): [string, string] 
 
   if (allWithRuns.length > 0) {
     const best = allWithRuns.reduce((a, b) => a.passRate > b.passRate ? a : b)
-    const worst = allWithRuns.filter(g => g.runs.length >= 3).reduce(
+    const worst = allWithRuns.filter(g => g.runs.length >= MIN_RUNS_FOR_RATE).reduce(
       (a, b) => a.passRate < b.passRate ? a : b, allWithRuns[0]
     )
 
@@ -555,7 +565,7 @@ function generateNightlySummary(guides: NightlyGuideStatus[]): [string, string] 
       const durStr = dur !== null ? ` (avg ${formatDuration(dur)}, ${meta.model} on ${meta.gpuCount}× ${meta.gpuType})` : ''
       para2Parts.push(`${best.acronym} (${best.platform}) leads at ${best.passRate}%${durStr}.`)
     }
-    if (worst.passRate === 0 && worst.runs.length >= 3) {
+    if (worst.passRate === 0 && worst.runs.length >= MIN_RUNS_FOR_RATE) {
       para2Parts.push(`${worst.acronym} (${worst.platform}) has never passed in ${worst.runs.length} runs and needs investigation.`)
     }
 
@@ -754,45 +764,45 @@ function GuideDetailPanel({ guide, hoveredRun, onRunHover }: {
             </span>
           </div>
         )}
-        <div className="flex items-center justify-between text-[11px]">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
           <span className="text-muted-foreground">{t('cards:llmd.model')}</span>
           <span className={`font-mono text-2xs truncate max-w-[140px] ${hoveredRun ? 'text-foreground' : 'text-foreground'}`} title={displayModel}>{displayModel}</span>
         </div>
-        <div className="flex items-center justify-between text-[11px]">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
           <span className="text-muted-foreground">{t('cards:llmd.gpu')}</span>
           <span className={`font-mono text-2xs ${hoveredRun ? 'text-foreground' : 'text-foreground'}`}>
             {displayGpuCount > 0 ? `${displayGpuCount}× ${displayGpuType}` : displayGpuType}
           </span>
         </div>
         {hoveredRun && runDur !== null ? (
-          <div className="flex items-center justify-between text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
             <span className="text-muted-foreground">{t('cards:llmd.duration')}</span>
             <span className="text-foreground font-mono">{formatDuration(runDur)}</span>
           </div>
         ) : avgDur !== null ? (
-          <div className="flex items-center justify-between text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
             <span className="text-muted-foreground">{t('cards:llmd.avgDuration')}</span>
             <span className="text-foreground font-mono">{formatDuration(avgDur)}</span>
           </div>
         ) : null}
         <div className="h-px bg-border/30 my-0.5" />
         {lastSuccess && (
-          <div className="flex items-center justify-between text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
             <span className="text-muted-foreground">{t('cards:llmd.lastPass')}</span>
             <span className="text-green-400 font-mono">{formatTimeAgo(lastSuccess.updatedAt)}</span>
           </div>
         )}
         {lastFailure && (
-          <div className="flex items-center justify-between text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
             <span className="text-muted-foreground">{t('cards:llmd.lastFail')}</span>
             <span className="text-red-400 font-mono">{formatTimeAgo(lastFailure.updatedAt)}</span>
           </div>
         )}
-        <div className="flex items-center justify-between text-[11px]">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
           <span className="text-muted-foreground">{t('cards:llmd.totalRuns')}</span>
           <span className="text-foreground font-mono">{guide.runs.length}</span>
         </div>
-        <div className="flex items-center justify-between text-[11px]">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 text-[11px]">
           <span className="text-muted-foreground">{t('cards:llmd.trend')}</span>
           <TrendIndicator trend={guide.trend} passRate={guide.passRate} />
         </div>
@@ -850,9 +860,10 @@ export function NightlyE2EStatus() {
     }
   }
 
+  const hasData = guides.length > 0
   const { showSkeleton } = useCardLoadingState({
-    isLoading,
-    hasAnyData: guides.length > 0,
+    isLoading: isLoading && !hasData,
+    hasAnyData: hasData,
     isFailed,
     consecutiveFailures,
     isDemoData: isDemoFallback,
@@ -895,7 +906,7 @@ export function NightlyE2EStatus() {
   if (showSkeleton) {
     return (
       <div className="p-4 h-full flex flex-col gap-3 overflow-hidden">
-        <div className="grid grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 @md:grid-cols-4 gap-3">
           {Array.from({ length: 4 }).map((_, i) => (
             <Skeleton key={i} variant="rounded" height={64} />
           ))}
@@ -917,7 +928,7 @@ export function NightlyE2EStatus() {
   return (
     <div className="p-4 h-full flex flex-col gap-3 overflow-hidden">
       {/* Stats row */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-3">
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}

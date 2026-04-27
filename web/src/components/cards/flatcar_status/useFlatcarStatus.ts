@@ -4,6 +4,7 @@ import { FLATCAR_DEMO_DATA, type FlatcarDemoData } from './demoData'
 import { compareFlatcarVersions } from './versionUtils'
 import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/constants/network'
 import { authFetch } from '../../../lib/api'
+import { LOCAL_AGENT_HTTP_URL } from '../../../lib/constants/network'
 
 export interface FlatcarStatus {
   totalNodes: number
@@ -42,7 +43,7 @@ interface FlatcarNodeInfo {
  * so no client-side filtering is needed.
  */
 async function fetchFlatcarStatus(): Promise<FlatcarStatus> {
-  const resp = await authFetch('/api/mcp/flatcar/nodes', {
+  const resp = await authFetch(`${LOCAL_AGENT_HTTP_URL}/flatcar/nodes`, {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
   })
@@ -109,6 +110,7 @@ function toDemoStatus(demo: FlatcarDemoData): FlatcarStatus {
 export interface UseFlatcarStatusResult {
   data: FlatcarStatus
   loading: boolean
+  isRefreshing: boolean
   error: boolean
   consecutiveFailures: number
   showSkeleton: boolean
@@ -116,7 +118,7 @@ export interface UseFlatcarStatusResult {
 }
 
 export function useFlatcarStatus(): UseFlatcarStatusResult {
-  const { data, isLoading, isFailed, consecutiveFailures, isDemoFallback } =
+  const { data, isLoading, isRefreshing, isFailed, consecutiveFailures, isDemoFallback } =
     useCache<FlatcarStatus>({
       key: CACHE_KEY,
       category: 'default',
@@ -129,16 +131,18 @@ export function useFlatcarStatus(): UseFlatcarStatusResult {
   const hasAnyData = data.totalNodes > 0
 
   const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading,
+    isLoading: isLoading && !hasAnyData,
+    isRefreshing,
     hasAnyData,
     isFailed,
     consecutiveFailures,
-    isDemoData: isDemoFallback,
+    isDemoData: isDemoFallback && !isLoading,
   })
 
   return {
     data,
     loading: isLoading,
+    isRefreshing,
     error: isFailed && !hasAnyData,
     consecutiveFailures,
     showSkeleton,

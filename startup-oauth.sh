@@ -279,7 +279,7 @@ cleanup() {
     kill $AGENT_LOOP_PID 2>/dev/null || true
     kill $AGENT_PID 2>/dev/null || true
     kill $WATCHDOG_PID 2>/dev/null || true
-    rm -f "$SHUTDOWN_FLAG" "$STAGE_FILE"
+    rm -f "$SHUTDOWN_FLAG" "$STAGE_FILE" "${AGENT_PID_FILE:-}"
     exit 0
 }
 trap cleanup SIGINT SIGTERM EXIT
@@ -341,11 +341,25 @@ if [ -z "$KC_AGENT_BIN" ]; then
     fi
 fi
 
+# Generate KC_AGENT_TOKEN if not already set — both kc-agent and the Go
+# backend read this env var so the frontend can authenticate to the agent
+# via a backend-proxied token endpoint.
+if [ -z "$KC_AGENT_TOKEN" ]; then
+    KC_AGENT_TOKEN="$(openssl rand -hex 32)"
+    echo "Auto-generated KC_AGENT_TOKEN."
+fi
+export KC_AGENT_TOKEN
+
 # Start kc-agent with auto-restart on crash
 AGENT_PID=""
 AGENT_LOOP_PID=""
 if [ -n "$KC_AGENT_BIN" ]; then
     echo -e "${GREEN}Starting kc-agent ($KC_AGENT_BIN)...${NC}"
+    # Pidfile written by the restart loop so the parent shell can target the
+    # exact kc-agent process instead of whoever happens to be on port 8585.
+    # Fixes #8127 — an unrelated process listening on :8585 was killed on Ctrl+C.
+    AGENT_PID_FILE="/tmp/.kc-agent-pid-$$"
+    : > "$AGENT_PID_FILE"
     (
         # Pass KUBECONFIG from .env / environment as --kubeconfig flag
         KC_AGENT_ARGS=()
@@ -355,6 +369,7 @@ if [ -n "$KC_AGENT_BIN" ]; then
         while true; do
             "$KC_AGENT_BIN" "${KC_AGENT_ARGS[@]}" &
             CHILD=$!
+            echo "$CHILD" > "$AGENT_PID_FILE"
             echo "[kc-agent] Started (PID $CHILD)"
             wait $CHILD
             EXIT_CODE=$?
@@ -366,8 +381,14 @@ if [ -n "$KC_AGENT_BIN" ]; then
         done
     ) &
     AGENT_LOOP_PID=$!
-    sleep 2
-    AGENT_PID=$(lsof -i :8585 -t 2>/dev/null | head -1)
+    # Give the loop a moment to spawn the child and write the pidfile.
+    AGENT_PID_WAIT_ATTEMPTS=10
+    AGENT_PID_WAIT_SLEEP_SECONDS=0.2
+    for _ in $(seq 1 $AGENT_PID_WAIT_ATTEMPTS); do
+        if [ -s "$AGENT_PID_FILE" ]; then break; fi
+        sleep "$AGENT_PID_WAIT_SLEEP_SECONDS"
+    done
+    AGENT_PID=$(cat "$AGENT_PID_FILE" 2>/dev/null || true)
 else
     echo -e "${YELLOW}Warning: kc-agent not found. Run 'make build' or install via brew.${NC}"
 fi
@@ -377,11 +398,30 @@ if [ "$USE_DEV_SERVER" = true ]; then
     # NOTE: Do NOT pass --dev to the backend — that bypasses OAuth and creates "dev-user".
     # The --dev flag in startup-oauth.sh only controls using Vite dev server vs built assets.
 
-    # Start watchdog first so users see a "waiting" page immediately
+    # Build and start the standalone watcher so users see a branded page immediately.
+    # The watcher is stdlib-only — builds in ~2s and starts in milliseconds.
     if [ "$WATCHDOG_RUNNING" = false ]; then
         write_stage "watchdog"
-        echo -e "${GREEN}Starting watchdog on port 8080...${NC}"
-        GOWORK=off go run ./cmd/console --watchdog --backend-port "$BACKEND_LISTEN_PORT" &
+        # Rebuild watcher if binary is missing or source changed
+        WATCHER_BIN="./bin/kc-watcher"
+        WATCHER_NEEDS_BUILD=false
+        if [ ! -f "$WATCHER_BIN" ]; then
+            WATCHER_NEEDS_BUILD=true
+        elif [ -n "$(find cmd/watcher -name '*.go' -newer "$WATCHER_BIN" 2>/dev/null)" ]; then
+            WATCHER_NEEDS_BUILD=true
+        fi
+        if [ "$WATCHER_NEEDS_BUILD" = true ]; then
+            echo -e "${GREEN}Building kc-watcher...${NC}"
+            mkdir -p ./bin
+            GOWORK=off go build -ldflags "-X main.version=${VERSION:-dev}" -o "$WATCHER_BIN" ./cmd/watcher
+        fi
+        echo -e "${GREEN}Starting watcher on port 8080...${NC}"
+        TLS_FLAG=""
+        if [ "${TLS_ENABLED:-}" = "true" ]; then
+            TLS_FLAG="--tls"
+            echo -e "${GREEN}  HTTPS/H2 enabled (TLS_ENABLED=true)${NC}"
+        fi
+        "$WATCHER_BIN" $TLS_FLAG --backend-port "$BACKEND_LISTEN_PORT" &
         WATCHDOG_PID=$!
         sleep 1
     fi
@@ -413,12 +453,30 @@ if [ "$USE_DEV_SERVER" = true ]; then
 else
     # Production mode: pre-built frontend served by Go backend (fast load)
 
-    # Start watchdog first so users see a "waiting" page during the build
-    # instead of a connection refused error
+    # Build and start the standalone watcher so users see a branded page immediately.
+    # The watcher is stdlib-only — builds in ~2s and starts in milliseconds.
     if [ "$WATCHDOG_RUNNING" = false ]; then
         write_stage "watchdog"
-        echo -e "${GREEN}Starting watchdog on port 8080...${NC}"
-        GOWORK=off go run ./cmd/console --watchdog --backend-port "$BACKEND_LISTEN_PORT" &
+        # Rebuild watcher if binary is missing or source changed
+        WATCHER_BIN="./bin/kc-watcher"
+        WATCHER_NEEDS_BUILD=false
+        if [ ! -f "$WATCHER_BIN" ]; then
+            WATCHER_NEEDS_BUILD=true
+        elif [ -n "$(find cmd/watcher -name '*.go' -newer "$WATCHER_BIN" 2>/dev/null)" ]; then
+            WATCHER_NEEDS_BUILD=true
+        fi
+        if [ "$WATCHER_NEEDS_BUILD" = true ]; then
+            echo -e "${GREEN}Building kc-watcher...${NC}"
+            mkdir -p ./bin
+            GOWORK=off go build -ldflags "-X main.version=${VERSION:-dev}" -o "$WATCHER_BIN" ./cmd/watcher
+        fi
+        echo -e "${GREEN}Starting watcher on port 8080...${NC}"
+        TLS_FLAG=""
+        if [ "${TLS_ENABLED:-}" = "true" ]; then
+            TLS_FLAG="--tls"
+            echo -e "${GREEN}  HTTPS/H2 enabled (TLS_ENABLED=true)${NC}"
+        fi
+        "$WATCHER_BIN" $TLS_FLAG --backend-port "$BACKEND_LISTEN_PORT" &
         WATCHDOG_PID=$!
         sleep 1
     fi

@@ -142,7 +142,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
   if (showSkeleton) {
     return (
       <div className="h-full flex flex-col min-h-card">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-y-2 mb-4">
           <Skeleton variant="text" width={150} height={20} />
           <Skeleton variant="rounded" width={80} height={28} />
         </div>
@@ -168,7 +168,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
   return (
     <div className="h-full flex flex-col min-h-card content-loaded">
       {/* Header with controls */}
-      <div className="flex items-center justify-between mb-3 flex-shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-3 shrink-0">
         <div className="flex items-center gap-2">
           <StatusBadge color="orange">
             {t('argoCDApplications.appsCount', { count: totalItems })}
@@ -215,7 +215,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
       {/* Integration notice — only shown in demo/fallback mode (#4201) */}
       {isDemoData && (
         <div className="flex items-start gap-2 p-2 mb-3 rounded-lg bg-orange-500/10 border border-orange-500/20 text-xs">
-          <AlertCircle className="w-4 h-4 text-orange-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-orange-400 shrink-0 mt-0.5" />
           <div>
             <p className="text-orange-400 font-medium">{t('argoCDApplications.argocdIntegration')}</p>
             <p className="text-muted-foreground">
@@ -237,7 +237,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
       />
 
       {/* Stats */}
-      <div className="grid grid-cols-4 gap-2 mb-3">
+      <div className="grid grid-cols-2 @md:grid-cols-4 gap-2 mb-3">
         <div className="text-center p-2 rounded-lg bg-green-500/10 cursor-pointer hover:bg-green-500/20"
              role="button" tabIndex={0}
              aria-label={`Show all applications (${stats.synced} synced)`}
@@ -279,6 +279,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
           <button
             onClick={() => setSelectedFilter('all')}
             className="text-xs px-2 py-0.5 rounded bg-purple-500/20 text-purple-400 flex items-center gap-1"
+            aria-label={`Clear filter: ${selectedFilter === 'outOfSync' ? t('argoCDApplications.outOfSync') : t('argoCDApplications.unhealthy')}`}
           >
             {selectedFilter === 'outOfSync' ? t('argoCDApplications.outOfSync') : t('argoCDApplications.unhealthy')}
             <XCircle className="w-3 h-3" />
@@ -312,7 +313,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
                 className="p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 cursor-pointer transition-colors group"
                 title={t('argoCDApplications.clickToView', { name: app.name })}
               >
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium text-foreground">{app.name}</span>
                     <span className={`text-xs px-1.5 py-0.5 rounded ${syncConfig.bg} ${syncConfig.color}`}>
@@ -344,7 +345,7 @@ function ArgoCDApplicationsInternal({ config }: ArgoCDApplicationsProps) {
                     <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
                   </div>
                 </div>
-                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs text-muted-foreground">
                   <div className="flex items-center gap-2">
                     <ClusterBadge cluster={app.cluster} size="sm" />
                     <span>/{app.namespace}</span>

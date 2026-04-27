@@ -21,7 +21,7 @@ concurrency:
 
 env:
   NODE_VERSION: '22'
-  COVERAGE_THRESHOLD: 80
+  COVERAGE_THRESHOLD: 91
 
 jobs:
   coverage-gate:
@@ -31,12 +31,12 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -44,7 +44,8 @@ jobs:
 
       - name: Install dependencies
         working-directory: web
-        run: npm ci
+        # Retry once on transient npm registry failures (see #9107)
+        run: npm ci || npm ci
 
       - name: Run smoke tests with coverage (modified files only)
         working-directory: web
@@ -122,11 +123,23 @@ jobs:
 
           TOTAL=$(jq -r '.total.lines.pct // "?"' "$SUMMARY_FILE")
           echo "total_coverage=${TOTAL}" >> "$GITHUB_OUTPUT"
+
+          # Warn when total project coverage is below the threshold floor.
+          # This is a visibility-only check — not blocking — but surfaces the gap
+          # between the per-file modified-files gate and overall project health.
+          TOTAL_INT=$(echo "$TOTAL" | grep -oE '^[0-9]+' || echo "")
+          if [ -n "$TOTAL_INT" ] && [ "$TOTAL_INT" -lt "$THRESHOLD" ]; then
+            {
+              echo ""
+              echo "> :bar_chart: **Total project coverage: ${TOTAL}%** — below the ${THRESHOLD}% threshold floor. New code meets the per-file gate, but overall coverage has room to grow."
+            } >> /tmp/coverage-report.md
+          fi
+
           echo "status=$( [ \"$ALL_PASS\" = \"true\" ] && echo pass || echo warn )" >> "$GITHUB_OUTPUT"
 
       - name: Comment on PR
         if: steps.gate.outputs.status != 'skip'
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             const fs = require('fs');
